@@ -175,9 +175,25 @@ codegraph-rs/
 [features]
 default = ["cli"]
 cli = ["clap", "indicatif"]
-vectors = ["rust-bert/onnx", "ort", "sqlite-vec", "zerocopy"]  # Optional: embeddings + vector search
-mcp = ["tokio"]                  # Optional: MCP server
+vectors = ["rust-bert/onnx", "sqlite-vec", "zerocopy"]  # Base: embeddings + vector search
+vectors-coreml = ["vectors", "ort/coreml"]              # macOS: GPU/Neural Engine acceleration
+mcp = ["tokio"]                                          # Optional: MCP server
 full = ["cli", "vectors", "mcp"]
+
+# Platform-specific defaults (set in build.rs or CI)
+# - macOS: vectors-coreml
+# - Linux/Windows: vectors
+```
+
+**Build Configuration:**
+
+```toml
+# Cargo.toml - platform-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0", features = ["load-dynamic", "coreml"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { version = "2.0", features = ["load-dynamic"] }
 ```
 
 ---
@@ -681,6 +697,8 @@ impl<'a> GraphTraverser<'a> {
 
 Uses [rust-bert](https://github.com/guillaume-be/rust-bert) with ONNX backend for embeddings and [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
 
+On macOS, uses CoreML execution provider for GPU/Neural Engine acceleration.
+
 ```rust
 use rust_bert::pipelines::sentence_embeddings::{
     SentenceEmbeddingsBuilder, SentenceEmbeddingsModel, SentenceEmbeddingsConfig,
@@ -691,6 +709,9 @@ use rusqlite::{ffi::sqlite3_auto_extension, Connection};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+use ort::CoreMLExecutionProvider;
 
 /// Initialize sqlite-vec extension for the connection
 ///
@@ -741,9 +762,24 @@ impl TextEmbedder {
             LocalResource::from(config_file),
         );
 
+        // Configure execution providers based on platform
+        #[cfg(target_os = "macos")]
+        let execution_providers = vec![
+            CoreMLExecutionProvider::default()
+                .with_subgraphs()        // Enable for subgraphs
+                .with_ane_only(false)    // Use GPU + Neural Engine + CPU
+                .build()
+                .error_on_failure(),
+        ];
+
+        #[cfg(not(target_os = "macos"))]
+        let execution_providers = vec![]; // CPU fallback
+
         // Build model with ONNX backend
+        // On macOS: Uses CoreML (GPU/Neural Engine) with CPU fallback
+        // On Linux/Windows: Uses CPU
         let model = SentenceEmbeddingsBuilder::local(config)
-            .with_device(tch::Device::Cpu)  // CPU only for portability
+            .with_execution_providers(execution_providers)
             .create_model()
             .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))?;
 
@@ -1240,9 +1276,13 @@ rusqlite = { version = "0.31", features = ["bundled", "vtab", "functions"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.7", features = ["derive"] }
 
-# Embeddings (rust-bert with ONNX backend)
+# Embeddings (rust-bert with ONNX backend, no network)
 rust-bert = { version = "0.23", default-features = false, features = ["onnx"] }
-ort = { version = "2.0", features = ["load-dynamic"] }
+
+# NOTE: ort is configured per-platform in [target] sections:
+# - macOS: ort with load-dynamic + coreml (GPU/Neural Engine)
+# - Linux/Windows: ort with load-dynamic only (CPU)
+# See platform-specific dependencies below
 
 # Tree-sitter
 tree-sitter = "0.22"
@@ -1260,10 +1300,6 @@ tree-sitter-ruby = "0.21"
 tree-sitter-swift = "0.21"
 tree-sitter-kotlin = "0.21"
 
-# Embeddings (optional)
-ort = { version = "2.0", optional = true }
-tokenizers = { version = "0.19", optional = true }
-
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"
@@ -1278,7 +1314,44 @@ glob = "0.3"
 thiserror = "1.0"
 rayon = "1.10"
 walkdir = "2.5"
+
+# Platform-specific ONNX runtime configuration
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0", features = ["load-dynamic", "coreml"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "2.0", features = ["load-dynamic"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0", features = ["load-dynamic"] }
 ```
+
+### ONNX Runtime Setup (No Network)
+
+The `load-dynamic` feature requires pre-installing ONNX Runtime:
+
+**macOS (with CoreML):**
+```bash
+# Download ONNX Runtime with CoreML support
+curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-osx-arm64-1.17.0.tgz
+tar -xzf onnxruntime-osx-arm64-1.17.0.tgz
+export ORT_DYLIB_PATH=/path/to/onnxruntime-osx-arm64-1.17.0/lib/libonnxruntime.dylib
+```
+
+**Linux:**
+```bash
+curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-linux-x64-1.17.0.tgz
+tar -xzf onnxruntime-linux-x64-1.17.0.tgz
+export ORT_DYLIB_PATH=/path/to/onnxruntime-linux-x64-1.17.0/lib/libonnxruntime.so
+```
+
+**Windows:**
+```powershell
+# Download and extract onnxruntime-win-x64-1.17.0.zip
+$env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"
+```
+
+For distribution, bundle the ONNX Runtime library with the application or require users to install it separately.
 
 ---
 
