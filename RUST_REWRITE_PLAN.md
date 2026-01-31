@@ -175,7 +175,7 @@ codegraph-rs/
 [features]
 default = ["cli"]
 cli = ["clap", "indicatif"]
-vectors = ["ort", "tokenizers", "sqlite-vec", "zerocopy"]  # Optional: ONNX embeddings + vector search
+vectors = ["rust-bert/onnx", "ort", "sqlite-vec", "zerocopy"]  # Optional: embeddings + vector search
 mcp = ["tokio"]                  # Optional: MCP server
 full = ["cli", "vectors", "mcp"]
 ```
@@ -679,15 +679,18 @@ impl<'a> GraphTraverser<'a> {
 
 ### 3.5 Vector/Embedding Module (`codegraph-vectors/`)
 
-Uses [sqlite-vec](https://github.com/asg017/sqlite-vec) for efficient vector similarity search directly in SQLite.
+Uses [rust-bert](https://github.com/guillaume-be/rust-bert) with ONNX backend for embeddings and [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
 
 ```rust
-use ort::{Environment, Session, SessionBuilder};
-use tokenizers::Tokenizer;
+use rust_bert::pipelines::sentence_embeddings::{
+    SentenceEmbeddingsBuilder, SentenceEmbeddingsModel, SentenceEmbeddingsConfig,
+    SentenceEmbeddingsModelType,
+};
+use rust_bert::resources::LocalResource;
 use rusqlite::{ffi::sqlite3_auto_extension, Connection};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Initialize sqlite-vec extension for the connection
 ///
@@ -703,9 +706,8 @@ pub fn init_sqlite_vec() {
 
 /// CRITICAL: This module runs entirely locally with no network access
 pub struct TextEmbedder {
-    session: Session,
-    tokenizer: Tokenizer,
-    model_path: PathBuf,
+    model: SentenceEmbeddingsModel,
+    embedding_dim: usize,
 }
 
 impl TextEmbedder {
@@ -713,70 +715,120 @@ impl TextEmbedder {
     ///
     /// # Security
     /// - Model must be pre-downloaded to ~/.codegraph/models/
-    /// - No network requests are made
+    /// - No network requests are made (RemoteResource disabled)
     /// - Model integrity should be verified via checksum
     pub fn load(model_dir: &Path) -> Result<Self, EmbedderError> {
-        let model_path = model_dir.join("model.onnx");
-        let tokenizer_path = model_dir.join("tokenizer.json");
-
-        // Verify paths exist (no downloading)
-        if !model_path.exists() {
-            return Err(EmbedderError::ModelNotFound(model_path));
+        // Verify model directory exists
+        if !model_dir.exists() {
+            return Err(EmbedderError::ModelNotFound(model_dir.to_path_buf()));
         }
 
-        let env = Environment::builder()
-            .with_name("codegraph")
-            .build()?;
+        // Verify required files exist
+        let model_file = model_dir.join("model.onnx");
+        let tokenizer_file = model_dir.join("tokenizer.json");
+        let config_file = model_dir.join("config.json");
 
-        let session = SessionBuilder::new(&env)?
-            .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
-            .with_model_from_file(&model_path)?;
+        for file in [&model_file, &tokenizer_file, &config_file] {
+            if !file.exists() {
+                return Err(EmbedderError::MissingModelFile(file.clone()));
+            }
+        }
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| EmbedderError::TokenizerError(e.to_string()))?;
+        // Configure for local-only loading (no network)
+        let config = SentenceEmbeddingsConfig::new(
+            LocalResource::from(model_file),
+            LocalResource::from(tokenizer_file),
+            LocalResource::from(config_file),
+        );
+
+        // Build model with ONNX backend
+        let model = SentenceEmbeddingsBuilder::local(config)
+            .with_device(tch::Device::Cpu)  // CPU only for portability
+            .create_model()
+            .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))?;
+
+        // Get embedding dimension from model config
+        let embedding_dim = 768; // TODO: Read from config.json
 
         Ok(Self {
-            session,
-            tokenizer,
-            model_path,
+            model,
+            embedding_dim,
+        })
+    }
+
+    /// Load a pre-configured model type from local cache
+    ///
+    /// Models should be pre-downloaded to ~/.codegraph/models/
+    pub fn load_model_type(
+        model_type: SentenceEmbeddingsModelType,
+        cache_dir: &Path,
+    ) -> Result<Self, EmbedderError> {
+        // Set cache directory to prevent network downloads
+        std::env::set_var("RUSTBERT_CACHE", cache_dir);
+
+        let model = SentenceEmbeddingsBuilder::local(model_type)
+            .create_model()
+            .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))?;
+
+        let embedding_dim = match model_type {
+            SentenceEmbeddingsModelType::AllMiniLmL6V2 => 384,
+            SentenceEmbeddingsModelType::AllMiniLmL12V2 => 384,
+            SentenceEmbeddingsModelType::AllDistilrobertaV1 => 768,
+            SentenceEmbeddingsModelType::ParaphraseAlbertSmallV2 => 768,
+            _ => 768, // Default
+        };
+
+        Ok(Self {
+            model,
+            embedding_dim,
         })
     }
 
     /// Generate embedding for text
-    ///
-    /// # Returns
-    /// 768-dimensional float vector (for nomic-embed-text)
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
-        let encoding = self.tokenizer.encode(text, true)
-            .map_err(|e| EmbedderError::TokenizerError(e.to_string()))?;
+        let embeddings = self.model.encode(&[text])
+            .map_err(|e| EmbedderError::InferenceError(e.to_string()))?;
 
-        let input_ids: Vec<i64> = encoding.get_ids()
-            .iter()
-            .map(|&id| id as i64)
-            .collect();
-
-        let attention_mask: Vec<i64> = encoding.get_attention_mask()
-            .iter()
-            .map(|&m| m as i64)
-            .collect();
-
-        // Run ONNX inference (LOCAL ONLY)
-        let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask,
-        ]?)?;
-
-        // Extract embeddings
-        let embedding = outputs[0].try_extract_tensor::<f32>()?;
-        Ok(embedding.view().to_slice().unwrap().to_vec())
+        Ok(embeddings.into_iter().next().unwrap())
     }
 
-    /// Batch embed multiple texts
+    /// Batch embed multiple texts (more efficient than individual calls)
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
-        texts.iter()
-            .map(|text| self.embed(text))
-            .collect()
+        self.model.encode(texts)
+            .map_err(|e| EmbedderError::InferenceError(e.to_string()))
+    }
+
+    /// Get the embedding dimension for this model
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+}
+
+/// Supported embedding models (pre-downloadable)
+#[derive(Debug, Clone, Copy)]
+pub enum EmbeddingModel {
+    /// all-MiniLM-L6-v2: 384 dimensions, fast, good quality
+    AllMiniLmL6V2,
+    /// all-MiniLM-L12-v2: 384 dimensions, slightly better quality
+    AllMiniLmL12V2,
+    /// all-distilroberta-v1: 768 dimensions, best quality
+    AllDistilrobertaV1,
+}
+
+impl EmbeddingModel {
+    pub fn dimension(&self) -> usize {
+        match self {
+            Self::AllMiniLmL6V2 | Self::AllMiniLmL12V2 => 384,
+            Self::AllDistilrobertaV1 => 768,
+        }
+    }
+
+    pub fn model_id(&self) -> &'static str {
+        match self {
+            Self::AllMiniLmL6V2 => "sentence-transformers/all-MiniLM-L6-v2",
+            Self::AllMiniLmL12V2 => "sentence-transformers/all-MiniLM-L12-v2",
+            Self::AllDistilrobertaV1 => "sentence-transformers/all-distilroberta-v1",
+        }
     }
 }
 
@@ -1165,7 +1217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `sqlite-vss` (optional) | `sqlite-vec` | Vector search SQLite extension (successor to sqlite-vss) |
 | `tree-sitter` | `tree-sitter` | Same C library |
 | `tree-sitter-typescript` | `tree-sitter-typescript` | Same grammars |
-| `@xenova/transformers` | `ort` + `tokenizers` | ONNX runtime |
+| `@xenova/transformers` | `rust-bert` + `ort` | High-level NLP pipelines with ONNX backend |
 | `commander` | `clap` | CLI parsing |
 | `figlet` | `figlet-rs` | ASCII art |
 | `crypto` (SHA256) | `sha2` | Hashing |
@@ -1187,6 +1239,10 @@ rusqlite = { version = "0.31", features = ["bundled", "vtab", "functions"] }
 # Vector Search (sqlite-vec extension)
 sqlite-vec = "0.1"
 zerocopy = { version = "0.7", features = ["derive"] }
+
+# Embeddings (rust-bert with ONNX backend)
+rust-bert = { version = "0.23", default-features = false, features = ["onnx"] }
+ort = { version = "2.0", features = ["load-dynamic"] }
 
 # Tree-sitter
 tree-sitter = "0.22"
@@ -1514,8 +1570,9 @@ impl MCPServer {
 - [ ] Integration tests
 
 ### Phase 5: Vectors (Week 7)
-- [ ] Integrate ONNX runtime (`ort` crate)
-- [ ] Implement TextEmbedder with tokenizers
+- [ ] Integrate `rust-bert` with ONNX backend
+- [ ] Implement TextEmbedder using SentenceEmbeddingsModel
+- [ ] Set up local model loading (no network)
 - [ ] Integrate sqlite-vec extension
 - [ ] Implement VectorSearchManager with vec0 virtual table
 - [ ] Add embedding dimension validation
@@ -1658,7 +1715,7 @@ fn test_model_checksum_required() {
 |------|-------|------------|
 | **Liquid Language** | TypeScript uses regex fallback due to tree-sitter ABI issues. Rust version needs same fallback. | Implement regex-based Liquid extractor in `languages/liquid.rs` |
 | **sqlite-vec integration** | sqlite-vec is pre-v1, API may change. | Pin specific version, monitor for breaking changes |
-| **ESM Dynamic Import** | TypeScript dynamically imports `@xenova/transformers`. Rust doesn't have equivalent. | Use `ort` directly with static linking |
+| **ESM Dynamic Import** | TypeScript dynamically imports `@xenova/transformers`. Rust doesn't have equivalent. | Use `rust-bert` with ONNX backend, statically linked |
 | **Node Cache (LRU)** | TypeScript QueryBuilder has LRU cache. Plan doesn't mention caching strategy. | Add `lru` crate for node caching in QueryBuilder |
 | **Error JSON Arrays** | TypeScript stores errors as JSON arrays in `files.errors`. Plan doesn't specify serialization. | Use `serde_json::to_string(&errors)` for `Vec<String>` |
 | **Git Hooks** | TypeScript writes shell scripts. Rust needs to generate platform-appropriate scripts. | Detect platform, generate bash or batch scripts |
@@ -1671,7 +1728,7 @@ fn test_model_checksum_required() {
 |-------|---------|------------|
 | "Same tree-sitter grammars" | Rust tree-sitter crates may have different versions than Node bindings | Pin specific grammar versions; test extraction parity |
 | "768-dimensional embeddings" | Dimension depends on model; nomic-embed-text-v1.5 is 768 | Correct, but should be configurable |
-| "No network by default" | Rust ort crate may try to download ONNX runtime | Use `ort = { features = ["load-dynamic"] }` with bundled runtime |
+| "No network by default" | rust-bert/ort may try to download models or ONNX runtime | Set `RUSTBERT_CACHE` env var, use `ort = { features = ["load-dynamic"] }`, pre-download models |
 | "Prepared statements" | rusqlite prepared statements work differently than better-sqlite3 | Use `conn.prepare_cached()` for similar semantics |
 
 ### 9.3 Missing Components
