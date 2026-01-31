@@ -175,7 +175,7 @@ codegraph-rs/
 [features]
 default = ["cli"]
 cli = ["clap", "indicatif"]
-vectors = ["ort", "tokenizers"]  # Optional: ONNX embeddings
+vectors = ["ort", "tokenizers", "sqlite-vec", "zerocopy"]  # Optional: ONNX embeddings + vector search
 mcp = ["tokio"]                  # Optional: MCP server
 full = ["cli", "vectors", "mcp"]
 ```
@@ -327,8 +327,12 @@ pub struct TrackedFile {
 **Key Implementation Details:**
 
 ```rust
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags, params};
+use sqlite_vec::sqlite3_vec_init;
 use std::path::Path;
+use std::sync::Once;
+
+static SQLITE_VEC_INIT: Once = Once::new();
 
 pub struct DatabaseConnection {
     conn: Connection,
@@ -337,6 +341,15 @@ pub struct DatabaseConnection {
 
 impl DatabaseConnection {
     pub fn open(path: &Path) -> Result<Self, DbError> {
+        // Initialize sqlite-vec extension (once per process)
+        SQLITE_VEC_INIT.call_once(|| {
+            unsafe {
+                sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite3_vec_init as *const ()
+                )));
+            }
+        });
+
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -350,6 +363,14 @@ impl DatabaseConnection {
 
         // Apply schema
         conn.execute_batch(include_str!("schema.sql"))?;
+
+        // Verify sqlite-vec is loaded
+        let (vec_version,): (String,) = conn.query_row(
+            "SELECT vec_version()",
+            [],
+            |row| Ok((row.get(0)?,))
+        )?;
+        log::debug!("sqlite-vec version: {}", vec_version);
 
         Ok(Self {
             queries: QueryBuilder::new(&conn)?,
@@ -403,6 +424,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     content='nodes',
     content_rowid='rowid'
 );
+
+-- sqlite-vec virtual table for vector embeddings
+-- Note: Created at runtime after sqlite-vec extension is loaded
+-- CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
+--     node_id TEXT PRIMARY KEY,
+--     embedding float[768]  -- Dimension matches embedding model
+-- );
 ```
 
 ### 3.3 Extraction Module (`codegraph-extraction/`)
@@ -651,10 +679,27 @@ impl<'a> GraphTraverser<'a> {
 
 ### 3.5 Vector/Embedding Module (`codegraph-vectors/`)
 
+Uses [sqlite-vec](https://github.com/asg017/sqlite-vec) for efficient vector similarity search directly in SQLite.
+
 ```rust
 use ort::{Environment, Session, SessionBuilder};
 use tokenizers::Tokenizer;
+use rusqlite::{ffi::sqlite3_auto_extension, Connection};
+use sqlite_vec::sqlite3_vec_init;
+use zerocopy::AsBytes;
 use std::path::PathBuf;
+
+/// Initialize sqlite-vec extension for the connection
+///
+/// # Security
+/// - sqlite-vec is a pure C extension with no network access
+/// - Runs entirely within the SQLite process
+/// - No external dependencies at runtime
+pub fn init_sqlite_vec() {
+    unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+    }
+}
 
 /// CRITICAL: This module runs entirely locally with no network access
 pub struct TextEmbedder {
@@ -735,19 +780,169 @@ impl TextEmbedder {
     }
 }
 
-/// Vector similarity search (brute-force cosine similarity)
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+/// Vector search manager using sqlite-vec
+pub struct VectorSearchManager {
+    embedding_dim: usize,
+}
 
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+impl VectorSearchManager {
+    pub fn new(embedding_dim: usize) -> Self {
+        Self { embedding_dim }
     }
 
-    dot / (norm_a * norm_b)
+    /// Create the vec0 virtual table for vector storage
+    pub fn create_vector_table(&self, conn: &Connection) -> Result<(), VectorError> {
+        conn.execute(
+            &format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_embeddings USING vec0(
+                    node_id TEXT PRIMARY KEY,
+                    embedding float[{}]
+                )",
+                self.embedding_dim
+            ),
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or update a vector embedding
+    pub fn upsert_embedding(
+        &self,
+        conn: &Connection,
+        node_id: &str,
+        embedding: &[f32],
+    ) -> Result<(), VectorError> {
+        // Delete existing if present (vec0 doesn't support upsert)
+        conn.execute(
+            "DELETE FROM vec_embeddings WHERE node_id = ?",
+            [node_id],
+        )?;
+
+        // Insert new embedding using zerocopy for efficient byte conversion
+        conn.execute(
+            "INSERT INTO vec_embeddings(node_id, embedding) VALUES (?, ?)",
+            rusqlite::params![node_id, embedding.as_bytes()],
+        )?;
+        Ok(())
+    }
+
+    /// Search for similar vectors using sqlite-vec's MATCH operator
+    ///
+    /// # Returns
+    /// Vec of (node_id, distance) sorted by distance ascending
+    pub fn search_similar(
+        &self,
+        conn: &Connection,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, VectorError> {
+        let mut stmt = conn.prepare(
+            "SELECT
+                node_id,
+                distance
+            FROM vec_embeddings
+            WHERE embedding MATCH ?1
+            ORDER BY distance
+            LIMIT ?2"
+        )?;
+
+        let results = stmt
+            .query_map(
+                rusqlite::params![query_embedding.as_bytes(), limit as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Search with a distance threshold
+    pub fn search_within_distance(
+        &self,
+        conn: &Connection,
+        query_embedding: &[f32],
+        max_distance: f64,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, VectorError> {
+        let mut stmt = conn.prepare(
+            "SELECT
+                node_id,
+                distance
+            FROM vec_embeddings
+            WHERE embedding MATCH ?1
+              AND distance < ?2
+            ORDER BY distance
+            LIMIT ?3"
+        )?;
+
+        let results = stmt
+            .query_map(
+                rusqlite::params![
+                    query_embedding.as_bytes(),
+                    max_distance,
+                    limit as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+
+    /// Get embedding for a specific node
+    pub fn get_embedding(
+        &self,
+        conn: &Connection,
+        node_id: &str,
+    ) -> Result<Option<Vec<f32>>, VectorError> {
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM vec_embeddings WHERE node_id = ?"
+        )?;
+
+        let result = stmt.query_row([node_id], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            // Convert bytes back to f32 array
+            let floats: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            Ok(floats)
+        });
+
+        match result {
+            Ok(embedding) => Ok(Some(embedding)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(VectorError::from(e)),
+        }
+    }
+
+    /// Delete embedding for a node
+    pub fn delete_embedding(&self, conn: &Connection, node_id: &str) -> Result<(), VectorError> {
+        conn.execute(
+            "DELETE FROM vec_embeddings WHERE node_id = ?",
+            [node_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get count of stored embeddings
+    pub fn count_embeddings(&self, conn: &Connection) -> Result<usize, VectorError> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vec_embeddings",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
 }
 ```
+
+**Key sqlite-vec features:**
+- **Pure C, no dependencies**: Runs anywhere SQLite runs
+- **vec0 virtual table**: Optimized for vector storage and search
+- **MATCH operator**: Fast brute-force similarity search
+- **Distance filtering**: Support for `distance < threshold` in WHERE clause
+- **Zero-copy with zerocopy crate**: Efficient f32 array to bytes conversion
 
 ### 3.6 MCP Server (`codegraph-mcp/`)
 
@@ -967,6 +1162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | TypeScript Package | Rust Crate | Notes |
 |--------------------|------------|-------|
 | `better-sqlite3` | `rusqlite` | Same SQLite, different bindings |
+| `sqlite-vss` (optional) | `sqlite-vec` | Vector search SQLite extension (successor to sqlite-vss) |
 | `tree-sitter` | `tree-sitter` | Same C library |
 | `tree-sitter-typescript` | `tree-sitter-typescript` | Same grammars |
 | `@xenova/transformers` | `ort` + `tokenizers` | ONNX runtime |
@@ -979,6 +1175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | N/A | `thiserror` | Error handling |
 | N/A | `indicatif` | Progress bars |
 | N/A | `rayon` | Parallelism |
+| N/A | `zerocopy` | Zero-copy byte conversion for vectors |
 
 ### Cargo.toml Dependencies
 
@@ -986,6 +1183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 [workspace.dependencies]
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "vtab", "functions"] }
+
+# Vector Search (sqlite-vec extension)
+sqlite-vec = "0.1"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 # Tree-sitter
 tree-sitter = "0.22"
@@ -1313,10 +1514,12 @@ impl MCPServer {
 - [ ] Integration tests
 
 ### Phase 5: Vectors (Week 7)
-- [ ] Integrate ONNX runtime
-- [ ] Implement TextEmbedder
-- [ ] Implement vector search
-- [ ] Benchmark against TypeScript version
+- [ ] Integrate ONNX runtime (`ort` crate)
+- [ ] Implement TextEmbedder with tokenizers
+- [ ] Integrate sqlite-vec extension
+- [ ] Implement VectorSearchManager with vec0 virtual table
+- [ ] Add embedding dimension validation
+- [ ] Benchmark vector search against TypeScript version
 
 ### Phase 6: Context & MCP (Week 8)
 - [ ] Implement ContextBuilder
@@ -1454,12 +1657,13 @@ fn test_model_checksum_required() {
 | Area | Issue | Mitigation |
 |------|-------|------------|
 | **Liquid Language** | TypeScript uses regex fallback due to tree-sitter ABI issues. Rust version needs same fallback. | Implement regex-based Liquid extractor in `languages/liquid.rs` |
-| **sqlite-vss** | TypeScript has optional sqlite-vss support. Rust `rusqlite` doesn't have easy vss bindings. | Use brute-force cosine similarity only, or implement custom SQLite extension |
+| **sqlite-vec integration** | sqlite-vec is pre-v1, API may change. | Pin specific version, monitor for breaking changes |
 | **ESM Dynamic Import** | TypeScript dynamically imports `@xenova/transformers`. Rust doesn't have equivalent. | Use `ort` directly with static linking |
 | **Node Cache (LRU)** | TypeScript QueryBuilder has LRU cache. Plan doesn't mention caching strategy. | Add `lru` crate for node caching in QueryBuilder |
 | **Error JSON Arrays** | TypeScript stores errors as JSON arrays in `files.errors`. Plan doesn't specify serialization. | Use `serde_json::to_string(&errors)` for `Vec<String>` |
 | **Git Hooks** | TypeScript writes shell scripts. Rust needs to generate platform-appropriate scripts. | Detect platform, generate bash or batch scripts |
 | **Memory Monitoring** | TypeScript has memory monitoring utilities. Rust has different memory model. | May not be necessary; Rust has predictable memory usage |
+| **vec0 table migrations** | Existing databases won't have vec0 table. | Migration adds vec0 table, re-indexes embeddings if needed |
 
 ### 9.2 Accuracy Issues
 
@@ -1508,11 +1712,27 @@ fn test_model_checksum_required() {
 | **File System Write** | Overwrite critical files | Only write to `.codegraph/` directory |
 | **SQL Injection** | Malicious search queries | Prepared statements exclusively |
 | **FTS5 Injection** | Crafted FTS queries | Sanitize FTS input, limit query complexity |
+| **sqlite-vec queries** | Malformed vector data | Validate embedding dimensions, use zerocopy safely |
 | **Model Loading** | Malicious ONNX model | Checksum verification required |
 | **MCP Input** | Malformed JSON-RPC | Strict schema validation with serde |
 | **Memory Exhaustion** | Large files or deep traversals | Configurable limits on file size and depth |
+| **Vector Storage DoS** | Many large embeddings | Limit total embedding count, consider quantization |
 | **Symlink Following** | Escape project via symlinks | Use `canonicalize()` and recheck bounds |
 | **Race Conditions** | TOCTOU in path validation | Use file handles, not paths where possible |
+
+### 10.1.1 sqlite-vec Security Notes
+
+sqlite-vec is a **pure C extension with no dependencies**, which provides several security benefits:
+
+1. **No network access**: sqlite-vec cannot make network requests
+2. **Memory safe (within SQLite)**: Uses SQLite's memory allocator
+3. **No file access**: Only operates on data passed to it via SQL
+4. **Deterministic**: Same inputs always produce same outputs
+
+**Potential risks:**
+- Pre-v1 software: API may have undiscovered bugs
+- Vector dimension mismatch could cause issues (mitigated by validation)
+- Large result sets could consume memory (mitigated by LIMIT clauses)
 
 ### 10.2 Data Exfiltration Prevention
 
@@ -1618,10 +1838,10 @@ Before proceeding with implementation, the following questions should be resolve
 
 1. **Async vs Sync**: Should the Rust version use async (tokio) for I/O, or stay synchronous like the TypeScript version? Async adds complexity but may improve MCP server responsiveness.
 
-2. **sqlite-vss Support**: The TypeScript version has optional sqlite-vss for vector search. Should the Rust version:
-   - Skip sqlite-vss entirely (use brute-force only)?
-   - Implement a custom SQLite extension in Rust?
-   - Use a different vector search solution (e.g., `usearch` crate)?
+2. **sqlite-vec quantization**: sqlite-vec supports int8 and binary quantization for smaller storage. Should the Rust version:
+   - Use float32 only (maximum accuracy, ~3KB per embedding)?
+   - Support int8 quantization (8x smaller, slight accuracy loss)?
+   - Support binary quantization (32x smaller, more accuracy loss)?
 
 3. **Cross-Platform Priority**: What platforms must be supported at launch?
    - Linux x64 (CI/server environments)
