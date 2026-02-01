@@ -98,11 +98,17 @@ codegraph-rs/
 │   │       ├── parser.rs         # Tree-sitter wrapper
 │   │       ├── languages/        # Per-language extractors
 │   │       │   ├── mod.rs
-│   │       │   ├── typescript.rs
-│   │       │   ├── python.rs
-│   │       │   ├── rust.rs
-│   │       │   ├── go.rs
-│   │       │   └── ... (12 more)
+│   │       │   ├── typescript.rs # + JS/TSX/JSX, embedded GraphQL
+│   │       │   ├── rust.rs       # + attribute macros
+│   │       │   ├── php.rs
+│   │       │   ├── dart.rs       # + Flutter patterns, embedded GraphQL
+│   │       │   ├── graphql.rs    # Standalone GraphQL
+│   │       │   ├── bash.rs       # Shell scripts
+│   │       │   ├── hcl.rs        # Terraform, Vault, Nomad
+│   │       │   ├── python.rs     # Secondary
+│   │       │   ├── go.rs         # Secondary
+│   │       │   └── ... (8 more secondary)
+│   │       ├── embedded.rs       # Embedded language extraction
 │   │       └── grammars.rs       # Grammar loading
 │   │
 │   ├── codegraph-resolution/     # Reference resolution
@@ -112,11 +118,16 @@ codegraph-rs/
 │   │       ├── resolver.rs       # ReferenceResolver
 │   │       ├── imports.rs        # Import path resolution
 │   │       ├── names.rs          # Name matching
-│   │       └── frameworks/       # Framework-specific
+│   │       └── frameworks/       # Framework-specific patterns
 │   │           ├── mod.rs
-│   │           ├── react.rs
-│   │           ├── express.rs
-│   │           └── ... (7 more)
+│   │           ├── react.rs      # React/Next.js
+│   │           ├── express.rs    # Express/Node
+│   │           ├── flutter.rs    # Flutter widgets, routes
+│   │           ├── riverpod.rs   # Riverpod state management
+│   │           ├── bloc.rs       # Bloc/Cubit patterns
+│   │           ├── getit.rs      # get_it dependency injection
+│   │           ├── terraform.rs  # Terraform resources, modules
+│   │           └── ... (rust, go, python, etc.)
 │   │
 │   ├── codegraph-graph/          # Graph algorithms
 │   │   ├── Cargo.toml
@@ -261,22 +272,28 @@ pub enum EdgeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
+    // === Primary Targets (first-class support with framework patterns) ===
     TypeScript,
     JavaScript,
     Tsx,
     Jsx,
+    Rust,
+    Php,
+    Dart,           // Flutter, AngularDart
+    GraphQL,        // Standalone + embedded extraction
+    Bash,           // Shell scripts
+    Hcl,            // Terraform, Vault, Nomad, Packer
+
+    // === Secondary (extraction only, no framework patterns) ===
     Python,
     Go,
-    Rust,
     Java,
     C,
     Cpp,
     CSharp,
-    Php,
     Ruby,
     Swift,
     Kotlin,
-    // Note: Liquid deferred to future release (see Section 9.9)
 }
 
 /// Visibility modifier
@@ -491,21 +508,27 @@ impl TreeSitterParser {
 
 fn get_grammar(lang: Language) -> Result<TsLanguage, ParseError> {
     match lang {
+        // Primary targets
         Language::TypeScript => Ok(tree_sitter_typescript::language_typescript()),
         Language::Tsx => Ok(tree_sitter_typescript::language_tsx()),
-        Language::JavaScript => Ok(tree_sitter_javascript::language()),
-        Language::Python => Ok(tree_sitter_python::language()),
+        Language::JavaScript | Language::Jsx => Ok(tree_sitter_javascript::language()),
         Language::Rust => Ok(tree_sitter_rust::language()),
+        Language::Php => Ok(tree_sitter_php::language_php()),
+        Language::Dart => Ok(tree_sitter_dart::language()),
+        Language::GraphQL => Ok(tree_sitter_graphql::language()),
+        Language::Bash => Ok(tree_sitter_bash::language()),
+        Language::Hcl => Ok(tree_sitter_hcl::language()),
+
+        // Secondary targets
+        Language::Python => Ok(tree_sitter_python::language()),
         Language::Go => Ok(tree_sitter_go::language()),
         Language::Java => Ok(tree_sitter_java::language()),
         Language::C => Ok(tree_sitter_c::language()),
         Language::Cpp => Ok(tree_sitter_cpp::language()),
         Language::CSharp => Ok(tree_sitter_c_sharp::language()),
-        Language::Php => Ok(tree_sitter_php::language_php()),
         Language::Ruby => Ok(tree_sitter_ruby::language()),
         Language::Swift => Ok(tree_sitter_swift::language()),
         Language::Kotlin => Ok(tree_sitter_kotlin::language()),
-        // Note: Liquid deferred to future release (see Section 9.9)
     }
 }
 ```
@@ -736,6 +759,526 @@ const RUST_ATTRIBUTE_PATTERNS: &[(&str, &str)] = &[
     // Proc macros
     ("proc_macro", "proc-macro"),
     ("proc_macro_derive", "proc-macro"),
+];
+```
+
+**Dart/Flutter Extractor:**
+
+```rust
+pub struct DartExtractor {
+    graphql_parser: Option<TreeSitterParser>,  // For embedded GraphQL
+}
+
+impl DartExtractor {
+    /// Extract Flutter widget classes
+    fn extract_widget(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // Detect: class MyWidget extends StatelessWidget/StatefulWidget
+        if node.kind() != "class_declaration" {
+            return None;
+        }
+
+        let name = node.child_by_field_name("name")?;
+        let superclass = node.child_by_field_name("superclass")?;
+        let superclass_text = &source[superclass.start_byte()..superclass.end_byte()];
+
+        let widget_type = match superclass_text {
+            s if s.contains("StatelessWidget") => Some("stateless"),
+            s if s.contains("StatefulWidget") => Some("stateful"),
+            s if s.contains("State<") => Some("state"),
+            s if s.contains("InheritedWidget") => Some("inherited"),
+            s if s.contains("RenderObjectWidget") => Some("render"),
+            _ => None,
+        };
+
+        if widget_type.is_some() {
+            Some(Node {
+                kind: NodeKind::Component,  // Widgets are components
+                name: source[name.start_byte()..name.end_byte()].to_string(),
+                // ... other fields
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Extract Dart annotations (similar to TS decorators)
+    fn extract_annotations(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+        let mut annotations = Vec::new();
+
+        if let Some(parent) = node.parent() {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                if child.kind() == "annotation" {
+                    let text = &source[child.start_byte()..child.end_byte()];
+                    // Strip @ prefix
+                    annotations.push(text.trim_start_matches('@').to_string());
+                }
+                if child.id() == node.id() {
+                    break;
+                }
+            }
+        }
+
+        annotations
+    }
+
+    /// Extract embedded GraphQL queries (flutter_graphql, graphql_flutter)
+    fn extract_embedded_graphql(&self, node: TsNode<'_>, source: &str) -> Vec<EmbeddedGraphQL> {
+        let mut queries = Vec::new();
+
+        // Pattern 1: gql('''...''') or gql("""...""")
+        // Pattern 2: Query(document: gql(...))
+        if node.kind() == "function_expression_invocation" {
+            let function = node.child_by_field_name("function");
+            if let Some(func) = function {
+                let func_text = &source[func.start_byte()..func.end_byte()];
+                if func_text == "gql" {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        let content = self.extract_multiline_string(&args, source);
+                        if let Some(gql_content) = content {
+                            if let Some(ref parser) = self.graphql_parser {
+                                queries.push(EmbeddedGraphQL {
+                                    content: gql_content,
+                                    host_line: node.start_position().row as u32,
+                                    host_language: Language::Dart,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        queries
+    }
+}
+
+/// Known Dart/Flutter annotation patterns
+const DART_ANNOTATION_PATTERNS: &[(&str, &str)] = &[
+    // Core Dart
+    ("override", "dart:core"),
+    ("deprecated", "dart:core"),
+    ("pragma", "dart:core"),
+
+    // Flutter widgets
+    ("immutable", "flutter"),
+    ("required", "flutter"),
+    ("protected", "flutter"),
+    ("mustCallSuper", "flutter"),
+    ("optionalTypeArgs", "flutter"),
+    ("visibleForTesting", "flutter"),
+
+    // Riverpod
+    ("riverpod", "riverpod"),
+    ("Riverpod", "riverpod"),
+    ("ProviderScope", "riverpod"),
+
+    // Bloc
+    ("Bloc", "bloc"),
+    ("Cubit", "bloc"),
+    ("BlocProvider", "bloc"),
+    ("BlocBuilder", "bloc"),
+    ("BlocListener", "bloc"),
+
+    // get_it DI
+    ("injectable", "get_it"),
+    ("singleton", "get_it"),
+    ("lazySingleton", "get_it"),
+    ("factoryMethod", "get_it"),
+    ("preResolve", "get_it"),
+    ("Injectable", "injectable"),
+    ("Singleton", "injectable"),
+    ("LazySingleton", "injectable"),
+
+    // Freezed
+    ("freezed", "freezed"),
+    ("Freezed", "freezed"),
+    ("JsonSerializable", "json_serializable"),
+
+    // Routing
+    ("GoRoute", "go_router"),
+    ("TypedGoRoute", "go_router"),
+    ("RoutePage", "auto_route"),
+    ("AutoRoute", "auto_route"),
+];
+
+/// Flutter widget hierarchy detection
+const FLUTTER_WIDGET_PATTERNS: &[(&str, &str)] = &[
+    // Core widgets
+    ("StatelessWidget", "widget"),
+    ("StatefulWidget", "widget"),
+    ("State", "state"),
+    ("InheritedWidget", "inherited"),
+
+    // Material
+    ("MaterialApp", "app"),
+    ("Scaffold", "layout"),
+    ("AppBar", "layout"),
+
+    // Routing
+    ("Navigator", "navigation"),
+    ("GoRouter", "navigation"),
+    ("AutoRouter", "navigation"),
+
+    // State management
+    ("Provider", "provider"),
+    ("ChangeNotifierProvider", "provider"),
+    ("BlocProvider", "bloc"),
+    ("ProviderScope", "riverpod"),
+    ("ConsumerWidget", "riverpod"),
+    ("HookConsumerWidget", "riverpod"),
+];
+```
+
+**GraphQL Extractor (Standalone + Embedded):**
+
+```rust
+pub struct GraphQLExtractor;
+
+impl GraphQLExtractor {
+    /// Extract operations from GraphQL document
+    fn extract_operations(&self, node: TsNode<'_>, source: &str) -> Vec<GraphQLOperation> {
+        let mut operations = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "operation_definition" => {
+                    let op_type = child.child_by_field_name("type")
+                        .map(|n| &source[n.start_byte()..n.end_byte()])
+                        .unwrap_or("query");
+
+                    let name = child.child_by_field_name("name")
+                        .map(|n| source[n.start_byte()..n.end_byte()].to_string());
+
+                    let variables = self.extract_variables(&child, source);
+                    let selections = self.extract_selections(&child, source);
+
+                    operations.push(GraphQLOperation {
+                        kind: op_type.to_string(),
+                        name,
+                        variables,
+                        selections,
+                        start_line: child.start_position().row as u32,
+                    });
+                }
+                "fragment_definition" => {
+                    let name = child.child_by_field_name("name")
+                        .map(|n| source[n.start_byte()..n.end_byte()].to_string());
+
+                    let on_type = child.child_by_field_name("type_condition")
+                        .map(|n| source[n.start_byte()..n.end_byte()].to_string());
+
+                    operations.push(GraphQLOperation {
+                        kind: "fragment".to_string(),
+                        name,
+                        variables: vec![],
+                        selections: self.extract_selections(&child, source),
+                        start_line: child.start_position().row as u32,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        operations
+    }
+
+    /// Extract field selections
+    fn extract_selections(&self, node: &TsNode<'_>, source: &str) -> Vec<String> {
+        let mut selections = Vec::new();
+
+        if let Some(selection_set) = node.child_by_field_name("selection_set") {
+            let mut cursor = selection_set.walk();
+            for child in selection_set.children(&mut cursor) {
+                if child.kind() == "field" {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        selections.push(source[name.start_byte()..name.end_byte()].to_string());
+                    }
+                }
+            }
+        }
+
+        selections
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphQLOperation {
+    pub kind: String,         // query, mutation, subscription, fragment
+    pub name: Option<String>,
+    pub variables: Vec<GraphQLVariable>,
+    pub selections: Vec<String>,
+    pub start_line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphQLVariable {
+    pub name: String,
+    pub type_name: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedGraphQL {
+    pub content: String,
+    pub host_line: u32,
+    pub host_language: Language,
+}
+
+/// Embedded GraphQL detection for TypeScript/JavaScript
+impl TypeScriptExtractor {
+    /// Extract GraphQL from tagged template literals: gql`...`
+    fn extract_embedded_graphql(&self, node: TsNode<'_>, source: &str) -> Vec<EmbeddedGraphQL> {
+        let mut queries = Vec::new();
+
+        if node.kind() == "tagged_template_expression" {
+            let tag = node.child_by_field_name("tag");
+            if let Some(tag) = tag {
+                let tag_text = &source[tag.start_byte()..tag.end_byte()];
+                if tag_text == "gql" || tag_text == "graphql" {
+                    if let Some(template) = node.child_by_field_name("template_string") {
+                        let content = &source[template.start_byte()..template.end_byte()];
+                        // Strip backticks
+                        let cleaned = content.trim_start_matches('`').trim_end_matches('`');
+                        queries.push(EmbeddedGraphQL {
+                            content: cleaned.to_string(),
+                            host_line: node.start_position().row as u32,
+                            host_language: Language::TypeScript,
+                        });
+                    }
+                }
+            }
+        }
+
+        queries
+    }
+}
+```
+
+**Bash/Shell Extractor:**
+
+```rust
+pub struct BashExtractor;
+
+impl BashExtractor {
+    /// Extract function definitions
+    fn extract_function(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // Pattern 1: function name() { }
+        // Pattern 2: name() { }
+        if node.kind() != "function_definition" {
+            return None;
+        }
+
+        let name = node.child_by_field_name("name")?;
+        let name_text = &source[name.start_byte()..name.end_byte()];
+
+        Some(Node {
+            kind: NodeKind::Function,
+            name: name_text.to_string(),
+            language: Language::Bash,
+            // ... other fields
+        })
+    }
+
+    /// Extract source/import statements
+    fn extract_source(&self, node: TsNode<'_>, source: &str) -> Option<Edge> {
+        // Pattern: source ./file.sh or . ./file.sh
+        if node.kind() != "command" {
+            return None;
+        }
+
+        let command_name = node.child_by_field_name("name")?;
+        let cmd_text = &source[command_name.start_byte()..command_name.end_byte()];
+
+        if cmd_text == "source" || cmd_text == "." {
+            let arg = node.child_by_field_name("argument")?;
+            let path = &source[arg.start_byte()..arg.end_byte()];
+            return Some(Edge {
+                kind: EdgeKind::Imports,
+                // ... target is the sourced file
+            });
+        }
+
+        None
+    }
+
+    /// Extract variable assignments
+    fn extract_variable(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        if node.kind() != "variable_assignment" {
+            return None;
+        }
+
+        let name = node.child_by_field_name("name")?;
+        let name_text = &source[name.start_byte()..name.end_byte()];
+
+        Some(Node {
+            kind: NodeKind::Variable,
+            name: name_text.to_string(),
+            language: Language::Bash,
+            // ... other fields
+        })
+    }
+}
+```
+
+**Terraform/HCL Extractor:**
+
+```rust
+pub struct HclExtractor;
+
+impl HclExtractor {
+    /// Extract Terraform resource blocks
+    fn extract_resource(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // resource "aws_instance" "web" { }
+        if node.kind() != "block" {
+            return None;
+        }
+
+        let block_type = node.child(0)?;
+        let type_text = &source[block_type.start_byte()..block_type.end_byte()];
+
+        if type_text != "resource" {
+            return None;
+        }
+
+        // Get resource type and name
+        let resource_type = node.child(1)?;
+        let resource_name = node.child(2)?;
+
+        let type_str = source[resource_type.start_byte()..resource_type.end_byte()]
+            .trim_matches('"');
+        let name_str = source[resource_name.start_byte()..resource_name.end_byte()]
+            .trim_matches('"');
+
+        Some(Node {
+            kind: NodeKind::Variable,  // or custom NodeKind::Resource
+            name: format!("{}.{}", type_str, name_str),
+            language: Language::Hcl,
+            // ... metadata includes resource_type
+        })
+    }
+
+    /// Extract module references
+    fn extract_module(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // module "vpc" { source = "..." }
+        if node.kind() != "block" {
+            return None;
+        }
+
+        let block_type = node.child(0)?;
+        if &source[block_type.start_byte()..block_type.end_byte()] != "module" {
+            return None;
+        }
+
+        let module_name = node.child(1)?;
+        let name = source[module_name.start_byte()..module_name.end_byte()]
+            .trim_matches('"');
+
+        // Find source attribute for module path
+        let source_path = self.find_attribute(&node, "source", source);
+
+        Some(Node {
+            kind: NodeKind::Module,
+            name: name.to_string(),
+            language: Language::Hcl,
+            // ... metadata includes source_path
+        })
+    }
+
+    /// Extract variable definitions
+    fn extract_variable(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // variable "region" { type = string, default = "us-west-2" }
+        if node.kind() != "block" {
+            return None;
+        }
+
+        let block_type = node.child(0)?;
+        if &source[block_type.start_byte()..block_type.end_byte()] != "variable" {
+            return None;
+        }
+
+        let var_name = node.child(1)?;
+        let name = source[var_name.start_byte()..var_name.end_byte()]
+            .trim_matches('"');
+
+        Some(Node {
+            kind: NodeKind::Variable,
+            name: name.to_string(),
+            language: Language::Hcl,
+        })
+    }
+
+    /// Extract output definitions
+    fn extract_output(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // output "ip_address" { value = aws_instance.web.public_ip }
+        if node.kind() != "block" {
+            return None;
+        }
+
+        let block_type = node.child(0)?;
+        if &source[block_type.start_byte()..block_type.end_byte()] != "output" {
+            return None;
+        }
+
+        let output_name = node.child(1)?;
+        let name = source[output_name.start_byte()..output_name.end_byte()]
+            .trim_matches('"');
+
+        Some(Node {
+            kind: NodeKind::Export,  // Outputs are exports
+            name: name.to_string(),
+            language: Language::Hcl,
+        })
+    }
+
+    /// Extract data source references
+    fn extract_data(&self, node: TsNode<'_>, source: &str) -> Option<Node> {
+        // data "aws_ami" "ubuntu" { }
+        if node.kind() != "block" {
+            return None;
+        }
+
+        let block_type = node.child(0)?;
+        if &source[block_type.start_byte()..block_type.end_byte()] != "data" {
+            return None;
+        }
+
+        let data_type = node.child(1)?;
+        let data_name = node.child(2)?;
+
+        let type_str = source[data_type.start_byte()..data_type.end_byte()]
+            .trim_matches('"');
+        let name_str = source[data_name.start_byte()..data_name.end_byte()]
+            .trim_matches('"');
+
+        Some(Node {
+            kind: NodeKind::Variable,  // or custom NodeKind::DataSource
+            name: format!("data.{}.{}", type_str, name_str),
+            language: Language::Hcl,
+        })
+    }
+}
+
+/// Terraform block type patterns
+const HCL_BLOCK_PATTERNS: &[(&str, &str)] = &[
+    ("resource", "terraform"),
+    ("data", "terraform"),
+    ("module", "terraform"),
+    ("variable", "terraform"),
+    ("output", "terraform"),
+    ("locals", "terraform"),
+    ("provider", "terraform"),
+    ("terraform", "terraform"),
+
+    // Vault
+    ("secret", "vault"),
+    ("policy", "vault"),
+
+    // Nomad
+    ("job", "nomad"),
+    ("group", "nomad"),
+    ("task", "nomad"),
 ];
 ```
 
@@ -1709,18 +2252,26 @@ rust-bert = { version = "0.23", default-features = false, features = ["onnx"] }
 # - Linux/Windows: ort with load-dynamic only (CPU)
 # See platform-specific dependencies below
 
-# Tree-sitter
+# Tree-sitter core
 tree-sitter = "0.22"
+
+# Primary targets (first-class support)
 tree-sitter-typescript = "0.21"
 tree-sitter-javascript = "0.21"
-tree-sitter-python = "0.21"
 tree-sitter-rust = "0.21"
+tree-sitter-php = "0.21"
+tree-sitter-dart = "0.0"           # Dart/Flutter
+tree-sitter-graphql = "0.2"        # GraphQL (standalone + embedded)
+tree-sitter-bash = "0.21"          # Shell scripts
+tree-sitter-hcl = "1.1"            # Terraform, Vault, Nomad
+
+# Secondary targets (extraction only)
+tree-sitter-python = "0.21"
 tree-sitter-go = "0.21"
 tree-sitter-java = "0.21"
 tree-sitter-c = "0.21"
 tree-sitter-cpp = "0.21"
 tree-sitter-c-sharp = "0.21"
-tree-sitter-php = "0.21"
 tree-sitter-ruby = "0.21"
 tree-sitter-swift = "0.21"
 tree-sitter-kotlin = "0.21"
@@ -2997,11 +3548,27 @@ The following features are deferred to future releases:
 
 | Feature | Reason | Priority |
 |---------|--------|----------|
-| **Liquid language support** | Not in target languages (TS, JS, Rust, PHP) | Low |
+| **Liquid language support** | Not in primary targets | Low |
 | **Context7 integration** | Requires network access | Medium |
 | **Doc tool** | Separate feature for PRDs, user stories | Medium |
 | **int8/binary quantization** | Optimization after baseline works | Low |
 | **Multiple embedding models** | Complexity; single model works well | Low |
+| **Python framework patterns** | Secondary target, extraction only | Low |
+| **Go framework patterns** | Secondary target, extraction only | Low |
+
+### 9.10 Primary Target Languages
+
+The following languages have **first-class support** with full framework patterns:
+
+| Language | Frameworks/Patterns |
+|----------|---------------------|
+| **TypeScript/JavaScript** | React, Next.js, Express, NestJS, Angular, embedded GraphQL |
+| **Rust** | Actix-web, Axum, Tokio, Serde, attribute macros |
+| **PHP** | Laravel, Symfony |
+| **Dart/Flutter** | Widgets, Riverpod, Bloc, get_it DI, GoRouter, AutoRoute, embedded GraphQL |
+| **GraphQL** | Operations, fragments, embedded in TS/JS/Dart |
+| **Bash** | Functions, source imports, variables |
+| **Terraform/HCL** | Resources, modules, variables, outputs, data sources |
 
 ---
 
