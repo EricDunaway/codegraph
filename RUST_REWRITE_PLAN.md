@@ -276,7 +276,7 @@ pub enum Language {
     Ruby,
     Swift,
     Kotlin,
-    Liquid,
+    // Note: Liquid deferred to future release (see Section 9.9)
 }
 
 /// Visibility modifier
@@ -505,8 +505,7 @@ fn get_grammar(lang: Language) -> Result<TsLanguage, ParseError> {
         Language::Ruby => Ok(tree_sitter_ruby::language()),
         Language::Swift => Ok(tree_sitter_swift::language()),
         Language::Kotlin => Ok(tree_sitter_kotlin::language()),
-        Language::Liquid => Err(ParseError::RegexFallback),
-        _ => Err(ParseError::UnsupportedLanguage),
+        // Note: Liquid deferred to future release (see Section 9.9)
     }
 }
 ```
@@ -1026,29 +1025,48 @@ impl TextEmbedder {
 }
 
 /// Supported embedding models (pre-downloadable)
-#[derive(Debug, Clone, Copy)]
+///
+/// Default: nomic-embed-text-v1.5 (matches TypeScript version)
+/// - 768 dimensions
+/// - 8192 token context window
+/// - Supports: TypeScript, JavaScript, Rust, PHP, and 100+ other languages
+#[derive(Debug, Clone, Copy, Default)]
 pub enum EmbeddingModel {
-    /// all-MiniLM-L6-v2: 384 dimensions, fast, good quality
-    AllMiniLmL6V2,
-    /// all-MiniLM-L12-v2: 384 dimensions, slightly better quality
-    AllMiniLmL12V2,
-    /// all-distilroberta-v1: 768 dimensions, best quality
-    AllDistilrobertaV1,
+    /// nomic-embed-text-v1.5: 768 dimensions, 8192 tokens, best for code + text
+    /// Requires prefixes: "search_document: " and "search_query: "
+    #[default]
+    NomicEmbedTextV1_5,
+    /// StarEncoder: 768 dimensions, code-optimized (for dual-embeddings feature)
+    StarEncoder,
 }
 
 impl EmbeddingModel {
     pub fn dimension(&self) -> usize {
-        match self {
-            Self::AllMiniLmL6V2 | Self::AllMiniLmL12V2 => 384,
-            Self::AllDistilrobertaV1 => 768,
-        }
+        768  // Both models use 768 dimensions
     }
 
     pub fn model_id(&self) -> &'static str {
         match self {
-            Self::AllMiniLmL6V2 => "sentence-transformers/all-MiniLM-L6-v2",
-            Self::AllMiniLmL12V2 => "sentence-transformers/all-MiniLM-L12-v2",
-            Self::AllDistilrobertaV1 => "sentence-transformers/all-distilroberta-v1",
+            Self::NomicEmbedTextV1_5 => "nomic-ai/nomic-embed-text-v1.5",
+            Self::StarEncoder => "bigcode/starencoder",
+        }
+    }
+
+    pub fn requires_prefix(&self) -> bool {
+        matches!(self, Self::NomicEmbedTextV1_5)
+    }
+
+    pub fn document_prefix(&self) -> &'static str {
+        match self {
+            Self::NomicEmbedTextV1_5 => "search_document: ",
+            Self::StarEncoder => "",
+        }
+    }
+
+    pub fn query_prefix(&self) -> &'static str {
+        match self {
+            Self::NomicEmbedTextV1_5 => "search_query: ",
+            Self::StarEncoder => "",
         }
     }
 }
@@ -2226,53 +2244,764 @@ fn test_model_checksum_required() {
 
 ## 9. Adversarial Scrutiny
 
-### 9.1 Completeness Issues
+This section provides a critical review of the plan, identifying gaps, conflicts, and areas where the TypeScript version may be superior. Each issue includes options for resolution.
 
-| Area | Issue | Mitigation |
+### 9.1 Critical Issues Requiring Resolution
+
+#### Issue 1: Model Configuration Conflicts
+
+**Problem**: The plan references multiple embedding models inconsistently:
+- Section 3.5 shows `AllMiniLmL6V2` (384 dims), `AllMiniLmL12V2` (384 dims), `AllDistilrobertaV1` (768 dims)
+- Section 3.5.1 references `nomic-embed-text-v1.5` (768 dims) and `StarEncoder` (768 dims)
+- The TypeScript version uses `nomic-ai/nomic-embed-text-v1.5` exclusively
+
+**Options**:
+| Option | Pros | Cons | Recommendation |
+|--------|------|------|----------------|
+| A: Use nomic-embed-text-v1.5 only | Matches TypeScript, simpler | Single model limits flexibility | ✅ **Default** |
+| B: Support model selection | Flexible | More complex, testing burden | For future |
+| C: Hardcode StarEncoder | Code-optimized | May not work well for natural language queries | Not recommended |
+
+**Resolution**: Use `nomic-embed-text-v1.5` as the default single model. Remove `AllMiniLmL6V2` references. `dual-embeddings` feature adds StarEncoder as opt-in.
+
+---
+
+#### Issue 2: StarEncoder Availability in rust-bert
+
+**Problem**: StarEncoder may not be available in rust-bert's pre-built model catalog. Need to verify ONNX model availability.
+
+**Options**:
+| Option | Pros | Cons | Recommendation |
+|--------|------|------|----------------|
+| A: Convert StarEncoder to ONNX manually | Works with rust-bert | Requires maintenance | For `dual-embeddings` feature |
+| B: Use CodeBERT instead | Available in rust-bert | Doesn't support TypeScript/Rust well | Not recommended |
+| C: Use nomic for both code and text | Simple | Slightly worse code search | ✅ **Default** |
+
+**Resolution**: Default to nomic-only. Document StarEncoder ONNX conversion for `dual-embeddings` feature.
+
+---
+
+#### Issue 3: Missing MCP Tool Implementations
+
+**Problem**: Only `codegraph_node` and `codegraph_file_nodes` have implementation details. The following tools lack implementation code:
+- `codegraph_search`
+- `codegraph_context`
+- `codegraph_callers`
+- `codegraph_callees`
+- `codegraph_impact`
+
+**Resolution**: Add implementation details in Section 9.6 below.
+
+---
+
+#### Issue 4: ContextBuilder Not Specified
+
+**Problem**: TypeScript has a sophisticated `ContextBuilder` (434 lines) with:
+- Semantic search fallback to text search
+- Graph expansion from entry points
+- Code block extraction with size limits
+- Priority-based node selection
+- Markdown/JSON formatting
+
+The Rust plan only mentions "ContextBuilder" without implementation.
+
+**Resolution**: Add ContextBuilder specification in Section 9.7 below.
+
+---
+
+#### Issue 5: Missing Types from TypeScript
+
+**Problem**: The following TypeScript types are not defined in the Rust plan:
+- `SearchResult` (node + score)
+- `CodeBlock` (extracted source code)
+- `TaskContext` (context building output)
+- `BuildContextOptions`
+- `FindRelevantContextOptions`
+
+**Resolution**: Add type definitions in Section 9.8 below.
+
+---
+
+### 9.2 Completeness Issues
+
+| Area | Issue | Resolution |
 |------|-------|------------|
-| **Liquid Language** | TypeScript uses regex fallback due to tree-sitter ABI issues. Rust version needs same fallback. | Implement regex-based Liquid extractor in `languages/liquid.rs` |
-| **sqlite-vec integration** | sqlite-vec is pre-v1, API may change. | Pin specific version, monitor for breaking changes |
-| **ESM Dynamic Import** | TypeScript dynamically imports `@xenova/transformers`. Rust doesn't have equivalent. | Use `rust-bert` with ONNX backend, statically linked |
-| **Node Cache (LRU)** | TypeScript QueryBuilder has LRU cache. Plan doesn't mention caching strategy. | Add `lru` crate for node caching in QueryBuilder |
-| **Error JSON Arrays** | TypeScript stores errors as JSON arrays in `files.errors`. Plan doesn't specify serialization. | Use `serde_json::to_string(&errors)` for `Vec<String>` |
-| **Git Hooks** | TypeScript writes shell scripts. Rust needs to generate platform-appropriate scripts. | Detect platform, generate bash or batch scripts |
-| **Memory Monitoring** | TypeScript has memory monitoring utilities. Rust has different memory model. | May not be necessary; Rust has predictable memory usage |
-| **vec0 table migrations** | Existing databases won't have vec0 table. | Migration adds vec0 table, re-indexes embeddings if needed |
+| **Liquid Language** | Not needed for target languages (TS, JS, Rust, PHP) | **REMOVED** - Add as future feature |
+| **sqlite-vec pre-v1** | API may change | Pin `sqlite-vec = "0.1"`, monitor releases |
+| **Node LRU Cache** | TypeScript has LRU cache in QueryBuilder | Add `lru` crate, cache `get_node` results |
+| **Error Serialization** | Errors stored as JSON arrays | Use `serde_json::to_string(&errors)` |
+| **Git Hooks Platform** | Need bash/batch scripts | Detect via `cfg!(windows)`, generate appropriate script |
+| **Progress Callbacks** | TypeScript uses callbacks | Use `impl Fn(Progress)` or channel-based reporting |
+| **Incremental Sync** | Change detection algorithm missing | Use file content hash comparison (already in TrackedFile) |
 
-### 9.2 Accuracy Issues
+### 9.3 Accuracy Corrections
 
-| Claim | Reality | Correction |
-|-------|---------|------------|
-| "Same tree-sitter grammars" | Rust tree-sitter crates may have different versions than Node bindings | Pin specific grammar versions; test extraction parity |
-| "768-dimensional embeddings" | Dimension depends on model; nomic-embed-text-v1.5 is 768 | Correct, but should be configurable |
-| "No network by default" | rust-bert/ort may try to download models or ONNX runtime | Set `RUSTBERT_CACHE` env var, use `ort = { features = ["load-dynamic"] }`, pre-download models |
-| "Prepared statements" | rusqlite prepared statements work differently than better-sqlite3 | Use `conn.prepare_cached()` for similar semantics |
+| Original Claim | Correction |
+|----------------|------------|
+| Multiple embedding models listed | Standardize on `nomic-embed-text-v1.5` (768 dims) |
+| Node ID format "kind:32-char-hex" | Match TypeScript format: `"{kind}:{sha256_prefix}"` |
+| `conn.prepare()` for caching | Use `conn.prepare_cached()` for LRU statement cache |
+| Dimension from model config | Hardcode 768 for nomic, make configurable for custom models |
 
-### 9.3 Missing Components
+### 9.4 TypeScript Features Gap Analysis
 
-1. **Incremental Sync**: Plan mentions sync but doesn't detail change detection algorithm
-2. **Progress Callbacks**: TypeScript uses callbacks; Rust needs different pattern (channels or trait)
-3. **Concurrent Indexing Prevention**: Need Mutex equivalent
-4. **Config Validation**: Schema validation for config.json
-5. **Graceful Shutdown**: Signal handling for CLI and MCP server
-6. **Cross-Platform Paths**: Windows path handling differs from Unix
+| TypeScript Feature | Rust Plan Status | Action |
+|--------------------|------------------|--------|
+| Semantic → Text search fallback | ❌ Missing | Add fallback logic in search |
+| Code block extraction with truncation | ❌ Missing | Add to ContextBuilder |
+| Entry point prioritization | ❌ Missing | Add priority scoring |
+| Subgraph merging | ❌ Missing | Add `merge_subgraphs()` |
+| `get_nodes_in_file()` query | ✅ Added via `codegraph_file_nodes` | Complete |
+| Decorator extraction (TS/JS) | ✅ Added | Complete |
+| Attribute macro extraction (Rust) | ✅ Added | Complete |
+| Framework pattern detection | ✅ Listed | Needs implementation detail |
 
-### 9.4 Performance Considerations
+### 9.5 Behavioral Parity Requirements
 
-| TypeScript Behavior | Rust Consideration |
-|---------------------|-------------------|
-| Single-threaded by default | Can use `rayon` for parallel file processing |
-| Async I/O for embeddings | Consider `tokio` for async, but adds complexity |
-| V8 GC pauses | No GC, but need careful memory management |
-| better-sqlite3 sync API | rusqlite is also sync; good match |
+These must match TypeScript exactly for database compatibility:
 
-### 9.5 Behavioral Parity Risks
+| Behavior | Requirement |
+|----------|-------------|
+| Node ID hash | Same SHA256 input: `{filePath}:{kind}:{name}:{startLine}` |
+| Line numbers | 1-indexed (not 0-indexed) |
+| Path separators | Always forward slashes in database |
+| FTS5 tokenization | Default SQLite tokenizer |
+| Content hash | SHA256 of file content |
 
-1. **Node ID Generation**: Must produce identical hashes for same inputs
-2. **FTS5 Queries**: Tokenization may differ between platforms
-3. **File Glob Patterns**: Glob crate may have different semantics
-4. **Line Counting**: Off-by-one errors between 0-indexed and 1-indexed
-5. **Path Normalization**: Forward vs backward slashes
+---
+
+### 9.6 Missing Tool Implementations
+
+```rust
+impl MCPServer {
+    /// codegraph_search - Quick symbol search by name
+    fn handle_search(&mut self, args: Value) -> Result<Value, MCPError> {
+        let query: String = serde_json::from_value(args["query"].clone())?;
+        let kind: Option<String> = args.get("kind")
+            .and_then(|k| k.as_str())
+            .map(|s| s.to_string());
+        let limit: usize = args.get("limit")
+            .and_then(|l| l.as_u64())
+            .unwrap_or(10) as usize;
+
+        // Sanitize query for FTS5
+        let sanitized = sanitize_search_query(&query);
+
+        // Search using FTS5 + optional kind filter
+        let results = self.codegraph.search_nodes(&sanitized, kind.as_deref(), limit)?;
+
+        Ok(json!({
+            "results": results.iter().map(|r| json!({
+                "id": r.node.id.0,
+                "name": r.node.name,
+                "kind": r.node.kind,
+                "filePath": r.node.file_path,
+                "startLine": r.node.start_line,
+                "score": r.score,
+            })).collect::<Vec<_>>()
+        }))
+    }
+
+    /// codegraph_context - Get relevant code context for a task
+    fn handle_context(&mut self, args: Value) -> Result<Value, MCPError> {
+        let task: String = serde_json::from_value(args["task"].clone())?;
+        let max_nodes: usize = args.get("maxNodes")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(20) as usize;
+        let include_code: bool = args.get("includeCode")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+        let embedding_mode: &str = args.get("embeddingMode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("auto");
+
+        // Build context using ContextBuilder
+        let context = self.codegraph.build_context(&task, BuildContextOptions {
+            max_nodes,
+            include_code,
+            embedding_mode: embedding_mode.parse().unwrap_or_default(),
+            ..Default::default()
+        })?;
+
+        Ok(json!({
+            "summary": context.summary,
+            "entryPoints": context.entry_points.iter().map(|n| json!({
+                "id": n.id.0,
+                "name": n.name,
+                "kind": n.kind,
+                "filePath": n.file_path,
+            })).collect::<Vec<_>>(),
+            "codeBlocks": context.code_blocks.iter().map(|b| json!({
+                "filePath": b.file_path,
+                "startLine": b.start_line,
+                "endLine": b.end_line,
+                "language": b.language,
+                "content": b.content,
+            })).collect::<Vec<_>>(),
+            "stats": context.stats,
+        }))
+    }
+
+    /// codegraph_callers - Find what calls a function
+    fn handle_callers(&mut self, args: Value) -> Result<Value, MCPError> {
+        let node_id: String = serde_json::from_value(args["nodeId"].clone())?;
+        let depth: usize = args.get("depth")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(1) as usize;
+        let limit: usize = args.get("limit")
+            .and_then(|l| l.as_u64())
+            .unwrap_or(20) as usize;
+
+        let validated_id = validate_node_id(&node_id)?;
+
+        // Traverse incoming "calls" edges
+        let subgraph = self.codegraph.traverser().traverse_bfs(&validated_id, &TraversalOptions {
+            max_depth: depth,
+            max_nodes: limit,
+            direction: TraversalDirection::Incoming,
+            edge_kinds: Some(vec![EdgeKind::Calls]),
+            node_kinds: None,
+            include_start: true,
+        })?;
+
+        Ok(json!({
+            "nodeId": node_id,
+            "callers": subgraph.nodes.values()
+                .filter(|n| n.id != validated_id)
+                .map(|n| json!({
+                    "id": n.id.0,
+                    "name": n.name,
+                    "kind": n.kind,
+                    "filePath": n.file_path,
+                    "startLine": n.start_line,
+                })).collect::<Vec<_>>(),
+            "edges": subgraph.edges.iter().map(|e| json!({
+                "source": e.source.0,
+                "target": e.target.0,
+                "line": e.line,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// codegraph_callees - Find what a function calls
+    fn handle_callees(&mut self, args: Value) -> Result<Value, MCPError> {
+        let node_id: String = serde_json::from_value(args["nodeId"].clone())?;
+        let depth: usize = args.get("depth")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(1) as usize;
+        let limit: usize = args.get("limit")
+            .and_then(|l| l.as_u64())
+            .unwrap_or(20) as usize;
+
+        let validated_id = validate_node_id(&node_id)?;
+
+        // Traverse outgoing "calls" edges
+        let subgraph = self.codegraph.traverser().traverse_bfs(&validated_id, &TraversalOptions {
+            max_depth: depth,
+            max_nodes: limit,
+            direction: TraversalDirection::Outgoing,
+            edge_kinds: Some(vec![EdgeKind::Calls]),
+            node_kinds: None,
+            include_start: true,
+        })?;
+
+        Ok(json!({
+            "nodeId": node_id,
+            "callees": subgraph.nodes.values()
+                .filter(|n| n.id != validated_id)
+                .map(|n| json!({
+                    "id": n.id.0,
+                    "name": n.name,
+                    "kind": n.kind,
+                    "filePath": n.file_path,
+                    "startLine": n.start_line,
+                })).collect::<Vec<_>>(),
+            "edges": subgraph.edges.iter().map(|e| json!({
+                "source": e.source.0,
+                "target": e.target.0,
+                "line": e.line,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// codegraph_impact - Analyze what code would be affected by changing a symbol
+    fn handle_impact(&mut self, args: Value) -> Result<Value, MCPError> {
+        let node_id: String = serde_json::from_value(args["nodeId"].clone())?;
+        let depth: usize = args.get("depth")
+            .and_then(|d| d.as_u64())
+            .unwrap_or(2) as usize;
+
+        let validated_id = validate_node_id(&node_id)?;
+
+        // Get impact radius (all incoming references)
+        let subgraph = self.codegraph.traverser().get_impact_radius(&validated_id, depth)?;
+
+        // Group by file for easier understanding
+        let mut by_file: HashMap<String, Vec<&Node>> = HashMap::new();
+        for node in subgraph.nodes.values() {
+            by_file.entry(node.file_path.clone()).or_default().push(node);
+        }
+
+        Ok(json!({
+            "nodeId": node_id,
+            "impactedNodes": subgraph.nodes.len() - 1,  // Exclude self
+            "impactedFiles": by_file.len(),
+            "byFile": by_file.iter().map(|(file, nodes)| json!({
+                "filePath": file,
+                "nodes": nodes.iter().map(|n| json!({
+                    "id": n.id.0,
+                    "name": n.name,
+                    "kind": n.kind,
+                    "startLine": n.start_line,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "directCallers": subgraph.edges.iter()
+                .filter(|e| e.kind == EdgeKind::Calls && e.target == validated_id)
+                .count(),
+            "directReferences": subgraph.edges.iter()
+                .filter(|e| e.kind == EdgeKind::References && e.target == validated_id)
+                .count(),
+        }))
+    }
+}
+```
+
+---
+
+### 9.7 ContextBuilder Implementation
+
+```rust
+use std::collections::HashSet;
+
+/// Options for building context
+#[derive(Debug, Clone)]
+pub struct BuildContextOptions {
+    pub max_nodes: usize,
+    pub max_code_blocks: usize,
+    pub max_code_block_size: usize,
+    pub include_code: bool,
+    pub format: OutputFormat,
+    pub search_limit: usize,
+    pub traversal_depth: usize,
+    pub min_score: f32,
+    pub embedding_mode: EmbeddingMode,
+}
+
+impl Default for BuildContextOptions {
+    fn default() -> Self {
+        Self {
+            max_nodes: 20,
+            max_code_blocks: 5,
+            max_code_block_size: 1500,
+            include_code: true,
+            format: OutputFormat::Markdown,
+            search_limit: 3,
+            traversal_depth: 1,
+            min_score: 0.3,
+            embedding_mode: EmbeddingMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum EmbeddingMode {
+    #[default]
+    Auto,
+    Code,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OutputFormat {
+    Markdown,
+    Json,
+    Structured,
+}
+
+/// Built context for a task
+#[derive(Debug, Clone)]
+pub struct TaskContext {
+    pub query: String,
+    pub subgraph: Subgraph,
+    pub entry_points: Vec<Node>,
+    pub code_blocks: Vec<CodeBlock>,
+    pub related_files: Vec<String>,
+    pub summary: String,
+    pub stats: ContextStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextStats {
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub file_count: usize,
+    pub code_block_count: usize,
+    pub total_code_size: usize,
+}
+
+/// A block of extracted source code
+#[derive(Debug, Clone)]
+pub struct CodeBlock {
+    pub content: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub language: Language,
+    pub node_id: NodeId,
+}
+
+/// Search result with score
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub node: Node,
+    pub score: f32,
+}
+
+pub struct ContextBuilder<'a> {
+    project_root: &'a Path,
+    queries: &'a QueryBuilder,
+    traverser: &'a GraphTraverser<'a>,
+    vector_manager: Option<&'a VectorManager>,
+}
+
+impl<'a> ContextBuilder<'a> {
+    /// Build context for a task query
+    pub fn build_context(
+        &self,
+        query: &str,
+        options: BuildContextOptions,
+    ) -> Result<TaskContext, ContextError> {
+        // 1. Find relevant context via search + traversal
+        let subgraph = self.find_relevant_context(query, &options)?;
+
+        // 2. Get entry points (search result nodes)
+        let entry_points: Vec<Node> = subgraph.roots.iter()
+            .filter_map(|id| subgraph.nodes.get(id).cloned())
+            .collect();
+
+        // 3. Extract code blocks for key nodes
+        let code_blocks = if options.include_code {
+            self.extract_code_blocks(&subgraph, options.max_code_blocks, options.max_code_block_size)?
+        } else {
+            vec![]
+        };
+
+        // 4. Get related files
+        let related_files: Vec<String> = subgraph.nodes.values()
+            .map(|n| n.file_path.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // 5. Generate summary
+        let summary = self.generate_summary(query, &subgraph, &entry_points);
+
+        // 6. Calculate stats
+        let stats = ContextStats {
+            node_count: subgraph.nodes.len(),
+            edge_count: subgraph.edges.len(),
+            file_count: related_files.len(),
+            code_block_count: code_blocks.len(),
+            total_code_size: code_blocks.iter().map(|b| b.content.len()).sum(),
+        };
+
+        Ok(TaskContext {
+            query: query.to_string(),
+            subgraph,
+            entry_points,
+            code_blocks,
+            related_files,
+            summary,
+            stats,
+        })
+    }
+
+    /// Find relevant subgraph using semantic search with text fallback
+    fn find_relevant_context(
+        &self,
+        query: &str,
+        options: &BuildContextOptions,
+    ) -> Result<Subgraph, ContextError> {
+        let mut search_results: Vec<SearchResult> = vec![];
+
+        // Try semantic search first
+        if let Some(vm) = self.vector_manager {
+            if let Ok(results) = vm.search(query, options.search_limit) {
+                search_results = results;
+            }
+        }
+
+        // Fallback to text search if semantic search yielded nothing
+        if search_results.is_empty() {
+            search_results = self.queries.search_nodes(query, options.search_limit)?
+                .into_iter()
+                .map(|node| SearchResult { node, score: 1.0 })
+                .collect();
+        }
+
+        // Filter by minimum score
+        let filtered: Vec<_> = search_results.into_iter()
+            .filter(|r| r.score >= options.min_score)
+            .collect();
+
+        // Build subgraph from search results + traversal
+        let mut nodes = HashMap::new();
+        let mut edges = Vec::new();
+        let mut roots = Vec::new();
+
+        for result in &filtered {
+            nodes.insert(result.node.id.clone(), result.node.clone());
+            roots.push(result.node.id.clone());
+
+            // Traverse from each entry point
+            let traversal = self.traverser.traverse_bfs(&result.node.id, &TraversalOptions {
+                max_depth: options.traversal_depth,
+                max_nodes: options.max_nodes / filtered.len().max(1),
+                direction: TraversalDirection::Both,
+                edge_kinds: None,
+                node_kinds: None,
+                include_start: false,
+            })?;
+
+            // Merge results
+            for (id, node) in traversal.nodes {
+                nodes.entry(id).or_insert(node);
+            }
+            for edge in traversal.edges {
+                if !edges.iter().any(|e: &Edge| e.source == edge.source && e.target == edge.target) {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        // Trim to max_nodes, prioritizing entry points
+        if nodes.len() > options.max_nodes {
+            nodes = self.prioritize_nodes(nodes, &roots, &edges, options.max_nodes);
+            edges.retain(|e| nodes.contains_key(&e.source) && nodes.contains_key(&e.target));
+        }
+
+        Ok(Subgraph { nodes, edges, roots })
+    }
+
+    /// Prioritize nodes: entry points first, then their neighbors
+    fn prioritize_nodes(
+        &self,
+        nodes: HashMap<NodeId, Node>,
+        roots: &[NodeId],
+        edges: &[Edge],
+        max: usize,
+    ) -> HashMap<NodeId, Node> {
+        let mut priority_ids: HashSet<NodeId> = roots.iter().cloned().collect();
+
+        // Add direct neighbors of roots
+        for edge in edges {
+            if priority_ids.contains(&edge.source) {
+                priority_ids.insert(edge.target.clone());
+            }
+            if priority_ids.contains(&edge.target) {
+                priority_ids.insert(edge.source.clone());
+            }
+        }
+
+        let mut result = HashMap::new();
+
+        // Add priority nodes first
+        for id in &priority_ids {
+            if result.len() >= max { break; }
+            if let Some(node) = nodes.get(id) {
+                result.insert(id.clone(), node.clone());
+            }
+        }
+
+        // Fill remaining slots
+        for (id, node) in &nodes {
+            if result.len() >= max { break; }
+            result.entry(id.clone()).or_insert(node.clone());
+        }
+
+        result
+    }
+
+    /// Extract code blocks, prioritizing entry points and functions
+    fn extract_code_blocks(
+        &self,
+        subgraph: &Subgraph,
+        max_blocks: usize,
+        max_size: usize,
+    ) -> Result<Vec<CodeBlock>, ContextError> {
+        let mut blocks = Vec::new();
+        let mut seen_files: HashSet<String> = HashSet::new();
+
+        // Priority order: roots → functions/methods → classes
+        let mut priority_nodes: Vec<&Node> = vec![];
+
+        for id in &subgraph.roots {
+            if let Some(node) = subgraph.nodes.get(id) {
+                priority_nodes.push(node);
+            }
+        }
+
+        for node in subgraph.nodes.values() {
+            if !subgraph.roots.contains(&node.id) {
+                if matches!(node.kind, NodeKind::Function | NodeKind::Method) {
+                    priority_nodes.push(node);
+                }
+            }
+        }
+
+        for node in subgraph.nodes.values() {
+            if !subgraph.roots.contains(&node.id) && node.kind == NodeKind::Class {
+                priority_nodes.push(node);
+            }
+        }
+
+        for node in priority_nodes {
+            if blocks.len() >= max_blocks { break; }
+
+            // Avoid duplicate files in code blocks
+            if seen_files.contains(&node.file_path) { continue; }
+
+            if let Ok(code) = self.read_node_code(node, max_size) {
+                seen_files.insert(node.file_path.clone());
+                blocks.push(CodeBlock {
+                    content: code,
+                    file_path: node.file_path.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    language: node.language,
+                    node_id: node.id.clone(),
+                });
+            }
+        }
+
+        Ok(blocks)
+    }
+
+    /// Read and optionally truncate node source code
+    fn read_node_code(&self, node: &Node, max_size: usize) -> Result<String, ContextError> {
+        let file_path = self.project_root.join(&node.file_path);
+        let content = safe_read_file(self.project_root, &node.file_path)?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        let start = (node.start_line as usize).saturating_sub(1);
+        let end = (node.end_line as usize).min(lines.len());
+
+        let code = lines[start..end].join("\n");
+
+        if code.len() > max_size {
+            Ok(format!("{}\n// ... truncated ...", &code[..max_size]))
+        } else {
+            Ok(code)
+        }
+    }
+
+    fn generate_summary(&self, query: &str, subgraph: &Subgraph, entry_points: &[Node]) -> String {
+        let names: Vec<_> = entry_points.iter().take(3).map(|n| n.name.as_str()).collect();
+        let remaining = if entry_points.len() > 3 {
+            format!(" and {} more", entry_points.len() - 3)
+        } else {
+            String::new()
+        };
+
+        let files: HashSet<_> = subgraph.nodes.values().map(|n| &n.file_path).collect();
+
+        format!(
+            "Found {} relevant code symbols across {} files. Key entry points: {}{}. {} relationships identified.",
+            subgraph.nodes.len(),
+            files.len(),
+            names.join(", "),
+            remaining,
+            subgraph.edges.len()
+        )
+    }
+}
+```
+
+---
+
+### 9.8 Database Query Layer Additions
+
+```rust
+impl QueryBuilder {
+    /// Search nodes by name using FTS5
+    pub fn search_nodes(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Node>, DbError> {
+        let sanitized = sanitize_search_query(query);
+
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT n.* FROM nodes n
+             JOIN nodes_fts f ON n.rowid = f.rowid
+             WHERE nodes_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+
+        let nodes = stmt.query_map([&sanitized, &limit.to_string()], |row| {
+            self.row_to_node(row)
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(nodes)
+    }
+
+    /// Get all nodes in a file
+    pub fn get_nodes_in_file(&self, file_path: &str) -> Result<Vec<Node>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT * FROM nodes WHERE file_path = ? ORDER BY start_line"
+        )?;
+
+        let nodes = stmt.query_map([file_path], |row| {
+            self.row_to_node(row)
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(nodes)
+    }
+
+    /// Merge two subgraphs, avoiding duplicate edges
+    pub fn merge_subgraphs(&self, a: Subgraph, b: Subgraph) -> Subgraph {
+        let mut nodes = a.nodes;
+        let mut edges = a.edges;
+        let mut roots = a.roots;
+
+        for (id, node) in b.nodes {
+            nodes.entry(id).or_insert(node);
+        }
+
+        for edge in b.edges {
+            let exists = edges.iter().any(|e|
+                e.source == edge.source && e.target == edge.target && e.kind == edge.kind
+            );
+            if !exists {
+                edges.push(edge);
+            }
+        }
+
+        for root in b.roots {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+
+        Subgraph { nodes, edges, roots }
+    }
+}
+```
+
+---
+
+### 9.9 Future Enhancements (Not in Initial Release)
+
+The following features are deferred to future releases:
+
+| Feature | Reason | Priority |
+|---------|--------|----------|
+| **Liquid language support** | Not in target languages (TS, JS, Rust, PHP) | Low |
+| **Context7 integration** | Requires network access | Medium |
+| **Doc tool** | Separate feature for PRDs, user stories | Medium |
+| **int8/binary quantization** | Optimization after baseline works | Low |
+| **Multiple embedding models** | Complexity; single model works well | Low |
 
 ---
 
