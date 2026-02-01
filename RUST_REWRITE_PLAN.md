@@ -177,12 +177,14 @@ default = ["cli"]
 cli = ["clap", "indicatif"]
 vectors = ["rust-bert/onnx", "sqlite-vec", "zerocopy"]  # Base: embeddings + vector search
 vectors-coreml = ["vectors", "ort/coreml"]              # macOS: GPU/Neural Engine acceleration
+dual-embeddings = ["vectors"]                            # StarEncoder (code) + nomic (text)
 mcp = ["tokio"]                                          # Optional: MCP server
 full = ["cli", "vectors", "mcp"]
 
 # Platform-specific defaults (set in build.rs or CI)
 # - macOS: vectors-coreml
 # - Linux/Windows: vectors
+# - dual-embeddings: opt-in for code+text hybrid search
 ```
 
 **Build Configuration:**
@@ -553,6 +555,189 @@ impl LanguageExtractor for TypeScriptExtractor {
 
     // ... implementation
 }
+```
+
+**TypeScript/JavaScript Decorator Extraction:**
+
+```rust
+impl TypeScriptExtractor {
+    /// Extract decorators from a class, method, or property
+    ///
+    /// TypeScript decorators: @Component, @Injectable, @Get('/path')
+    /// tree-sitter node type: "decorator"
+    fn extract_decorators(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+        let mut decorators = Vec::new();
+
+        // Decorators are siblings before the decorated node
+        if let Some(parent) = node.parent() {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                if child.kind() == "decorator" {
+                    // Extract the full decorator text: @Component({...})
+                    let text = &source[child.start_byte()..child.end_byte()];
+                    // Strip the @ prefix for storage
+                    let decorator = text.trim_start_matches('@').to_string();
+                    decorators.push(decorator);
+                }
+                // Stop when we reach the actual node
+                if child.id() == node.id() {
+                    break;
+                }
+            }
+        }
+
+        decorators
+    }
+
+    /// Create decorator edges for framework detection
+    fn create_decorator_edges(&self, node_id: &NodeId, decorators: &[String]) -> Vec<Edge> {
+        decorators.iter().filter_map(|dec| {
+            // Parse decorator name: "Component({...})" -> "Component"
+            let name = dec.split('(').next().unwrap_or(dec);
+
+            Some(Edge {
+                id: 0,
+                source: NodeId(format!("decorator:{}", name)),
+                target: node_id.clone(),
+                kind: EdgeKind::Decorates,
+                metadata: Some(serde_json::json!({ "full": dec })),
+                line: None,
+                col: None,
+            })
+        }).collect()
+    }
+}
+
+/// Known TypeScript/JavaScript decorator patterns for framework detection
+const TS_DECORATOR_PATTERNS: &[(&str, &str)] = &[
+    // Angular
+    ("Component", "angular"),
+    ("Injectable", "angular"),
+    ("NgModule", "angular"),
+    ("Directive", "angular"),
+    ("Pipe", "angular"),
+    // NestJS
+    ("Controller", "nestjs"),
+    ("Get", "nestjs"),
+    ("Post", "nestjs"),
+    ("Put", "nestjs"),
+    ("Delete", "nestjs"),
+    ("Injectable", "nestjs"),
+    ("Module", "nestjs"),
+    // TypeORM
+    ("Entity", "typeorm"),
+    ("Column", "typeorm"),
+    ("PrimaryGeneratedColumn", "typeorm"),
+    ("ManyToOne", "typeorm"),
+    ("OneToMany", "typeorm"),
+    // MobX
+    ("observable", "mobx"),
+    ("action", "mobx"),
+    ("computed", "mobx"),
+    // Class-validator
+    ("IsString", "class-validator"),
+    ("IsNumber", "class-validator"),
+    ("IsEmail", "class-validator"),
+];
+```
+
+**Rust Attribute Macro Extraction:**
+
+```rust
+pub struct RustExtractor;
+
+impl RustExtractor {
+    /// Extract attribute macros from Rust code
+    ///
+    /// Rust attributes: #[derive(Debug)], #[test], #[tokio::main]
+    /// tree-sitter node type: "attribute_item"
+    fn extract_attributes(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+        let mut attributes = Vec::new();
+
+        // Attributes are children or siblings of the item
+        let check_node = node.parent().unwrap_or(node);
+        let mut cursor = check_node.walk();
+
+        for child in check_node.children(&mut cursor) {
+            if child.kind() == "attribute_item" {
+                // Extract content: #[derive(Debug, Clone)] -> "derive(Debug, Clone)"
+                let text = &source[child.start_byte()..child.end_byte()];
+                // Strip #[ and ]
+                let attr = text
+                    .trim_start_matches("#[")
+                    .trim_end_matches(']')
+                    .to_string();
+                attributes.push(attr);
+            }
+            // Stop at the actual node
+            if child.id() == node.id() {
+                break;
+            }
+        }
+
+        attributes
+    }
+
+    /// Extract inner attributes (#![...]) for module-level metadata
+    fn extract_inner_attributes(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+        let mut attributes = Vec::new();
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() == "inner_attribute_item" {
+                let text = &source[child.start_byte()..child.end_byte()];
+                let attr = text
+                    .trim_start_matches("#![")
+                    .trim_end_matches(']')
+                    .to_string();
+                attributes.push(attr);
+            }
+        }
+
+        attributes
+    }
+
+    /// Parse derive macros into individual traits
+    fn parse_derive_traits(&self, attr: &str) -> Vec<String> {
+        if attr.starts_with("derive(") {
+            let inner = attr
+                .trim_start_matches("derive(")
+                .trim_end_matches(')');
+            inner.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Known Rust attribute patterns for framework/feature detection
+const RUST_ATTRIBUTE_PATTERNS: &[(&str, &str)] = &[
+    // Testing
+    ("test", "test"),
+    ("tokio::test", "tokio"),
+    ("async_std::test", "async_std"),
+    // Async runtimes
+    ("tokio::main", "tokio"),
+    ("async_std::main", "async_std"),
+    // Serialization
+    ("derive(Serialize", "serde"),
+    ("derive(Deserialize", "serde"),
+    ("serde(", "serde"),
+    // Web frameworks
+    ("get(", "actix-web"),
+    ("post(", "actix-web"),
+    ("route(", "axum"),
+    // Macros
+    ("derive(Debug", "std"),
+    ("derive(Clone", "std"),
+    ("derive(Default", "std"),
+    // Proc macros
+    ("proc_macro", "proc-macro"),
+    ("proc_macro_derive", "proc-macro"),
+];
 ```
 
 ### 3.4 Graph Module (`codegraph-graph/`)
@@ -1031,6 +1216,228 @@ impl VectorSearchManager {
 - **MATCH operator**: Fast brute-force similarity search
 - **Distance filtering**: Support for `distance < threshold` in WHERE clause
 - **Zero-copy with zerocopy crate**: Efficient f32 array to bytes conversion
+
+### 3.5.1 Hybrid Embedding Strategy (Optional Feature: `dual-embeddings`)
+
+When enabled, uses separate models for code and natural language:
+- **Code Model**: StarEncoder (768 dims) - optimized for code structure and syntax
+- **Text Model**: nomic-embed-text-v1.5 (768 dims) - optimized for natural language (comments, docstrings)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Code Node                              │
+├─────────────────────────────────────────────────────────────┤
+│  function parseConfig(path: string): Config {               │ ← Code Model
+│    // Load and validate configuration from disk             │ ← Text Model
+│    const data = fs.readFileSync(path);                      │ ← Code Model
+│    return validate(JSON.parse(data));                       │ ← Code Model
+│  }                                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Database Schema:**
+
+```sql
+-- Code embeddings (function bodies, signatures, identifiers)
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_code USING vec0(
+    node_id TEXT PRIMARY KEY,
+    embedding float[768]  -- StarEncoder
+);
+
+-- Text embeddings (comments, docstrings, natural language)
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_text USING vec0(
+    node_id TEXT PRIMARY KEY,
+    embedding float[768]  -- nomic-embed-text-v1.5
+);
+```
+
+**Dual Embedder Implementation:**
+
+```rust
+/// Hybrid embedding manager with code and text models
+pub struct DualEmbedder {
+    code_model: SentenceEmbeddingsModel,  // StarEncoder
+    text_model: SentenceEmbeddingsModel,  // nomic-embed-text
+}
+
+impl DualEmbedder {
+    /// Load both models from local cache
+    pub fn load(model_dir: &Path) -> Result<Self, EmbedderError> {
+        let code_model = Self::load_model(&model_dir.join("starencoder"))?;
+        let text_model = Self::load_model(&model_dir.join("nomic-embed-text-v1.5"))?;
+
+        Ok(Self { code_model, text_model })
+    }
+
+    /// Embed code content (function bodies, expressions)
+    pub fn embed_code(&self, code: &str) -> Result<Vec<f32>, EmbedderError> {
+        self.code_model.encode(&[code])
+            .map(|e| e.into_iter().next().unwrap())
+            .map_err(|e| EmbedderError::InferenceError(e.to_string()))
+    }
+
+    /// Embed text content (comments, docstrings)
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+        // Use nomic prefix for document embedding
+        let prefixed = format!("search_document: {}", text);
+        self.text_model.encode(&[&prefixed])
+            .map(|e| e.into_iter().next().unwrap())
+            .map_err(|e| EmbedderError::InferenceError(e.to_string()))
+    }
+
+    /// Embed a query (auto-detects code vs natural language)
+    pub fn embed_query(&self, query: &str) -> Result<QueryEmbedding, EmbedderError> {
+        if Self::looks_like_code(query) {
+            Ok(QueryEmbedding {
+                code: Some(self.embed_code(query)?),
+                text: None,
+            })
+        } else {
+            let prefixed = format!("search_query: {}", query);
+            Ok(QueryEmbedding {
+                code: None,
+                text: Some(self.text_model.encode(&[&prefixed])
+                    .map(|e| e.into_iter().next().unwrap())
+                    .map_err(|e| EmbedderError::InferenceError(e.to_string()))?),
+            })
+        }
+    }
+
+    /// Heuristic: does this look like code?
+    fn looks_like_code(query: &str) -> bool {
+        // Contains code patterns: dots, parens, brackets, operators
+        let code_chars = ['.', '(', ')', '[', ']', '{', '}', ':', ';', '=', '-', '>'];
+        let code_char_count = query.chars().filter(|c| code_chars.contains(c)).count();
+        let has_camel_case = query.chars().any(|c| c.is_uppercase());
+
+        code_char_count >= 2 || (has_camel_case && query.contains('.'))
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryEmbedding {
+    pub code: Option<Vec<f32>>,
+    pub text: Option<Vec<f32>>,
+}
+```
+
+**Hybrid Search Implementation:**
+
+```rust
+pub struct HybridSearchManager {
+    code_dim: usize,
+    text_dim: usize,
+}
+
+impl HybridSearchManager {
+    /// Search using the appropriate index based on query type
+    pub fn search(
+        &self,
+        conn: &Connection,
+        query_embedding: &QueryEmbedding,
+        limit: usize,
+        weights: SearchWeights,
+    ) -> Result<Vec<(String, f64)>, VectorError> {
+        let mut results: HashMap<String, f64> = HashMap::new();
+
+        // Search code index if we have code embedding
+        if let Some(ref code_emb) = query_embedding.code {
+            let code_results = self.search_index(conn, "vec_code", code_emb, limit * 2)?;
+            for (node_id, distance) in code_results {
+                let score = 1.0 / (1.0 + distance);
+                *results.entry(node_id).or_default() += score * weights.code;
+            }
+        }
+
+        // Search text index if we have text embedding
+        if let Some(ref text_emb) = query_embedding.text {
+            let text_results = self.search_index(conn, "vec_text", text_emb, limit * 2)?;
+            for (node_id, distance) in text_results {
+                let score = 1.0 / (1.0 + distance);
+                *results.entry(node_id).or_default() += score * weights.text;
+            }
+        }
+
+        // Sort by combined score
+        let mut sorted: Vec<_> = results.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        sorted.truncate(limit);
+
+        Ok(sorted)
+    }
+
+    fn search_index(
+        &self,
+        conn: &Connection,
+        table: &str,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>, VectorError> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT node_id, distance FROM {} WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            table
+        ))?;
+
+        let results = stmt
+            .query_map(rusqlite::params![embedding.as_bytes(), limit as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(results)
+    }
+}
+
+/// Weights for combining code and text search results
+#[derive(Debug, Clone, Copy)]
+pub struct SearchWeights {
+    pub code: f64,
+    pub text: f64,
+}
+
+impl Default for SearchWeights {
+    fn default() -> Self {
+        Self { code: 0.7, text: 0.3 }
+    }
+}
+```
+
+**Feature Flag Configuration:**
+
+```toml
+[features]
+# Single model (default): nomic-embed-text-v1.5 for everything
+vectors = ["rust-bert/onnx", "sqlite-vec", "zerocopy"]
+
+# Dual model: StarEncoder for code + nomic-embed-text for comments
+dual-embeddings = ["vectors"]
+```
+
+**CLI Configuration:**
+
+```bash
+# Enable dual embeddings during indexing
+codegraph index --embeddings --dual-model
+
+# Query with explicit mode
+codegraph search "fs.readFileSync" --mode code
+codegraph search "load configuration" --mode text
+codegraph search "parseConfig" --mode auto  # default
+```
+
+**MCP Tool Extension:**
+
+```rust
+// In codegraph_context tool
+{
+    "embeddingMode": {
+        "type": "string",
+        "enum": ["auto", "code", "text"],
+        "default": "auto",
+        "description": "Embedding search mode: auto (detect), code (StarEncoder), text (nomic)"
+    }
+}
+```
 
 ### 3.6 MCP Server (`codegraph-mcp/`)
 
@@ -1568,10 +1975,47 @@ impl MCPServer {
             "codegraph_callees" => self.handle_callees(args),
             "codegraph_impact" => self.handle_impact(args),
             "codegraph_node" => self.handle_node(args),
+            "codegraph_file_nodes" => self.handle_file_nodes(args),
             _ => return Err(MCPError::UnknownTool(name.to_string())),
         };
 
         tool
+    }
+
+    /// Handle codegraph_file_nodes - list all symbols in a file
+    fn handle_file_nodes(&mut self, args: Value) -> Result<Value, MCPError> {
+        let file_path: String = serde_json::from_value(args["filePath"].clone())?;
+
+        // SECURITY: Validate file path is within project
+        let validated_path = validate_path(&self.root_dir, &self.root_dir.join(&file_path))?;
+        let relative_path = validated_path
+            .strip_prefix(&self.root_dir)
+            .unwrap_or(&validated_path)
+            .to_string_lossy()
+            .to_string();
+
+        // Get all nodes in this file
+        let nodes = self.codegraph.get_nodes_in_file(&relative_path)?;
+
+        // Group by kind for organized output
+        let mut by_kind: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+        for node in &nodes {
+            by_kind.entry(node.kind.to_string()).or_default().push(json!({
+                "id": node.id.0,
+                "name": node.name,
+                "signature": node.signature,
+                "startLine": node.start_line,
+                "endLine": node.end_line,
+                "visibility": node.visibility,
+                "decorators": node.decorators,
+            }));
+        }
+
+        Ok(json!({
+            "filePath": relative_path,
+            "nodeCount": nodes.len(),
+            "nodes": by_kind,
+        }))
     }
 
     fn handle_node(&mut self, args: Value) -> Result<Value, MCPError> {
