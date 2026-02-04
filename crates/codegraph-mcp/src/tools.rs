@@ -174,11 +174,12 @@ impl McpTools {
         let mut output = format!("Found {} results for '{}':\n\n", results.len(), query);
         for result in results {
             output.push_str(&format!(
-                "- {} `{}` ({}:{})\n",
+                "- {} `{}` ({}:{}) [id: {}]\n",
                 result.node.kind.as_str(),
                 result.node.qualified_name,
                 result.node.file_path,
-                result.node.start_line
+                result.node.start_line,
+                result.node.id.as_str()
             ));
         }
 
@@ -244,11 +245,12 @@ impl McpTools {
         let mut output = format!("Callers of '{}':\n\n", node_id);
         for caller in callers {
             output.push_str(&format!(
-                "- {} `{}` ({}:{})\n",
+                "- {} `{}` ({}:{}) [id: {}]\n",
                 caller.kind.as_str(),
                 caller.qualified_name,
                 caller.file_path,
-                caller.start_line
+                caller.start_line,
+                caller.id.as_str()
             ));
         }
 
@@ -285,11 +287,12 @@ impl McpTools {
         let mut output = format!("Callees of '{}':\n\n", node_id);
         for callee in callees {
             output.push_str(&format!(
-                "- {} `{}` ({}:{})\n",
+                "- {} `{}` ({}:{}) [id: {}]\n",
                 callee.kind.as_str(),
                 callee.qualified_name,
                 callee.file_path,
-                callee.start_line
+                callee.start_line,
+                callee.id.as_str()
             ));
         }
 
@@ -324,11 +327,12 @@ impl McpTools {
             output.push_str("**Direct dependents:**\n");
             for node in &impact.direct {
                 output.push_str(&format!(
-                    "- {} `{}` ({}:{})\n",
+                    "- {} `{}` ({}:{}) [id: {}]\n",
                     node.kind.as_str(),
                     node.qualified_name,
                     node.file_path,
-                    node.start_line
+                    node.start_line,
+                    node.id.as_str()
                 ));
             }
         }
@@ -337,11 +341,12 @@ impl McpTools {
             output.push_str("\n**Indirect dependents:**\n");
             for node in impact.indirect.iter().take(10) {
                 output.push_str(&format!(
-                    "- {} `{}` ({}:{})\n",
+                    "- {} `{}` ({}:{}) [id: {}]\n",
                     node.kind.as_str(),
                     node.qualified_name,
                     node.file_path,
-                    node.start_line
+                    node.start_line,
+                    node.id.as_str()
                 ));
             }
             if impact.indirect.len() > 10 {
@@ -419,10 +424,11 @@ impl McpTools {
         let mut output = format!("Symbols in '{}':\n\n", file_path);
         for node in nodes {
             output.push_str(&format!(
-                "- {} `{}` (line {})\n",
+                "- {} `{}` (line {}) [id: {}]\n",
                 node.kind.as_str(),
                 node.name,
-                node.start_line
+                node.start_line,
+                node.id.as_str()
             ));
         }
 
