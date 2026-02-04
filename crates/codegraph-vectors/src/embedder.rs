@@ -5,34 +5,54 @@
 
 use crate::error::VectorError;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+
+#[cfg(feature = "onnx")]
 use std::path::Path;
+
+/// Default model filename
+pub const DEFAULT_MODEL_FILENAME: &str = "nomic-embed-text-v1.5.onnx";
+/// Default tokenizer filename
+pub const DEFAULT_TOKENIZER_FILENAME: &str = "tokenizer.json";
+/// Models subdirectory name
+pub const MODELS_DIR: &str = "models";
+/// CodeGraph directory name
+pub const CODEGRAPH_DIR: &str = ".codegraph";
 
 /// Configuration for the embedder
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
-    /// Path to the ONNX model file
-    pub model_path: String,
-    /// Path to the tokenizer file
-    pub tokenizer_path: String,
+    /// Path to the ONNX model file (if None, will search standard locations)
+    pub model_path: Option<PathBuf>,
+    /// Path to the tokenizer file (if None, will search standard locations)
+    pub tokenizer_path: Option<PathBuf>,
     /// Expected SHA256 hash of the model (for integrity verification)
     pub model_hash: Option<String>,
     /// Maximum sequence length
     pub max_length: usize,
     /// Output dimension
     pub dimension: usize,
-    /// Whether to use CoreML on macOS
-    pub use_coreml: bool,
 }
 
 impl Default for EmbedderConfig {
     fn default() -> Self {
         Self {
-            model_path: "nomic-embed-text-v1.5.onnx".to_string(),
-            tokenizer_path: "tokenizer.json".to_string(),
+            model_path: None,
+            tokenizer_path: None,
             model_hash: None,
             max_length: 512,
             dimension: 768, // nomic-embed default
-            use_coreml: cfg!(target_os = "macos"),
+        }
+    }
+}
+
+impl EmbedderConfig {
+    /// Create config with explicit model paths
+    pub fn with_paths(model_path: impl Into<PathBuf>, tokenizer_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: Some(model_path.into()),
+            tokenizer_path: Some(tokenizer_path.into()),
+            ..Default::default()
         }
     }
 }
@@ -41,7 +61,7 @@ impl Default for EmbedderConfig {
 pub struct TextEmbedder {
     config: EmbedderConfig,
     #[cfg(feature = "onnx")]
-    session: Option<ort::Session>,
+    session: Option<ort::session::Session>,
     #[cfg(feature = "onnx")]
     tokenizer: Option<tokenizers::Tokenizer>,
 }
@@ -89,22 +109,88 @@ impl TextEmbedder {
         }
     }
 
-    /// Load ONNX model (only available with onnx feature)
-    #[cfg(feature = "onnx")]
-    fn load_onnx(&mut self) -> Result<(), VectorError> {
-        use ort::session::Session;
+    /// Get the standard model search paths (in priority order)
+    ///
+    /// Search order:
+    /// 1. Project-level: `.codegraph/models/`
+    /// 2. User-level: `~/.codegraph/models/`
+    pub fn model_search_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
 
-        // Verify model exists
-        let model_path = Path::new(&self.config.model_path);
-        if !model_path.exists() {
+        // 1. Project-level: .codegraph/models/
+        let project_path = PathBuf::from(CODEGRAPH_DIR).join(MODELS_DIR);
+        paths.push(project_path);
+
+        // 2. User-level: ~/.codegraph/models/
+        if let Some(home) = dirs_home() {
+            let user_path = home.join(CODEGRAPH_DIR).join(MODELS_DIR);
+            paths.push(user_path);
+        }
+
+        paths
+    }
+
+    /// Resolve model file path by searching standard locations
+    ///
+    /// If `explicit_path` is Some, uses that directly.
+    /// Otherwise searches project-level then user-level directories.
+    pub fn resolve_model_path(
+        explicit_path: Option<&PathBuf>,
+        filename: &str,
+    ) -> Result<PathBuf, VectorError> {
+        // If explicit path provided, use it directly
+        if let Some(path) = explicit_path {
+            if path.exists() {
+                return Ok(path.clone());
+            }
             return Err(VectorError::ModelNotFound {
-                path: self.config.model_path.clone(),
+                path: path.display().to_string(),
             });
         }
 
+        // Search standard locations
+        for search_dir in Self::model_search_paths() {
+            let candidate = search_dir.join(filename);
+            if candidate.exists() {
+                log::info!("Found model at: {}", candidate.display());
+                return Ok(candidate);
+            }
+            log::debug!("Model not found at: {}", candidate.display());
+        }
+
+        // Not found - provide helpful error message
+        let search_paths: Vec<String> = Self::model_search_paths()
+            .iter()
+            .map(|p| p.join(filename).display().to_string())
+            .collect();
+
+        Err(VectorError::ModelNotFound {
+            path: format!(
+                "{} (searched: {})",
+                filename,
+                search_paths.join(", ")
+            ),
+        })
+    }
+
+    /// Load ONNX model (only available with onnx feature)
+    #[cfg(feature = "onnx")]
+    fn load_onnx(&mut self) -> Result<(), VectorError> {
+        // Resolve model path
+        let model_path = Self::resolve_model_path(
+            self.config.model_path.as_ref(),
+            DEFAULT_MODEL_FILENAME,
+        )?;
+
+        // Resolve tokenizer path
+        let tokenizer_path = Self::resolve_model_path(
+            self.config.tokenizer_path.as_ref(),
+            DEFAULT_TOKENIZER_FILENAME,
+        )?;
+
         // Verify integrity if hash provided
         if let Some(ref expected_hash) = self.config.model_hash {
-            let actual_hash = self.compute_file_hash(model_path)?;
+            let actual_hash = self.compute_file_hash(&model_path)?;
             if actual_hash != *expected_hash {
                 return Err(VectorError::IntegrityCheckFailed {
                     expected: expected_hash.clone(),
@@ -114,43 +200,77 @@ impl TextEmbedder {
         }
 
         // Load tokenizer
-        let tokenizer_path = Path::new(&self.config.tokenizer_path);
-        if !tokenizer_path.exists() {
-            return Err(VectorError::ModelNotFound {
-                path: self.config.tokenizer_path.clone(),
-            });
-        }
-
-        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| VectorError::TokenizationFailed(e.to_string()))?;
 
         // Build session with execution providers
-        let session = {
-            #[cfg(all(feature = "coreml", target_os = "macos"))]
-            {
-                use ort::execution_providers::CoreMLExecutionProvider;
-
-                Session::builder()
-                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
-                    .with_execution_providers([CoreMLExecutionProvider::default().build()])
-                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
-                    .commit_from_file(model_path)
-                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
-            }
-            #[cfg(not(all(feature = "coreml", target_os = "macos")))]
-            {
-                Session::builder()
-                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
-                    .commit_from_file(model_path)
-                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
-            }
-        };
+        // CoreML is auto-enabled on macOS Apple Silicon (M1/M2/M3/M4) via target-specific dependencies
+        let session = self.build_session(&model_path)?;
 
         self.session = Some(session);
         self.tokenizer = Some(tokenizer);
 
-        log::info!("Loaded embedding model from {}", self.config.model_path);
+        log::info!("Loaded embedding model from {}", model_path.display());
+        log::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(())
+    }
+
+    /// Build ONNX session with appropriate execution providers
+    /// CoreML is automatically used on macOS Apple Silicon for Neural Engine + GPU acceleration
+    #[cfg(feature = "onnx")]
+    fn build_session(&self, model_path: &Path) -> Result<ort::session::Session, VectorError> {
+        use ort::session::Session;
+
+        // On macOS Apple Silicon, try CoreML execution provider for Neural Engine + GPU acceleration
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use ort::ep::CoreML;
+
+            // Check if CODEGRAPH_NO_COREML env var is set to skip CoreML
+            if std::env::var("CODEGRAPH_NO_COREML").is_ok() {
+                log::info!("CoreML disabled via CODEGRAPH_NO_COREML, using CPU");
+                return Session::builder()
+                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
+                    .commit_from_file(model_path)
+                    .map_err(|e| VectorError::ModelLoadFailed(e.to_string()));
+            }
+
+            let coreml_ep = CoreML::default()
+                .with_subgraphs(true) // Enable for all subgraphs
+                .build();
+
+            match Session::builder()
+                .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
+                .with_execution_providers([coreml_ep])
+            {
+                Ok(builder) => {
+                    log::info!("Using CoreML execution provider (Apple Silicon)");
+                    builder
+                        .commit_from_file(model_path)
+                        .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "CoreML execution provider failed to register, falling back to CPU: {}",
+                        e
+                    );
+                    // Fall back to CPU-only session
+                    Session::builder()
+                        .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
+                        .commit_from_file(model_path)
+                        .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))
+                }
+            }
+        }
+
+        // On all other platforms, use default CPU execution
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Session::builder()
+                .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))?
+                .commit_from_file(model_path)
+                .map_err(|e| VectorError::ModelLoadFailed(e.to_string()))
+        }
     }
 
     /// Compute SHA256 hash of a file
@@ -164,7 +284,7 @@ impl TextEmbedder {
     }
 
     /// Generate embedding for a single text
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>, VectorError> {
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>, VectorError> {
         #[cfg(feature = "onnx")]
         {
             self.embed_onnx(text)
@@ -177,20 +297,18 @@ impl TextEmbedder {
     }
 
     /// Generate embeddings for multiple texts
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, VectorError> {
+    pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, VectorError> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
 
     /// ONNX embedding implementation
     #[cfg(feature = "onnx")]
-    fn embed_onnx(&self, text: &str) -> Result<Vec<f32>, VectorError> {
-        use ndarray::Array2;
-        use ort::value::Value;
+    fn embed_onnx(&mut self, text: &str) -> Result<Vec<f32>, VectorError> {
+        use ort::value::Tensor;
 
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| VectorError::ModelLoadFailed("Model not loaded".to_string()))?;
+        // Get config values first to avoid borrow issues
+        let max_length = self.config.max_length;
+        let dimension = self.config.dimension;
 
         let tokenizer = self
             .tokenizer
@@ -208,23 +326,38 @@ impl TextEmbedder {
             .iter()
             .map(|&m| m as i64)
             .collect();
+        // token_type_ids are all zeros for single-sentence encoding (BERT-style models)
+        let token_type_ids: Vec<i64> = encoding
+            .get_type_ids()
+            .iter()
+            .map(|&t| t as i64)
+            .collect();
 
-        let seq_len = input_ids.len().min(self.config.max_length);
+        let seq_len = input_ids.len().min(max_length);
 
-        // Create input tensors
-        let input_ids_array = Array2::from_shape_vec((1, seq_len), input_ids[..seq_len].to_vec())
-            .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
-
-        let attention_mask_array =
-            Array2::from_shape_vec((1, seq_len), attention_mask[..seq_len].to_vec())
+        // Create ort Tensors using shape + vec pattern (ort 2.0 API)
+        let input_ids_tensor =
+            Tensor::from_array(([1usize, seq_len], input_ids[..seq_len].to_vec()))
+                .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
+        let attention_mask_tensor =
+            Tensor::from_array(([1usize, seq_len], attention_mask[..seq_len].to_vec()))
+                .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
+        let token_type_ids_tensor =
+            Tensor::from_array(([1usize, seq_len], token_type_ids[..seq_len].to_vec()))
                 .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
 
-        // Run inference
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| VectorError::ModelLoadFailed("Model not loaded".to_string()))?;
+
+        // Run inference using ort::inputs! macro
         let outputs = session
             .run(ort::inputs![
-                "input_ids" => Value::from_array(input_ids_array)?,
-                "attention_mask" => Value::from_array(attention_mask_array)?
-            ]?)
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor
+            ])
             .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
 
         // Extract embedding (usually last_hidden_state or pooler_output)
@@ -233,41 +366,19 @@ impl TextEmbedder {
             .or_else(|| outputs.get("sentence_embedding"))
             .ok_or_else(|| VectorError::InferenceFailed("No output tensor found".to_string()))?;
 
-        let embedding: Vec<f32> = output
+        // Extract the tensor data - try_extract_tensor returns (&Shape, &[T])
+        let (_, data) = output
             .try_extract_tensor::<f32>()
-            .map_err(|e| VectorError::InferenceFailed(e.to_string()))?
-            .view()
-            .iter()
-            .take(self.config.dimension)
-            .copied()
-            .collect();
+            .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
 
-        // Mean pooling if we got token embeddings
-        if embedding.len() > self.config.dimension {
-            let pooled = self.mean_pool(&embedding, seq_len);
-            Ok(pooled)
+        let embedding: Vec<f32> = data.iter().take(dimension).copied().collect();
+
+        // Mean pooling if we got token embeddings (use standalone function to avoid borrow issues)
+        if embedding.len() > dimension {
+            Ok(mean_pool(&embedding, seq_len, dimension))
         } else {
             Ok(embedding)
         }
-    }
-
-    /// Mean pooling over token embeddings
-    #[cfg(feature = "onnx")]
-    fn mean_pool(&self, embeddings: &[f32], seq_len: usize) -> Vec<f32> {
-        let dim = self.config.dimension;
-        let mut result = vec![0.0f32; dim];
-
-        for token_idx in 0..seq_len {
-            for (i, v) in result.iter_mut().enumerate() {
-                *v += embeddings[token_idx * dim + i];
-            }
-        }
-
-        for v in &mut result {
-            *v /= seq_len as f32;
-        }
-
-        result
     }
 
     /// Mock embedding for testing (deterministic based on text hash)
@@ -300,6 +411,32 @@ impl TextEmbedder {
     }
 }
 
+/// Get user home directory (cross-platform)
+fn dirs_home() -> Option<PathBuf> {
+    // Try HOME env var first (Unix), then USERPROFILE (Windows)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Mean pooling over token embeddings (standalone function to avoid borrow issues)
+#[cfg(feature = "onnx")]
+fn mean_pool(embeddings: &[f32], seq_len: usize, dim: usize) -> Vec<f32> {
+    let mut result = vec![0.0f32; dim];
+
+    for token_idx in 0..seq_len {
+        for (i, v) in result.iter_mut().enumerate() {
+            *v += embeddings[token_idx * dim + i];
+        }
+    }
+
+    for v in &mut result {
+        *v /= seq_len as f32;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +446,45 @@ mod tests {
         let config = EmbedderConfig::default();
         assert_eq!(config.dimension, 768);
         assert_eq!(config.max_length, 512);
+        assert!(config.model_path.is_none());
+        assert!(config.tokenizer_path.is_none());
+    }
+
+    #[test]
+    fn test_embedder_config_with_paths() {
+        let config = EmbedderConfig::with_paths("/path/to/model.onnx", "/path/to/tokenizer.json");
+        assert_eq!(
+            config.model_path,
+            Some(PathBuf::from("/path/to/model.onnx"))
+        );
+        assert_eq!(
+            config.tokenizer_path,
+            Some(PathBuf::from("/path/to/tokenizer.json"))
+        );
+    }
+
+    #[test]
+    fn test_model_search_paths() {
+        let paths = TextEmbedder::model_search_paths();
+
+        // Debug: print paths
+        for (i, path) in paths.iter().enumerate() {
+            eprintln!("Search path {}: {}", i, path.display());
+        }
+
+        // Should have at least project-level path
+        assert!(!paths.is_empty());
+        // First path should be project-level
+        assert!(paths[0].ends_with("models"));
+        assert!(paths[0].to_string_lossy().contains(".codegraph"));
+
+        // Should have user-level path if HOME is set
+        if std::env::var("HOME").is_ok() {
+            assert!(paths.len() >= 2, "Should have user-level path when HOME is set");
+            let home = std::env::var("HOME").unwrap();
+            let expected_user_path = format!("{}/.codegraph/models", home);
+            assert_eq!(paths[1].to_string_lossy(), expected_user_path);
+        }
     }
 
     #[test]
@@ -325,7 +501,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         let embedding = embedder.embed("Hello world").unwrap();
         assert_eq!(embedding.len(), 384);
@@ -342,7 +518,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         let e1 = embedder.embed("Test text").unwrap();
         let e2 = embedder.embed("Test text").unwrap();
@@ -360,7 +536,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         let e1 = embedder.embed("Hello").unwrap();
         let e2 = embedder.embed("World").unwrap();
@@ -377,7 +553,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         let texts = vec!["Hello", "World", "Test"];
         let embeddings = embedder.embed_batch(&texts).unwrap();

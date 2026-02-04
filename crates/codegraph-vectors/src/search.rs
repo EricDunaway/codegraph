@@ -2,7 +2,7 @@
 
 use crate::embedder::TextEmbedder;
 use crate::error::VectorError;
-use crate::storage::{VectorRecord, VectorStorage};
+use crate::storage::VectorStorage;
 use rusqlite::Connection;
 
 /// Result of a similarity search
@@ -35,13 +35,13 @@ impl Default for SearchConfig {
 /// Similarity search over stored vectors
 pub struct SimilaritySearch<'a> {
     storage: &'a VectorStorage,
-    embedder: &'a TextEmbedder,
+    embedder: &'a mut TextEmbedder,
     config: SearchConfig,
 }
 
 impl<'a> SimilaritySearch<'a> {
     /// Create a new similarity search
-    pub fn new(storage: &'a VectorStorage, embedder: &'a TextEmbedder) -> Self {
+    pub fn new(storage: &'a VectorStorage, embedder: &'a mut TextEmbedder) -> Self {
         Self {
             storage,
             embedder,
@@ -52,7 +52,7 @@ impl<'a> SimilaritySearch<'a> {
     /// Create with custom config
     pub fn with_config(
         storage: &'a VectorStorage,
-        embedder: &'a TextEmbedder,
+        embedder: &'a mut TextEmbedder,
         config: SearchConfig,
     ) -> Self {
         Self {
@@ -64,7 +64,7 @@ impl<'a> SimilaritySearch<'a> {
 
     /// Search for similar nodes by text query
     pub fn search_by_text(
-        &self,
+        &mut self,
         conn: &Connection,
         query: &str,
     ) -> Result<Vec<SimilarityResult>, VectorError> {
@@ -124,7 +124,7 @@ impl<'a> SimilaritySearch<'a> {
 
     /// Search within a subset of nodes
     pub fn search_in_subset(
-        &self,
+        &mut self,
         conn: &Connection,
         query: &str,
         node_ids: &[&str],
@@ -235,7 +235,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         // Store some vectors - using exact same text for one to guarantee match
         let query_text = "function getUserById";
@@ -247,7 +247,7 @@ mod tests {
         storage.store(db.conn(), "n2", &v2, "test").unwrap();
         storage.store(db.conn(), "n3", &v3, "test").unwrap();
 
-        let search = SimilaritySearch::new(&storage, &embedder);
+        let mut search = SimilaritySearch::new(&storage, &mut embedder);
         let results = search.search_by_text(db.conn(), query_text).unwrap();
 
         // The most similar should be n1 (exact match text)
@@ -265,7 +265,7 @@ mod tests {
             dimension: 384,
             ..Default::default()
         };
-        let embedder = TextEmbedder::new(config);
+        let mut embedder = TextEmbedder::new(config);
 
         // Store some vectors
         let v1 = embedder.embed("authenticate user").unwrap();
@@ -276,7 +276,7 @@ mod tests {
         storage.store(db.conn(), "n2", &v2, "test").unwrap();
         storage.store(db.conn(), "n3", &v3, "test").unwrap();
 
-        let search = SimilaritySearch::new(&storage, &embedder);
+        let search = SimilaritySearch::new(&storage, &mut embedder);
         let results = search.find_similar(db.conn(), "n1").unwrap();
 
         // Should not include self
