@@ -97,12 +97,13 @@ pub struct ServerCapabilities {
 
 /// Tool definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
     /// Tool name
     pub name: String,
     /// Tool description
     pub description: String,
-    /// Input schema
+    /// Input schema (JSON Schema for tool parameters)
     pub input_schema: Value,
 }
 
@@ -118,16 +119,13 @@ pub struct ToolCallParams {
 
 /// Tool call result
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCallResult {
     /// Result content
     pub content: Vec<ContentBlock>,
-    /// Whether the call completed successfully
-    #[serde(default = "default_true")]
+    /// Whether the call resulted in an error
+    #[serde(default)]
     pub is_error: bool,
-}
-
-fn default_true() -> bool {
-    false
 }
 
 /// Content block in tool result

@@ -60,10 +60,12 @@ impl McpServer {
                 continue;
             }
 
-            let response = self.handle_message(trimmed);
-            let response_str = serde_json::to_string(&response)?;
-            writeln!(writer, "{}", response_str)?;
-            writer.flush()?;
+            // Only send response if this is a request (not a notification)
+            if let Some(response) = self.handle_message(trimmed) {
+                let response_str = serde_json::to_string(&response)?;
+                writeln!(writer, "{}", response_str)?;
+                writer.flush()?;
+            }
 
             line.clear();
         }
@@ -73,16 +75,17 @@ impl McpServer {
     }
 
     /// Handle a single JSON-RPC message
-    pub fn handle_message(&mut self, message: &str) -> JsonRpcResponse {
+    /// Returns None for notifications (no response needed)
+    pub fn handle_message(&mut self, message: &str) -> Option<JsonRpcResponse> {
         // Parse request
         let request: JsonRpcRequest = match serde_json::from_str(message) {
             Ok(r) => r,
             Err(e) => {
-                return JsonRpcResponse::error(
+                return Some(JsonRpcResponse::error(
                     None,
                     error_codes::PARSE_ERROR,
                     format!("Parse error: {}", e),
-                );
+                ));
             }
         };
 
@@ -91,10 +94,29 @@ impl McpServer {
     }
 
     /// Handle a parsed request
-    fn handle_request(&mut self, request: JsonRpcRequest) -> JsonRpcResponse {
+    /// Returns None for notifications (messages without an id)
+    fn handle_request(&mut self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         let id = request.id.clone();
+        let is_notification = id.is_none();
 
-        match request.method.as_str() {
+        // Handle notifications (no response needed)
+        if is_notification {
+            match request.method.as_str() {
+                "notifications/initialized" => {
+                    log::info!("Client initialized");
+                }
+                "notifications/cancelled" => {
+                    log::info!("Request cancelled");
+                }
+                _ => {
+                    log::debug!("Unknown notification: {}", request.method);
+                }
+            }
+            return None;
+        }
+
+        // Handle requests (response required)
+        Some(match request.method.as_str() {
             "initialize" => self.handle_initialize(id, request.params),
             "tools/list" => self.handle_tools_list(id),
             "tools/call" => self.handle_tools_call(id, request.params),
@@ -104,7 +126,7 @@ impl McpServer {
                 error_codes::METHOD_NOT_FOUND,
                 format!("Method not found: {}", request.method),
             ),
-        }
+        })
     }
 
     /// Handle initialize request
@@ -198,9 +220,9 @@ mod tests {
     fn test_handle_initialize() {
         let mut server = McpServer::new_in_memory().unwrap();
 
-        let response = server.handle_message(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-        );
+        let response = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .expect("should return response for request");
 
         assert!(response.error.is_none());
         assert!(response.result.is_some());
@@ -211,9 +233,9 @@ mod tests {
     fn test_handle_tools_list() {
         let mut server = McpServer::new_in_memory().unwrap();
 
-        let response = server.handle_message(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
-        );
+        let response = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
+            .expect("should return response for request");
 
         assert!(response.error.is_none());
         let result = response.result.unwrap();
@@ -224,9 +246,9 @@ mod tests {
     fn test_handle_unknown_method() {
         let mut server = McpServer::new_in_memory().unwrap();
 
-        let response = server.handle_message(
-            r#"{"jsonrpc":"2.0","id":1,"method":"unknown","params":{}}"#,
-        );
+        let response = server
+            .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"unknown","params":{}}"#)
+            .expect("should return response for request");
 
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, error_codes::METHOD_NOT_FOUND);
@@ -236,10 +258,23 @@ mod tests {
     fn test_handle_parse_error() {
         let mut server = McpServer::new_in_memory().unwrap();
 
-        let response = server.handle_message("not valid json");
+        let response = server
+            .handle_message("not valid json")
+            .expect("should return response for parse error");
 
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, error_codes::PARSE_ERROR);
+    }
+
+    #[test]
+    fn test_handle_notification() {
+        let mut server = McpServer::new_in_memory().unwrap();
+
+        // Notifications (no id) should return None
+        let response =
+            server.handle_message(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+
+        assert!(response.is_none());
     }
 
     #[test]
