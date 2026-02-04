@@ -1,0 +1,32 @@
+[package]
+name = "codegraph-extraction"
+description = "Tree-sitter based code extraction for CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["lang-rust", "lang-typescript"]
+lang-rust = []
+lang-typescript = []
+lang-python = []
+lang-go = []
+lang-php = []
+all-languages = ["lang-rust", "lang-typescript", "lang-python", "lang-go", "lang-php"]
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+walkdir = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+regex-lite = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

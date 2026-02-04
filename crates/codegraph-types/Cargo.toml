@@ -1,0 +1,15 @@
+[package]
+name = "codegraph-types"
+description = "Core types for CodeGraph - semantic code knowledge graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

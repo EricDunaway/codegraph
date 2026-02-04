@@ -1,0 +1,26 @@
+[package]
+name = "codegraph-core"
+description = "Core library for CodeGraph - semantic code knowledge graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+codegraph-db = { path = "../codegraph-db" }
+codegraph-extraction = { path = "../codegraph-extraction" }
+codegraph-resolution = { path = "../codegraph-resolution" }
+codegraph-graph = { path = "../codegraph-graph" }
+codegraph-vectors = { path = "../codegraph-vectors" }
+codegraph-context = { path = "../codegraph-context" }
+codegraph-sync = { path = "../codegraph-sync" }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

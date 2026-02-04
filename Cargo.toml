@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codegraph-types",
+    "crates/codegraph-db",
+    "crates/codegraph-extraction",
+    "crates/codegraph-resolution",
+    "crates/codegraph-graph",
+    "crates/codegraph-vectors",
+    "crates/codegraph-context",
+    "crates/codegraph-sync",
+    "crates/codegraph-mcp",
+    "crates/codegraph-core",
+    "crates/codegraph-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["CodeGraph Contributors"]
+license = "MIT"
+repository = "https://github.com/codegraph/codegraph"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Core utilities
+thiserror = "2.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "blob", "functions", "vtab"] }
+
+# Tree-sitter (core + grammars)
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-swift = "0.5"
+tree-sitter-kotlin = "0.3"
+tree-sitter-dart = "0.0"
+tree-sitter-graphql = "0.5"
+tree-sitter-bash = "0.23"
+tree-sitter-hcl = "0.3"
+
+# File system
+walkdir = "2.5"
+globset = "0.4"
+ignore = "0.4"
+notify = "7.0"
+sha2 = "0.10"
+
+# Embeddings (optional feature)
+ort = { version = "2.0.0-rc.11", default-features = false }
+tokenizers = "0.20"
+ndarray = "0.16"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.17"
+console = "0.15"
+
+# MCP Server
+serde_derive = "1.0"
+
+# Testing
+tempfile = "3.14"
+
+# Async (minimal, only for MCP)
+# Note: We use sync by default, async only where needed
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
+# Profile for development (fast compile)
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Profile for release
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

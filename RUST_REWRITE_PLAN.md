@@ -186,16 +186,17 @@ codegraph-rs/
 [features]
 default = ["cli"]
 cli = ["clap", "indicatif"]
-vectors = ["rust-bert/onnx", "sqlite-vec", "zerocopy"]  # Base: embeddings + vector search
-vectors-coreml = ["vectors", "ort/coreml"]              # macOS: GPU/Neural Engine acceleration
-dual-embeddings = ["vectors"]                            # StarEncoder (code) + nomic (text)
-mcp = ["tokio"]                                          # Optional: MCP server
+vectors = ["ort", "tokenizers", "sqlite-vec", "ndarray"]  # Base: embeddings + vector search (direct ort, not rust-bert)
+vectors-coreml = ["vectors"]                               # macOS: GPU/Neural Engine via CoreML (auto-enabled on macOS)
+dual-embeddings = ["vectors"]                              # StarEncoder (code) + nomic (text)
+mcp = []                                                   # MCP server (sync stdio, no async runtime needed)
 full = ["cli", "vectors", "mcp"]
 
-# Platform-specific defaults (set in build.rs or CI)
-# - macOS: vectors-coreml
-# - Linux/Windows: vectors
-# - dual-embeddings: opt-in for code+text hybrid search
+# NOTE: We use direct `ort` instead of `rust-bert` because:
+# 1. Direct CoreML access with ComputeUnits::CPUAndNeuralEngine for M4 Neural Engine
+# 2. Smaller binary (no libtorch overhead)
+# 3. Full control over ONNX session configuration
+# 4. Embedding models don't need rust-bert's high-level NLP pipelines
 ```
 
 **Build Configuration:**
@@ -1422,23 +1423,25 @@ impl<'a> GraphTraverser<'a> {
 
 ### 3.5 Vector/Embedding Module (`codegraph-vectors/`)
 
-Uses [rust-bert](https://github.com/guillaume-be/rust-bert) with ONNX backend for embeddings and [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
+Uses direct [ort](https://ort.pyke.io/) (ONNX Runtime) for embeddings and [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
+
+**Why direct `ort` instead of `rust-bert`:**
+- **CoreML support**: Direct access to `ComputeUnits::CPUAndNeuralEngine` for M4 GPU/Neural Engine
+- **Smaller binary**: No libtorch overhead
+- **Full control**: Low-level ONNX inference with direct configuration
+- **Simpler**: Embedding models don't need rust-bert's high-level NLP pipelines
 
 On macOS, uses CoreML execution provider for GPU/Neural Engine acceleration.
 
 ```rust
-use rust_bert::pipelines::sentence_embeddings::{
-    SentenceEmbeddingsBuilder, SentenceEmbeddingsModel, SentenceEmbeddingsConfig,
-    SentenceEmbeddingsModelType,
-};
-use rust_bert::resources::LocalResource;
+use ort::{Session, GraphOptimizationLevel, inputs};
+use ort::execution_providers::CoreMLExecutionProvider;
+use tokenizers::Tokenizer;
+use ndarray::{Array1, Array2, Axis};
 use rusqlite::{ffi::sqlite3_auto_extension, Connection};
 use sqlite_vec::sqlite3_vec_init;
-use zerocopy::AsBytes;
 use std::path::{Path, PathBuf};
-
-#[cfg(target_os = "macos")]
-use ort::CoreMLExecutionProvider;
+use sha2::{Sha256, Digest};
 
 /// Initialize sqlite-vec extension for the connection
 ///
@@ -1454,8 +1457,10 @@ pub fn init_sqlite_vec() {
 
 /// CRITICAL: This module runs entirely locally with no network access
 pub struct TextEmbedder {
-    model: SentenceEmbeddingsModel,
+    session: Session,
+    tokenizer: Tokenizer,
     embedding_dim: usize,
+    model_config: EmbeddingModel,
 }
 
 impl TextEmbedder {
@@ -1463,9 +1468,9 @@ impl TextEmbedder {
     ///
     /// # Security
     /// - Model must be pre-downloaded to ~/.codegraph/models/
-    /// - No network requests are made (RemoteResource disabled)
-    /// - Model integrity should be verified via checksum
-    pub fn load(model_dir: &Path) -> Result<Self, EmbedderError> {
+    /// - No network requests are made
+    /// - Model integrity verified via SHA-256 checksum
+    pub fn load(model_dir: &Path, model_config: EmbeddingModel) -> Result<Self, EmbedderError> {
         // Verify model directory exists
         if !model_dir.exists() {
             return Err(EmbedderError::ModelNotFound(model_dir.to_path_buf()));
@@ -1474,91 +1479,145 @@ impl TextEmbedder {
         // Verify required files exist
         let model_file = model_dir.join("model.onnx");
         let tokenizer_file = model_dir.join("tokenizer.json");
-        let config_file = model_dir.join("config.json");
 
-        for file in [&model_file, &tokenizer_file, &config_file] {
+        for file in [&model_file, &tokenizer_file] {
             if !file.exists() {
                 return Err(EmbedderError::MissingModelFile(file.clone()));
             }
         }
 
-        // Configure for local-only loading (no network)
-        let config = SentenceEmbeddingsConfig::new(
-            LocalResource::from(model_file),
-            LocalResource::from(tokenizer_file),
-            LocalResource::from(config_file),
-        );
+        // Verify model checksum for security
+        Self::verify_model_checksum(&model_file, model_config)?;
 
-        // Configure execution providers based on platform
-        #[cfg(target_os = "macos")]
-        let execution_providers = vec![
-            CoreMLExecutionProvider::default()
-                .with_subgraphs()        // Enable for subgraphs
-                .with_ane_only(false)    // Use GPU + Neural Engine + CPU
-                .build()
-                .error_on_failure(),
-        ];
+        // Load tokenizer
+        let tokenizer = Tokenizer::from_file(&tokenizer_file)
+            .map_err(|e| EmbedderError::TokenizerError(e.to_string()))?;
 
-        #[cfg(not(target_os = "macos"))]
-        let execution_providers = vec![]; // CPU fallback
-
-        // Build model with ONNX backend
-        // On macOS: Uses CoreML (GPU/Neural Engine) with CPU fallback
-        // On Linux/Windows: Uses CPU
-        let model = SentenceEmbeddingsBuilder::local(config)
-            .with_execution_providers(execution_providers)
-            .create_model()
-            .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))?;
-
-        // Get embedding dimension from model config
-        let embedding_dim = 768; // TODO: Read from config.json
+        // Configure ONNX session with platform-specific execution providers
+        let session = Self::create_session(&model_file)?;
 
         Ok(Self {
-            model,
-            embedding_dim,
+            session,
+            tokenizer,
+            embedding_dim: model_config.dimension(),
+            model_config,
         })
     }
 
-    /// Load a pre-configured model type from local cache
-    ///
-    /// Models should be pre-downloaded to ~/.codegraph/models/
-    pub fn load_model_type(
-        model_type: SentenceEmbeddingsModelType,
-        cache_dir: &Path,
-    ) -> Result<Self, EmbedderError> {
-        // Set cache directory to prevent network downloads
-        std::env::set_var("RUSTBERT_CACHE", cache_dir);
+    /// Create ONNX session with appropriate execution providers
+    fn create_session(model_path: &Path) -> Result<Session, EmbedderError> {
+        let mut builder = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?;
 
-        let model = SentenceEmbeddingsBuilder::local(model_type)
-            .create_model()
-            .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))?;
+        // macOS: Use CoreML for GPU/Neural Engine acceleration
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.with_execution_providers([
+                CoreMLExecutionProvider::default()
+                    .with_subgraphs()
+                    .with_ane_only(false)  // Use GPU + Neural Engine + CPU
+                    .build()
+            ])?;
+        }
 
-        let embedding_dim = match model_type {
-            SentenceEmbeddingsModelType::AllMiniLmL6V2 => 384,
-            SentenceEmbeddingsModelType::AllMiniLmL12V2 => 384,
-            SentenceEmbeddingsModelType::AllDistilrobertaV1 => 768,
-            SentenceEmbeddingsModelType::ParaphraseAlbertSmallV2 => 768,
-            _ => 768, // Default
-        };
+        builder.commit_from_file(model_path)
+            .map_err(|e| EmbedderError::ModelLoadError(e.to_string()))
+    }
 
-        Ok(Self {
-            model,
-            embedding_dim,
-        })
+    /// Verify model file checksum for security
+    fn verify_model_checksum(model_path: &Path, model: EmbeddingModel) -> Result<(), EmbedderError> {
+        let expected_checksum = model.expected_checksum();
+        if expected_checksum.is_empty() {
+            return Ok(()); // Skip verification if no checksum defined
+        }
+
+        let mut file = std::fs::File::open(model_path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        let actual = format!("{:x}", hasher.finalize());
+
+        if actual != expected_checksum {
+            return Err(EmbedderError::ChecksumMismatch {
+                expected: expected_checksum.to_string(),
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Generate embedding for text
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
-        let embeddings = self.model.encode(&[text])
-            .map_err(|e| EmbedderError::InferenceError(e.to_string()))?;
-
-        Ok(embeddings.into_iter().next().unwrap())
+        let results = self.embed_batch(&[text])?;
+        Ok(results.into_iter().next().unwrap())
     }
 
     /// Batch embed multiple texts (more efficient than individual calls)
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
-        self.model.encode(texts)
-            .map_err(|e| EmbedderError::InferenceError(e.to_string()))
+        // Apply prefixes if required by model
+        let prefixed_texts: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{}", self.model_config.document_prefix(), t))
+            .collect();
+
+        // Tokenize
+        let encodings = self.tokenizer.encode_batch(
+            prefixed_texts.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            true,
+        ).map_err(|e| EmbedderError::TokenizerError(e.to_string()))?;
+
+        // Prepare inputs
+        let input_ids: Vec<Vec<i64>> = encodings
+            .iter()
+            .map(|e| e.get_ids().iter().map(|&id| id as i64).collect())
+            .collect();
+        let attention_mask: Vec<Vec<i64>> = encodings
+            .iter()
+            .map(|e| e.get_attention_mask().iter().map(|&m| m as i64).collect())
+            .collect();
+
+        // Pad sequences to max length
+        let max_len = input_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        let batch_size = input_ids.len();
+
+        let input_ids_array = Array2::from_shape_fn((batch_size, max_len), |(i, j)| {
+            input_ids[i].get(j).copied().unwrap_or(0)
+        });
+        let attention_mask_array = Array2::from_shape_fn((batch_size, max_len), |(i, j)| {
+            attention_mask[i].get(j).copied().unwrap_or(0)
+        });
+
+        // Run inference
+        let outputs = self.session.run(inputs![
+            "input_ids" => input_ids_array.view(),
+            "attention_mask" => attention_mask_array.view(),
+        ]?)?;
+
+        // Extract embeddings (mean pooling over token dimension)
+        let embeddings = outputs["last_hidden_state"]
+            .try_extract_tensor::<f32>()?;
+
+        // Mean pooling: average over sequence dimension
+        let embeddings: Vec<Vec<f32>> = embeddings
+            .axis_iter(Axis(0))
+            .zip(attention_mask.iter())
+            .map(|(seq_embeddings, mask)| {
+                let mask_sum: f32 = mask.iter().map(|&m| m as f32).sum();
+                seq_embeddings
+                    .axis_iter(Axis(0))
+                    .zip(mask.iter())
+                    .fold(vec![0.0f32; self.embedding_dim], |mut acc, (token_emb, &m)| {
+                        if m > 0 {
+                            for (a, e) in acc.iter_mut().zip(token_emb.iter()) {
+                                *a += e / mask_sum;
+                            }
+                        }
+                        acc
+                    })
+            })
+            .collect();
+
+        Ok(embeddings)
     }
 
     /// Get the embedding dimension for this model
