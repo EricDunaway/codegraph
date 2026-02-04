@@ -8,84 +8,64 @@ CodeGraph is a local-first code intelligence system that builds a semantic knowl
 
 **Key characteristics:**
 - Headless library (no UI) - purely an API
-- Node.js runtime (works standalone, in Electron, or any Node environment)
+- Rust workspace with 11 crates
 - Per-project data stored in `.codegraph/` directory
 - Deterministic extraction from AST, not AI-generated summaries
+- ONNX embeddings with CoreML acceleration on Apple Silicon
 
 ## Build and Development Commands
 
 ```bash
-# Build
-npm run build          # Compile TypeScript and copy assets
+# Build (Rust workspace)
+cargo build --message-format=json              # Build all crates
+cargo check --message-format=json              # Check only (faster)
 
 # Test
-npm test               # Run all tests once
-npm run test:watch     # Run tests in watch mode
+cargo test --message-format=json               # Run all tests
+cargo test --message-format=json -p codegraph-extraction             # Test specific crate
+cargo test --message-format=json -p codegraph-extraction test_name   # Single test
 
-# Clean
-npm run clean          # Remove dist/ directory
-```
+# Lint
+cargo clippy --message-format=json             # Run clippy
 
-## Running a Single Test
+# Run CLI
+cargo run --message-format=json -p codegraph-cli -- index <path>     # Index a codebase
+cargo run --message-format=json -p codegraph-cli -- status <path>    # Show statistics
 
-```bash
-npx vitest run __tests__/extraction.test.ts           # Run specific test file
-npx vitest run __tests__/extraction.test.ts -t "TypeScript"  # Run tests matching pattern
+# Verify indexed data
+sqlite3 .codegraph/codegraph.db "SELECT name, decorators FROM nodes WHERE decorators != '[]' LIMIT 10;"
 ```
 
 ## Architecture
 
-### Core Module Structure
+### Core Module Structure (Rust Workspace)
 
 ```
-src/
-├── index.ts              # Main CodeGraph class - public API entry point
-├── types.ts              # All TypeScript interfaces and types
-├── db/                   # SQLite database layer
-│   ├── index.ts          # DatabaseConnection class
-│   ├── queries.ts        # QueryBuilder with prepared statements
-│   └── schema.sql        # Table definitions with FTS5 search
-├── extraction/           # Tree-sitter AST parsing
-│   ├── index.ts          # ExtractionOrchestrator
-│   ├── tree-sitter.ts    # Universal parser wrapper
-│   └── grammars.ts       # Language detection and grammar loading
-├── resolution/           # Reference resolver
-│   ├── index.ts          # ReferenceResolver orchestrator
-│   ├── import-resolver.ts
-│   ├── name-matcher.ts
-│   └── frameworks/       # Framework-specific patterns (React, Express, Laravel, etc.)
-├── graph/                # Graph traversal and queries
-│   ├── index.ts          # GraphQueryManager
-│   ├── traversal.ts      # GraphTraverser (BFS/DFS, impact radius)
-│   └── queries.ts        # High-level graph queries
-├── vectors/              # Semantic search with embeddings
-│   ├── index.ts          # VectorManager
-│   ├── embedder.ts       # ONNX runtime + model loading
-│   └── search.ts         # Similarity search
-├── context/              # Context building for AI assistants
-│   ├── index.ts          # ContextBuilder
-│   └── formatter.ts      # Markdown/JSON output formatting
-├── sync/                 # Incremental update system
-│   ├── index.ts
-│   └── git-hooks.ts      # Post-commit hook management
-├── mcp/                  # Model Context Protocol server
-│   ├── index.ts          # MCPServer class
-│   ├── tools.ts          # MCP tool definitions
-│   └── transport.ts      # Stdio transport
-└── bin/codegraph.ts      # CLI entry point
+crates/
+├── codegraph-types/       # Shared types (Node, Edge, NodeKind, EdgeKind)
+├── codegraph-db/          # SQLite with FTS5, schema, prepared statements
+├── codegraph-extraction/  # Tree-sitter AST parsing (per-language extractors)
+├── codegraph-resolution/  # Reference resolution, framework patterns
+├── codegraph-graph/       # BFS/DFS traversal, circular deps, dead code
+├── codegraph-vectors/     # ONNX embeddings (ort + CoreML on Apple Silicon)
+├── codegraph-context/     # Context building for AI
+├── codegraph-sync/        # Incremental updates, git hooks
+├── codegraph-mcp/         # MCP server (7 tools)
+├── codegraph-core/        # Orchestration layer
+└── codegraph-cli/         # CLI entry point
 ```
 
-### Key Classes
+### Key Crates
 
-- **CodeGraph** (`src/index.ts`): Main entry point. Lifecycle methods (`init`, `open`, `close`), indexing (`indexAll`, `sync`), graph queries (`traverse`, `getCallGraph`, `getImpactRadius`), semantic search (`semanticSearch`, `findSimilar`), context building (`buildContext`)
+- **codegraph-core**: Main orchestration. Lifecycle methods (`init`, `open`, `close`), indexing, graph queries, semantic search, context building
 
-- **ExtractionOrchestrator** (`src/extraction/index.ts`): Coordinates file scanning, parsing, and storing. Uses tree-sitter native bindings for each supported language
+- **codegraph-extraction**: Coordinates file scanning, parsing, and storing. Tree-sitter grammars for 17 languages (enabled via feature flags)
 
-- **GraphTraverser** (`src/graph/traversal.ts`): BFS/DFS traversal, call graph construction, impact radius calculation, path finding
+- **codegraph-graph**: BFS/DFS traversal, call graph construction, impact radius, circular dependency detection, dead code analysis
 
-- **VectorManager** (`src/vectors/manager.ts`): Manages embeddings using `@xenova/transformers` for ONNX inference. Stores vectors in SQLite BLOB format
+- **codegraph-vectors**: Manages embeddings using `ort` (ONNX Runtime). CoreML acceleration on Apple Silicon. Stores vectors in SQLite BLOB format
 
-- **ReferenceResolver** (`src/resolution/index.ts`): Resolves unresolved references after full indexing using framework patterns, import resolution, and name matching
+- **codegraph-resolution**: Resolves unresolved references using framework patterns, import resolution, and name matching
 
 ### Database Schema
 
@@ -99,7 +79,12 @@ SQLite database with:
 
 ### Supported Languages
 
-TypeScript, JavaScript, TSX, JSX, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin
+TypeScript, JavaScript, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, GraphQL, Bash, HCL (Terraform)
+
+**Feature flags** (in `codegraph-extraction`):
+- Default: `lang-rust`, `lang-typescript`, `lang-python`, `lang-go`, `lang-php`
+- Enable all: `cargo build --message-format=json --features all-languages`
+- Enable specific: `cargo build --message-format=json --features lang-dart,lang-graphql`
 
 ### Node and Edge Types
 
@@ -110,6 +95,11 @@ TypeScript, JavaScript, TSX, JSX, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby,
 ## CLI Usage
 
 ```bash
+# During development (use cargo run)
+cargo run --message-format=json -p codegraph-cli -- init <path>
+cargo run --message-format=json -p codegraph-cli -- index <path>
+
+# If installed globally
 codegraph init [path]       # Initialize in project
 codegraph index [path]      # Full index
 codegraph sync [path]       # Incremental update
@@ -141,13 +131,30 @@ CodeGraph provides **code context**, not product requirements. For new features,
 
 ## Test Structure
 
-Tests are in `__tests__/` directory with files mirroring the module structure:
-- `foundation.test.ts` - Database, config, directory management
-- `extraction.test.ts` - Tree-sitter parsing for all languages
-- `resolution.test.ts` - Reference resolution
-- `graph.test.ts` - Traversal and graph queries
-- `vectors.test.ts` - Embedding and semantic search
-- `context.test.ts` - Context building
-- `sync.test.ts` - Incremental updates and git hooks
+Each crate has tests in `src/` (unit tests) and `tests/` (integration tests):
+- `codegraph-db` - Database, schema, prepared statements
+- `codegraph-extraction` - Tree-sitter parsing for all languages
+- `codegraph-resolution` - Reference resolution
+- `codegraph-graph` - Traversal and graph queries
+- `codegraph-vectors` - Embedding and semantic search
+- `codegraph-context` - Context building
+- `codegraph-sync` - Incremental updates and git hooks
 
-Tests use temporary directories created with `fs.mkdtempSync` and cleaned up after each test.
+Tests use temporary directories created with `tempfile` crate and cleaned up after each test.
+
+## Known Issues / In Progress
+
+**Tree-sitter wiring (P0):** Tree-sitter grammars are declared in `Cargo.toml` but extraction currently uses regex. This prevents decorator/attribute extraction. See `docs/plans/LINKED_REPOS.md` and the deviation audit plan.
+
+**Key plan documents:**
+- `RUST_REWRITE_PLAN.md` - Original requirements
+- `docs/plans/LINKED_REPOS.md` - Multi-repo feature design
+
+## Verifying Tree-sitter Grammar Support
+
+To check if a tree-sitter grammar supports specific AST nodes:
+```bash
+# Fetch grammar.js and search for node types
+curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/master/common/define-grammar.js | grep -A5 "decorator:"
+curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-rust/master/grammar.js | grep -A5 "attribute_item:"
+```

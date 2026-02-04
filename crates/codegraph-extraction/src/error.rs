@@ -27,6 +27,10 @@ pub enum ExtractionError {
     #[error("Unsupported language: {0}")]
     UnsupportedLanguage(String),
 
+    /// Parse failed (tree-sitter returned None)
+    #[error("Parse failed for {language}: {message}")]
+    ParseFailed { language: String, message: String },
+
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
