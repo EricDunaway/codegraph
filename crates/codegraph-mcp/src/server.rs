@@ -6,7 +6,7 @@ use crate::tools::McpTools;
 use codegraph_db::{DatabaseConnection, QueryBuilder};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// MCP server state
 pub struct McpServer {
@@ -14,6 +14,8 @@ pub struct McpServer {
     db: DatabaseConnection,
     /// Query builder
     queries: QueryBuilder,
+    /// Repository path (for git status checks)
+    repo_path: PathBuf,
     /// Whether server is initialized
     initialized: bool,
 }
@@ -21,12 +23,21 @@ pub struct McpServer {
 impl McpServer {
     /// Create a new MCP server
     pub fn new(db_path: &str) -> Result<Self, McpError> {
-        let db = DatabaseConnection::open(Path::new(db_path))?;
+        let db_path = Path::new(db_path);
+        let db = DatabaseConnection::open(db_path)?;
         let queries = QueryBuilder::new(db.conn())?;
+
+        // Derive repo path from db path (db is at .codegraph/codegraph.db)
+        let repo_path = db_path
+            .parent() // .codegraph/
+            .and_then(|p| p.parent()) // repo root
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
 
         Ok(Self {
             db,
             queries,
+            repo_path,
             initialized: false,
         })
     }
@@ -39,6 +50,7 @@ impl McpServer {
         Ok(Self {
             db,
             queries,
+            repo_path: PathBuf::from("."),
             initialized: false,
         })
     }
@@ -176,6 +188,7 @@ impl McpServer {
         match McpTools::execute(
             self.db.conn(),
             &mut self.queries,
+            &self.repo_path,
             &call_params.name,
             call_params.arguments,
         ) {

@@ -4,6 +4,7 @@
 //! It exposes CodeGraph functionality through JSON-RPC over stdio.
 
 pub mod error;
+pub mod git;
 pub mod protocol;
 pub mod server;
 pub mod tools;

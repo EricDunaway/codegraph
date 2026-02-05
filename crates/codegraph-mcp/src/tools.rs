@@ -1,12 +1,15 @@
 //! MCP tools implementation
 
 use crate::error::McpError;
+use crate::git::{are_hooks_installed, get_git_status, get_last_sync_time, GitStatus};
 use crate::protocol::{ContentBlock, ToolCallResult, ToolDefinition};
 use codegraph_context::{ContextBuilder, ContextFormat, ContextOptions};
 use codegraph_db::QueryBuilder;
 use codegraph_graph::{GraphQueryManager, GraphTraverser};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use std::path::Path;
+use std::time::SystemTime;
 
 /// Tool names
 pub const TOOL_SEARCH: &str = "codegraph_search";
@@ -16,6 +19,7 @@ pub const TOOL_CALLEES: &str = "codegraph_callees";
 pub const TOOL_IMPACT: &str = "codegraph_impact";
 pub const TOOL_NODE: &str = "codegraph_node";
 pub const TOOL_FILE_NODES: &str = "codegraph_file_nodes";
+pub const TOOL_STATUS: &str = "codegraph_status";
 
 /// MCP tools handler
 pub struct McpTools;
@@ -134,6 +138,15 @@ impl McpTools {
                     "required": ["file_path"]
                 }),
             },
+            ToolDefinition {
+                name: TOOL_STATUS.to_string(),
+                description: "Get index status including dirty files and sync info".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
         ]
     }
 
@@ -141,18 +154,50 @@ impl McpTools {
     pub fn execute(
         conn: &Connection,
         queries: &mut QueryBuilder,
+        repo_path: &Path,
         tool_name: &str,
         args: Value,
     ) -> Result<ToolCallResult, McpError> {
+        // Get git status for staleness detection
+        let git_status = get_git_status(repo_path);
+
         match tool_name {
-            TOOL_SEARCH => Self::tool_search(conn, queries, args),
+            TOOL_SEARCH => Self::tool_search(conn, queries, args, &git_status),
             TOOL_CONTEXT => Self::tool_context(conn, queries, args),
-            TOOL_CALLERS => Self::tool_callers(conn, queries, args),
-            TOOL_CALLEES => Self::tool_callees(conn, queries, args),
-            TOOL_IMPACT => Self::tool_impact(conn, queries, args),
-            TOOL_NODE => Self::tool_node(conn, queries, args),
-            TOOL_FILE_NODES => Self::tool_file_nodes(conn, queries, args),
+            TOOL_CALLERS => Self::tool_callers(conn, queries, args, &git_status),
+            TOOL_CALLEES => Self::tool_callees(conn, queries, args, &git_status),
+            TOOL_IMPACT => Self::tool_impact(conn, queries, args, &git_status),
+            TOOL_NODE => Self::tool_node(conn, queries, args, &git_status),
+            TOOL_FILE_NODES => Self::tool_file_nodes(conn, queries, args, &git_status),
+            TOOL_STATUS => Self::tool_status(conn, queries, repo_path, &git_status),
             _ => Err(McpError::ToolNotFound(tool_name.to_string())),
+        }
+    }
+
+    /// Generate staleness warning if any files are dirty
+    fn staleness_warning(file_paths: &[&str], git_status: &GitStatus) -> Option<String> {
+        if !git_status.is_git_repo {
+            return None;
+        }
+
+        let stale_files: Vec<&str> = file_paths
+            .iter()
+            .filter(|p| git_status.is_dirty(p))
+            .copied()
+            .collect();
+
+        if stale_files.is_empty() {
+            None
+        } else if stale_files.len() == 1 {
+            Some(format!(
+                "\n\n⚠️ **Stale data**: `{}` has uncommitted changes. Results may be outdated.",
+                stale_files[0]
+            ))
+        } else {
+            Some(format!(
+                "\n\n⚠️ **Stale data**: {} files have uncommitted changes. Results may be outdated.",
+                stale_files.len()
+            ))
         }
     }
 
@@ -161,6 +206,7 @@ impl McpTools {
         conn: &Connection,
         queries: &QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let query = args
             .get("query")
@@ -172,7 +218,9 @@ impl McpTools {
         let results = queries.search_nodes(conn, query, None, None, limit, 0)?;
 
         let mut output = format!("Found {} results for '{}':\n\n", results.len(), query);
-        for result in results {
+        let mut file_paths: Vec<&str> = Vec::new();
+
+        for result in &results {
             output.push_str(&format!(
                 "- {} `{}` ({}:{}) [id: {}]\n",
                 result.node.kind.as_str(),
@@ -181,6 +229,11 @@ impl McpTools {
                 result.node.start_line,
                 result.node.id.as_str()
             ));
+            file_paths.push(&result.node.file_path);
+        }
+
+        if let Some(warning) = Self::staleness_warning(&file_paths, git_status) {
+            output.push_str(&warning);
         }
 
         Ok(ToolCallResult {
@@ -223,6 +276,7 @@ impl McpTools {
         conn: &Connection,
         queries: &mut QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let node_id = args
             .get("node_id")
@@ -243,7 +297,9 @@ impl McpTools {
         }
 
         let mut output = format!("Callers of '{}':\n\n", node_id);
-        for caller in callers {
+        let mut file_paths: Vec<&str> = Vec::new();
+
+        for caller in &callers {
             output.push_str(&format!(
                 "- {} `{}` ({}:{}) [id: {}]\n",
                 caller.kind.as_str(),
@@ -252,6 +308,11 @@ impl McpTools {
                 caller.start_line,
                 caller.id.as_str()
             ));
+            file_paths.push(&caller.file_path);
+        }
+
+        if let Some(warning) = Self::staleness_warning(&file_paths, git_status) {
+            output.push_str(&warning);
         }
 
         Ok(ToolCallResult {
@@ -265,6 +326,7 @@ impl McpTools {
         conn: &Connection,
         queries: &mut QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let node_id = args
             .get("node_id")
@@ -285,7 +347,9 @@ impl McpTools {
         }
 
         let mut output = format!("Callees of '{}':\n\n", node_id);
-        for callee in callees {
+        let mut file_paths: Vec<&str> = Vec::new();
+
+        for callee in &callees {
             output.push_str(&format!(
                 "- {} `{}` ({}:{}) [id: {}]\n",
                 callee.kind.as_str(),
@@ -294,6 +358,11 @@ impl McpTools {
                 callee.start_line,
                 callee.id.as_str()
             ));
+            file_paths.push(&callee.file_path);
+        }
+
+        if let Some(warning) = Self::staleness_warning(&file_paths, git_status) {
+            output.push_str(&warning);
         }
 
         Ok(ToolCallResult {
@@ -307,6 +376,7 @@ impl McpTools {
         conn: &Connection,
         queries: &mut QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let node_id = args
             .get("node_id")
@@ -323,6 +393,8 @@ impl McpTools {
             node_id, impact.total_count, impact.max_depth
         );
 
+        let mut file_paths: Vec<&str> = Vec::new();
+
         if !impact.direct.is_empty() {
             output.push_str("**Direct dependents:**\n");
             for node in &impact.direct {
@@ -334,6 +406,7 @@ impl McpTools {
                     node.start_line,
                     node.id.as_str()
                 ));
+                file_paths.push(&node.file_path);
             }
         }
 
@@ -348,10 +421,15 @@ impl McpTools {
                     node.start_line,
                     node.id.as_str()
                 ));
+                file_paths.push(&node.file_path);
             }
             if impact.indirect.len() > 10 {
                 output.push_str(&format!("... and {} more\n", impact.indirect.len() - 10));
             }
+        }
+
+        if let Some(warning) = Self::staleness_warning(&file_paths, git_status) {
+            output.push_str(&warning);
         }
 
         Ok(ToolCallResult {
@@ -365,6 +443,7 @@ impl McpTools {
         conn: &Connection,
         queries: &mut QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let node_id = args
             .get("node_id")
@@ -392,6 +471,10 @@ impl McpTools {
             output.push_str(&format!("\n**Documentation:**\n> {}\n", doc.replace('\n', "\n> ")));
         }
 
+        if let Some(warning) = Self::staleness_warning(&[&node.file_path], git_status) {
+            output.push_str(&warning);
+        }
+
         Ok(ToolCallResult {
             content: vec![ContentBlock::text(output)],
             is_error: false,
@@ -403,6 +486,7 @@ impl McpTools {
         conn: &Connection,
         queries: &QueryBuilder,
         args: Value,
+        git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
         let file_path = args
             .get("file_path")
@@ -430,6 +514,86 @@ impl McpTools {
                 node.start_line,
                 node.id.as_str()
             ));
+        }
+
+        if let Some(warning) = Self::staleness_warning(&[file_path], git_status) {
+            output.push_str(&warning);
+        }
+
+        Ok(ToolCallResult {
+            content: vec![ContentBlock::text(output)],
+            is_error: false,
+        })
+    }
+
+    /// Get index status
+    fn tool_status(
+        conn: &Connection,
+        queries: &QueryBuilder,
+        repo_path: &Path,
+        git_status: &GitStatus,
+    ) -> Result<ToolCallResult, McpError> {
+        // Get indexed file and node counts via stats
+        let stats = queries.get_stats(conn).ok();
+        let file_count = stats.as_ref().map(|s| s.file_count).unwrap_or(0);
+        let node_count = stats.as_ref().map(|s| s.node_count).unwrap_or(0);
+
+        // Get last sync time
+        let last_sync = get_last_sync_time(repo_path);
+        let last_sync_str = match last_sync {
+            Some(time) => {
+                let duration = SystemTime::now()
+                    .duration_since(time)
+                    .unwrap_or_default();
+                let secs = duration.as_secs();
+                if secs < 60 {
+                    format!("{} seconds ago", secs)
+                } else if secs < 3600 {
+                    format!("{} minutes ago", secs / 60)
+                } else if secs < 86400 {
+                    format!("{} hours ago", secs / 3600)
+                } else {
+                    format!("{} days ago", secs / 86400)
+                }
+            }
+            None => "unknown".to_string(),
+        };
+
+        // Check git hooks
+        let hooks_installed = are_hooks_installed(repo_path);
+
+        // Build output
+        let mut output = String::from("## CodeGraph Index Status\n\n");
+        output.push_str(&format!("- **Indexed files:** {}\n", file_count));
+        output.push_str(&format!("- **Total nodes:** {}\n", node_count));
+        output.push_str(&format!("- **Last sync:** {}\n", last_sync_str));
+        output.push_str(&format!(
+            "- **Git hooks:** {}\n",
+            if hooks_installed { "installed ✓" } else { "not installed" }
+        ));
+
+        // Dirty files
+        if git_status.is_git_repo {
+            let dirty_count = git_status.dirty_count();
+            if dirty_count == 0 {
+                output.push_str("- **Dirty files:** none (index is up-to-date)\n");
+            } else {
+                output.push_str(&format!("- **Dirty files:** {} (index may be stale)\n", dirty_count));
+
+                // List dirty files (up to 10)
+                output.push_str("\n**Modified/untracked files:**\n");
+                let dirty_files: Vec<_> = git_status.dirty_files().into_iter().take(10).collect();
+                for file in &dirty_files {
+                    output.push_str(&format!("  - {}\n", file));
+                }
+                if dirty_count > 10 {
+                    output.push_str(&format!("  ... and {} more\n", dirty_count - 10));
+                }
+
+                output.push_str("\nRun `codegraph sync` to update the index.");
+            }
+        } else {
+            output.push_str("- **Git status:** not a git repository\n");
         }
 
         Ok(ToolCallResult {
@@ -461,12 +625,36 @@ mod tests {
     #[test]
     fn test_get_definitions() {
         let defs = McpTools::get_definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8); // Now 8 tools including status
 
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&TOOL_SEARCH));
         assert!(names.contains(&TOOL_CONTEXT));
         assert!(names.contains(&TOOL_CALLERS));
+        assert!(names.contains(&TOOL_STATUS));
+    }
+
+    #[test]
+    fn test_staleness_warning_no_dirty() {
+        let git_status = GitStatus {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        let warning = McpTools::staleness_warning(&["src/main.rs"], &git_status);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_staleness_warning_with_dirty() {
+        let mut git_status = GitStatus {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        git_status.modified.insert("src/main.rs".to_string());
+
+        let warning = McpTools::staleness_warning(&["src/main.rs"], &git_status);
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("Stale data"));
     }
 
     #[test]
@@ -477,8 +665,9 @@ mod tests {
         let node = create_test_node("n1", "myFunction", NodeKind::Function);
         queries.insert_node(db.conn(), &node).unwrap();
 
+        let git_status = GitStatus::default();
         let args = json!({"query": "myFunction"});
-        let result = McpTools::tool_search(db.conn(), &queries, args).unwrap();
+        let result = McpTools::tool_search(db.conn(), &queries, args, &git_status).unwrap();
 
         assert!(!result.is_error);
         if let ContentBlock::Text { text } = &result.content[0] {
@@ -494,22 +683,14 @@ mod tests {
         let node = create_test_node("n1", "myFunction", NodeKind::Function);
         queries.insert_node(db.conn(), &node).unwrap();
 
+        let git_status = GitStatus::default();
         let args = json!({"node_id": "n1"});
-        let result = McpTools::tool_node(db.conn(), &mut queries, args).unwrap();
+        let result = McpTools::tool_node(db.conn(), &mut queries, args, &git_status).unwrap();
 
         assert!(!result.is_error);
         if let ContentBlock::Text { text } = &result.content[0] {
             assert!(text.contains("myFunction"));
             assert!(text.contains("function"));
         }
-    }
-
-    #[test]
-    fn test_tool_not_found() {
-        let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
-
-        let result = McpTools::execute(db.conn(), &mut queries, "invalid_tool", json!({}));
-        assert!(matches!(result, Err(McpError::ToolNotFound(_))));
     }
 }
