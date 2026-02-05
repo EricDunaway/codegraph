@@ -611,6 +611,34 @@ pub struct Node {
 
     /// When the node was last updated (Unix timestamp)
     pub updated_at: i64,
+
+    // =========================================================================
+    // Enrichment Fields (added in schema v2)
+    // =========================================================================
+
+    /// Inferred type from LSP hover (LSP enrichment)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inferred_type: Option<String>,
+
+    /// Resolved import path from LSP definition (LSP enrichment)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_import_path: Option<String>,
+
+    /// Code snippet (first N lines of body)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_snippet: Option<String>,
+
+    /// Thrown error types (JSON array in DB)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thrown_errors: Vec<String>,
+
+    /// Associated test names (JSON array in DB)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_names: Vec<String>,
+
+    /// Package name (from manifest or directory path)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
 }
 
 impl Node {
@@ -646,6 +674,13 @@ impl Node {
             decorators: Vec::new(),
             type_parameters: Vec::new(),
             updated_at: 0,
+            // Enrichment fields (v2)
+            inferred_type: None,
+            resolved_import_path: None,
+            code_snippet: None,
+            thrown_errors: Vec::new(),
+            test_names: Vec::new(),
+            package_name: None,
         }
     }
 
@@ -1036,6 +1071,164 @@ pub struct GraphStats {
 
     /// Last update timestamp
     pub last_updated: i64,
+}
+
+// =============================================================================
+// Enrichment Configuration Types
+// =============================================================================
+
+/// LSP enrichment scope (L4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LspScope {
+    /// Comprehensive on index, selective on sync (default)
+    #[default]
+    Hybrid,
+    /// Query all nodes
+    Comprehensive,
+    /// Query only changed/missing nodes
+    Selective,
+}
+
+/// Action when LSP is unavailable (I6)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LspUnavailableAction {
+    /// Fail the operation (default)
+    #[default]
+    Fail,
+    /// Continue without LSP enrichment
+    Degrade,
+}
+
+/// LSP server configuration for a specific language
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerConfig {
+    /// Whether this language's LSP is enabled
+    pub enabled: bool,
+    /// Path to the LSP server executable
+    pub server: String,
+    /// Arguments to pass to the server
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// LSP configuration (L1-L5)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Whether LSP enrichment is enabled globally
+    #[serde(default)]
+    pub enabled: bool,
+    /// TypeScript/JavaScript LSP configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typescript: Option<LspServerConfig>,
+    /// Dart LSP configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dart: Option<LspServerConfig>,
+    /// Rust LSP configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust: Option<LspServerConfig>,
+}
+
+/// Enrichment configuration (I1-I13)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentConfig {
+    /// LSP query scope strategy
+    #[serde(default)]
+    pub lsp_scope: LspScope,
+    /// Depth for cascade re-enrichment
+    #[serde(default = "default_cascade_depth")]
+    pub cascade_depth: u32,
+    /// Number of LSP server instances per language
+    #[serde(default = "default_lsp_instances")]
+    pub lsp_instances: u32,
+    /// What to do when LSP is unavailable
+    #[serde(default)]
+    pub on_lsp_unavailable: LspUnavailableAction,
+    /// Timeout for individual LSP queries in seconds
+    #[serde(default = "default_query_timeout")]
+    pub query_timeout_secs: u64,
+    /// Timeout for workspace initialization in seconds
+    #[serde(default = "default_workspace_init_timeout")]
+    pub workspace_init_timeout_secs: u64,
+}
+
+fn default_cascade_depth() -> u32 {
+    1
+}
+fn default_lsp_instances() -> u32 {
+    1
+}
+fn default_query_timeout() -> u64 {
+    5
+}
+fn default_workspace_init_timeout() -> u64 {
+    60
+}
+
+impl Default for EnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            lsp_scope: LspScope::Hybrid,
+            cascade_depth: 1,
+            lsp_instances: 1,
+            on_lsp_unavailable: LspUnavailableAction::Fail,
+            query_timeout_secs: 5,
+            workspace_init_timeout_secs: 60,
+        }
+    }
+}
+
+/// Embedding text configuration (B1-B8, G2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingTextConfig {
+    /// Maximum tokens for embedding text
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+    /// Maximum number of callees to include in context
+    #[serde(default = "default_max_callees")]
+    pub max_callees: usize,
+    /// Maximum number of callers to include in context
+    #[serde(default = "default_max_callers")]
+    pub max_callers: usize,
+    /// Maximum number of siblings to include in context
+    #[serde(default = "default_max_siblings")]
+    pub max_siblings: usize,
+    /// Maximum lines of code snippet to include
+    #[serde(default = "default_max_snippet_lines")]
+    pub max_snippet_lines: usize,
+    /// Whether to boost recently modified code
+    #[serde(default)]
+    pub git_activity_boost: bool,
+}
+
+fn default_max_tokens() -> usize {
+    2000
+}
+fn default_max_callees() -> usize {
+    10
+}
+fn default_max_callers() -> usize {
+    5
+}
+fn default_max_siblings() -> usize {
+    8
+}
+fn default_max_snippet_lines() -> usize {
+    50
+}
+
+impl Default for EmbeddingTextConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 2000,
+            max_callees: 10,
+            max_callers: 5,
+            max_siblings: 8,
+            max_snippet_lines: 50,
+            git_activity_boost: false,
+        }
+    }
 }
 
 // =============================================================================
@@ -1458,5 +1651,133 @@ mod tests {
         assert!(DEFAULT_EXCLUDE.contains(&"**/node_modules/**"));
         assert!(DEFAULT_EXCLUDE.contains(&"**/.git/**"));
         assert!(DEFAULT_EXCLUDE.contains(&"**/target/**"));
+    }
+
+    #[test]
+    fn test_node_enrichment_fields() {
+        let mut node = Node::new(
+            "test-id",
+            NodeKind::Function,
+            "test",
+            "test::test",
+            "test.rs",
+            Language::Rust,
+            1,
+            10,
+        );
+
+        // New enrichment fields should exist and default to None/empty
+        assert!(node.inferred_type.is_none());
+        assert!(node.resolved_import_path.is_none());
+        assert!(node.code_snippet.is_none());
+        assert!(node.thrown_errors.is_empty());
+        assert!(node.test_names.is_empty());
+        assert!(node.package_name.is_none());
+
+        // Should be settable
+        node.inferred_type = Some("Promise<void>".to_string());
+        node.thrown_errors = vec!["AuthError".to_string()];
+
+        assert_eq!(node.inferred_type.as_deref(), Some("Promise<void>"));
+        assert_eq!(node.thrown_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_node_enrichment_fields_serialization() {
+        let mut node = Node::new(
+            "test-id",
+            NodeKind::Function,
+            "processPayment",
+            "PaymentService::processPayment",
+            "src/payment.ts",
+            Language::TypeScript,
+            10,
+            25,
+        );
+        node.inferred_type = Some("Promise<Receipt>".to_string());
+        node.thrown_errors = vec!["PaymentError".to_string(), "ValidationError".to_string()];
+        node.package_name = Some("@myapp/payments".to_string());
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&node).unwrap();
+        let parsed: Node = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.inferred_type.as_deref(), Some("Promise<Receipt>"));
+        assert_eq!(parsed.thrown_errors.len(), 2);
+        assert_eq!(parsed.package_name.as_deref(), Some("@myapp/payments"));
+    }
+
+    #[test]
+    fn test_enrichment_config_defaults() {
+        let config = EnrichmentConfig::default();
+        assert_eq!(config.lsp_scope, LspScope::Hybrid);
+        assert_eq!(config.cascade_depth, 1);
+        assert_eq!(config.lsp_instances, 1);
+        assert_eq!(config.on_lsp_unavailable, LspUnavailableAction::Fail);
+        assert_eq!(config.query_timeout_secs, 5);
+        assert_eq!(config.workspace_init_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_embedding_config_defaults() {
+        let config = EmbeddingTextConfig::default();
+        assert_eq!(config.max_tokens, 2000);
+        assert_eq!(config.max_callees, 10);
+        assert_eq!(config.max_callers, 5);
+        assert_eq!(config.max_siblings, 8);
+        assert_eq!(config.max_snippet_lines, 50);
+        assert!(!config.git_activity_boost);
+    }
+
+    #[test]
+    fn test_lsp_config_serialization() {
+        let config = LspConfig {
+            enabled: true,
+            typescript: Some(LspServerConfig {
+                enabled: true,
+                server: "typescript-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+            }),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("typescript-language-server"));
+
+        let parsed: LspConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.typescript.is_some());
+        assert_eq!(parsed.typescript.unwrap().server, "typescript-language-server");
+    }
+
+    #[test]
+    fn test_lsp_scope_serialization() {
+        assert_eq!(
+            serde_json::to_string(&LspScope::Hybrid).unwrap(),
+            "\"hybrid\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LspScope::Comprehensive).unwrap(),
+            "\"comprehensive\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LspScope::Selective).unwrap(),
+            "\"selective\""
+        );
+    }
+
+    #[test]
+    fn test_enrichment_config_serialization() {
+        let config = EnrichmentConfig {
+            lsp_scope: LspScope::Comprehensive,
+            cascade_depth: 2,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: EnrichmentConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.lsp_scope, LspScope::Comprehensive);
+        assert_eq!(parsed.cascade_depth, 2);
     }
 }

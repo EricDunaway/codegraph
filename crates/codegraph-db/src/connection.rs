@@ -1,6 +1,7 @@
 //! Database connection management
 
 use crate::error::DbError;
+use crate::migrations;
 use crate::queries::QueryBuilder;
 use crate::schema::SCHEMA;
 use rusqlite::{Connection, OpenFlags};
@@ -31,6 +32,9 @@ impl DatabaseConnection {
         // Apply schema
         conn.execute_batch(SCHEMA)?;
 
+        // Run migrations
+        migrations::run_migrations(&conn)?;
+
         let queries = QueryBuilder::new(&conn)?;
 
         Ok(Self { conn, queries })
@@ -42,6 +46,9 @@ impl DatabaseConnection {
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+
+        // Run migrations
+        migrations::run_migrations(&conn)?;
 
         let queries = QueryBuilder::new(&conn)?;
 

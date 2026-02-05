@@ -7,11 +7,13 @@
 
 pub mod connection;
 pub mod error;
+pub mod migrations;
 pub mod queries;
 pub mod schema;
 
 pub use connection::DatabaseConnection;
 pub use error::DbError;
+pub use migrations::{get_schema_version, migrate_to_v2, run_migrations};
 pub use queries::QueryBuilder;
 
 // Re-export rusqlite for external access to Connection type

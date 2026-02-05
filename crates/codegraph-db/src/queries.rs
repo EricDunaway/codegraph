@@ -40,13 +40,17 @@ impl QueryBuilder {
                 start_line, end_line, start_column, end_column,
                 docstring, signature, visibility,
                 is_exported, is_async, is_static, is_abstract,
-                decorators, type_parameters, updated_at
+                decorators, type_parameters, updated_at,
+                inferred_type, resolved_import_path, code_snippet,
+                thrown_errors, test_names, package_name
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20
+                ?18, ?19, ?20,
+                ?21, ?22, ?23,
+                ?24, ?25, ?26
             )
             "#,
             params![
@@ -78,6 +82,21 @@ impl QueryBuilder {
                     Some(serde_json::to_string(&node.type_parameters).unwrap())
                 },
                 node.updated_at,
+                // Enrichment fields (v2)
+                node.inferred_type,
+                node.resolved_import_path,
+                node.code_snippet,
+                if node.thrown_errors.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&node.thrown_errors).unwrap())
+                },
+                if node.test_names.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&node.test_names).unwrap())
+                },
+                node.package_name,
             ],
         )?;
         Ok(())
@@ -117,7 +136,13 @@ impl QueryBuilder {
                 is_abstract = ?17,
                 decorators = ?18,
                 type_parameters = ?19,
-                updated_at = ?20
+                updated_at = ?20,
+                inferred_type = ?21,
+                resolved_import_path = ?22,
+                code_snippet = ?23,
+                thrown_errors = ?24,
+                test_names = ?25,
+                package_name = ?26
             WHERE id = ?1
             "#,
             params![
@@ -149,6 +174,21 @@ impl QueryBuilder {
                     Some(serde_json::to_string(&node.type_parameters).unwrap())
                 },
                 node.updated_at,
+                // Enrichment fields (v2)
+                node.inferred_type,
+                node.resolved_import_path,
+                node.code_snippet,
+                if node.thrown_errors.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&node.thrown_errors).unwrap())
+                },
+                if node.test_names.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&node.test_names).unwrap())
+                },
+                node.package_name,
             ],
         )?;
         Ok(())
@@ -833,6 +873,51 @@ impl QueryBuilder {
     }
 
     // =========================================================================
+    // Metadata Operations
+    // =========================================================================
+
+    /// Set a metadata key-value pair (upsert)
+    pub fn set_metadata(&self, conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Get a metadata value by key
+    pub fn get_metadata(&self, conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key = ?",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
+    }
+
+    /// Delete a metadata key
+    pub fn delete_metadata(&self, conn: &Connection, key: &str) -> Result<(), DbError> {
+        conn.execute("DELETE FROM metadata WHERE key = ?", params![key])?;
+        Ok(())
+    }
+
+    /// Get all metadata as a key-value map
+    pub fn get_all_metadata(&self, conn: &Connection) -> Result<std::collections::HashMap<String, String>, DbError> {
+        let mut stmt = conn.prepare("SELECT key, value FROM metadata")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    // =========================================================================
     // Cache Management
     // =========================================================================
 
@@ -878,6 +963,10 @@ impl QueryBuilder {
         let kind: String = row.get("kind")?;
         let language: String = row.get("language")?;
 
+        // Enrichment fields (optional - may not exist in v1 schema)
+        let thrown_errors: Option<String> = row.get("thrown_errors").ok().flatten();
+        let test_names: Option<String> = row.get("test_names").ok().flatten();
+
         Ok(Node {
             id: NodeId::new(row.get::<_, String>("id")?),
             kind: kind.parse().unwrap_or(NodeKind::Function),
@@ -903,6 +992,17 @@ impl QueryBuilder {
                 .map(|t| serde_json::from_str(&t).unwrap_or_default())
                 .unwrap_or_default(),
             updated_at: row.get("updated_at")?,
+            // Enrichment fields (v2)
+            inferred_type: row.get("inferred_type").ok().flatten(),
+            resolved_import_path: row.get("resolved_import_path").ok().flatten(),
+            code_snippet: row.get("code_snippet").ok().flatten(),
+            thrown_errors: thrown_errors
+                .map(|s| serde_json::from_str(&s).unwrap_or_default())
+                .unwrap_or_default(),
+            test_names: test_names
+                .map(|s| serde_json::from_str(&s).unwrap_or_default())
+                .unwrap_or_default(),
+            package_name: row.get("package_name").ok().flatten(),
         })
     }
 
@@ -1091,5 +1191,119 @@ mod tests {
 
         let results = queries.search_nodes(db.conn(), "sign", None, None, 10, 0).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_and_read_enriched_node() {
+        use crate::migrations;
+
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        migrations::run_migrations(db.conn()).unwrap();
+        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+
+        let mut node = Node::new(
+            "enriched-node",
+            NodeKind::Function,
+            "processPayment",
+            "PaymentService.processPayment",
+            "src/payment.ts",
+            Language::TypeScript,
+            10,
+            25,
+        );
+        node.inferred_type = Some("Promise<Receipt>".to_string());
+        node.thrown_errors = vec!["PaymentError".to_string(), "ValidationError".to_string()];
+        node.package_name = Some("@myapp/payments".to_string());
+        node.code_snippet = Some("async function processPayment() {\n  // ...\n}".to_string());
+
+        // Insert
+        queries.insert_node(db.conn(), &node).unwrap();
+
+        // Read back
+        let retrieved = queries.get_node_by_id(db.conn(), "enriched-node").unwrap().unwrap();
+
+        assert_eq!(retrieved.inferred_type.as_deref(), Some("Promise<Receipt>"));
+        assert_eq!(retrieved.thrown_errors.len(), 2);
+        assert!(retrieved.thrown_errors.contains(&"PaymentError".to_string()));
+        assert_eq!(retrieved.package_name.as_deref(), Some("@myapp/payments"));
+        assert!(retrieved.code_snippet.is_some());
+    }
+
+    #[test]
+    fn test_update_enriched_node() {
+        use crate::migrations;
+
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        migrations::run_migrations(db.conn()).unwrap();
+        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+
+        // Insert initial node
+        let mut node = Node::new(
+            "update-test",
+            NodeKind::Function,
+            "myFunc",
+            "module::myFunc",
+            "src/lib.rs",
+            Language::Rust,
+            1,
+            10,
+        );
+        queries.insert_node(db.conn(), &node).unwrap();
+
+        // Update with enrichment data
+        node.inferred_type = Some("Result<(), Error>".to_string());
+        node.test_names = vec!["test_myFunc".to_string()];
+        queries.update_node(db.conn(), &node).unwrap();
+
+        // Read back
+        let retrieved = queries.get_node_by_id(db.conn(), "update-test").unwrap().unwrap();
+
+        assert_eq!(retrieved.inferred_type.as_deref(), Some("Result<(), Error>"));
+        assert_eq!(retrieved.test_names.len(), 1);
+        assert_eq!(retrieved.test_names[0], "test_myFunc");
+    }
+
+    #[test]
+    fn test_metadata_operations() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
+
+        // Set metadata
+        queries.set_metadata(db.conn(), "embedding_version", "1").unwrap();
+        queries.set_metadata(db.conn(), "config_hash", "abc123").unwrap();
+
+        // Get metadata
+        let version = queries.get_metadata(db.conn(), "embedding_version").unwrap();
+        assert_eq!(version, Some("1".to_string()));
+
+        // Update existing
+        queries.set_metadata(db.conn(), "embedding_version", "2").unwrap();
+        let version = queries.get_metadata(db.conn(), "embedding_version").unwrap();
+        assert_eq!(version, Some("2".to_string()));
+
+        // Non-existent key
+        let missing = queries.get_metadata(db.conn(), "nonexistent").unwrap();
+        assert!(missing.is_none());
+
+        // Delete
+        queries.delete_metadata(db.conn(), "config_hash").unwrap();
+        let deleted = queries.get_metadata(db.conn(), "config_hash").unwrap();
+        assert!(deleted.is_none());
+    }
+
+    #[test]
+    fn test_get_all_metadata() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
+
+        // Set multiple values
+        queries.set_metadata(db.conn(), "key1", "value1").unwrap();
+        queries.set_metadata(db.conn(), "key2", "value2").unwrap();
+
+        // Get all
+        let all = queries.get_all_metadata(db.conn()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(all.get("key2"), Some(&"value2".to_string()));
     }
 }
