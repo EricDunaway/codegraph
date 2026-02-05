@@ -43,6 +43,7 @@ sha2 = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
+regex = "1"
 
 # Tree-sitter core
 tree-sitter = { workspace = true }

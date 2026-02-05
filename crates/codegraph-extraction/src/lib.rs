@@ -22,6 +22,10 @@ pub mod extractor;
 pub mod orchestrator;
 pub mod parser;
 pub mod languages;
+pub mod snippet;
+pub mod errors;
+pub mod test_detection;
+pub mod package;
 pub mod tree_sitter_extractor;
 
 pub use error::ExtractionError;
@@ -31,3 +35,13 @@ pub use orchestrator::{ExtractionOrchestrator, IndexProgress, IndexResult, SyncR
 pub use parser::TreeSitterParser;
 pub use tree_sitter_extractor::TreeSitterExtractor;
 pub use languages::{LanguageConfig, get_language_config};
+pub use snippet::{extract_code_snippet, extract_code_snippet_for_range, DEFAULT_MAX_LINES, TRUNCATION_MARKER};
+pub use errors::extract_thrown_errors;
+pub use test_detection::{
+    is_test_file, find_test_names_for_symbol, extract_imports, associate_tests_via_imports,
+    find_tests_for_symbol, ImportInfo, AssociationMethod, TestAssociation,
+};
+pub use package::{
+    extract_package_name, extract_package_name_nearest, extract_package_for_file,
+    is_workspace_root, PackageInfo, PackageSource,
+};
