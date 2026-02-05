@@ -16,6 +16,8 @@ log = { workspace = true }
 sha2 = { workspace = true }
 walkdir = { workspace = true }
 rusqlite = { workspace = true }
+filetime = "0.2"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -2,10 +2,13 @@
 
 use crate::change_detector::{ChangeDetector, ChangeKind, FileChange};
 use crate::error::SyncError;
+use crate::lock::IndexLock;
+use crate::selective::SelectiveScope;
 use codegraph_db::QueryBuilder;
-use codegraph_extraction::{ExtractionOrchestrator, ExtractorRegistry};
-use codegraph_types::{Config, FileRecord};
+use codegraph_extraction::ExtractorRegistry;
+use codegraph_types::{Config, EnrichmentConfig, FileRecord};
 use rusqlite::Connection;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Statistics from a sync operation
@@ -23,6 +26,12 @@ pub struct SyncStats {
     pub nodes_updated: usize,
     /// Nodes deleted
     pub nodes_deleted: usize,
+    /// Total nodes in the graph (after sync)
+    pub total_nodes: usize,
+    /// Nodes needing re-enrichment (based on selective scope)
+    pub nodes_to_enrich: usize,
+    /// Nodes that were actually enriched
+    pub nodes_enriched: usize,
     /// Errors encountered
     pub errors: Vec<String>,
 }
@@ -48,6 +57,8 @@ pub struct SyncResult {
     pub had_changes: bool,
     /// Duration in milliseconds
     pub duration_ms: u64,
+    /// Selective scope for enrichment (nodes/files needing re-enrichment)
+    pub enrichment_scope: SelectiveScope,
 }
 
 /// Configuration for sync
@@ -59,6 +70,10 @@ pub struct SyncConfig {
     pub continue_on_error: bool,
     /// Batch size for processing
     pub batch_size: usize,
+    /// Enrichment configuration (for cascade depth etc.)
+    pub enrichment: EnrichmentConfig,
+    /// Whether to use file locking
+    pub use_lock: bool,
 }
 
 impl Default for SyncConfig {
@@ -67,6 +82,8 @@ impl Default for SyncConfig {
             excludes: Vec::new(),
             continue_on_error: true,
             batch_size: 100,
+            enrichment: EnrichmentConfig::default(),
+            use_lock: true,
         }
     }
 }
@@ -102,8 +119,29 @@ impl SyncManager {
 
     /// Perform a full sync
     pub fn sync(&self, conn: &Connection, queries: &mut QueryBuilder) -> Result<SyncResult, SyncError> {
+        self.sync_with_codegraph_dir(conn, queries, None)
+    }
+
+    /// Perform a full sync with optional lock support
+    pub fn sync_with_codegraph_dir(
+        &self,
+        conn: &Connection,
+        queries: &mut QueryBuilder,
+        codegraph_dir: Option<&Path>,
+    ) -> Result<SyncResult, SyncError> {
         let start = SystemTime::now();
         let mut stats = SyncStats::default();
+
+        // Acquire lock if configured and codegraph_dir provided
+        let _lock = if self.config.use_lock {
+            if let Some(dir) = codegraph_dir {
+                Some(IndexLock::acquire(dir)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Build config for detection
         let mut detect_config = Config::default();
@@ -116,10 +154,28 @@ impl SyncManager {
         let changes = detector.detect_changes(conn, queries)?;
         let had_changes = !changes.is_empty();
 
+        // Collect changed file paths for selective scope
+        let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+
         if had_changes {
             // Process changes
             self.process_changes(conn, queries, &changes, &mut stats)?;
         }
+
+        // Compute selective scope with cascade depth
+        let changed_file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        let enrichment_scope = SelectiveScope::from_changed_files_with_cascade(
+            conn,
+            &changed_file_refs,
+            self.config.enrichment.cascade_depth,
+        );
+
+        // Update stats with scope info
+        stats.nodes_to_enrich = enrichment_scope.node_count();
+
+        // Get total node count
+        let graph_stats = queries.get_stats(conn)?;
+        stats.total_nodes = graph_stats.node_count as usize;
 
         let duration_ms = start
             .elapsed()
@@ -130,6 +186,7 @@ impl SyncManager {
             stats,
             had_changes,
             duration_ms,
+            enrichment_scope,
         })
     }
 
@@ -147,9 +204,27 @@ impl SyncManager {
         let changes = detector.detect_changes_for_files(conn, queries, file_paths)?;
         let had_changes = !changes.is_empty();
 
+        // Collect changed file paths for selective scope
+        let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+
         if had_changes {
             self.process_changes(conn, queries, &changes, &mut stats)?;
         }
+
+        // Compute selective scope with cascade depth
+        let changed_file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
+        let enrichment_scope = SelectiveScope::from_changed_files_with_cascade(
+            conn,
+            &changed_file_refs,
+            self.config.enrichment.cascade_depth,
+        );
+
+        // Update stats with scope info
+        stats.nodes_to_enrich = enrichment_scope.node_count();
+
+        // Get total node count
+        let graph_stats = queries.get_stats(conn)?;
+        stats.total_nodes = graph_stats.node_count as usize;
 
         let duration_ms = start
             .elapsed()
@@ -160,6 +235,7 @@ impl SyncManager {
             stats,
             had_changes,
             duration_ms,
+            enrichment_scope,
         })
     }
 

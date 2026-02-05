@@ -34,4 +34,12 @@ pub enum SyncError {
     /// Invalid configuration
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// Lock acquisition failed
+    #[error("Failed to acquire lock: {0}")]
+    LockFailed(String),
+
+    /// Lock is already held by another process
+    #[error("Lock already held")]
+    LockHeld,
 }
