@@ -26,19 +26,26 @@ pub fn byte_to_utf16(text: &str, byte_offset: usize) -> u32 {
 ///
 /// This is the inverse of `byte_to_utf16`. Converts an LSP position
 /// back to a byte offset for use with Rust strings.
-pub fn utf16_to_byte(text: &str, utf16_offset: u32) -> usize {
+///
+/// Returns `None` if `utf16_offset` exceeds the text length.
+pub fn utf16_to_byte(text: &str, utf16_offset: u32) -> Option<usize> {
     let mut current_utf16 = 0u32;
     let mut byte_offset = 0usize;
 
     for ch in text.chars() {
         if current_utf16 >= utf16_offset {
-            break;
+            return Some(byte_offset);
         }
         current_utf16 += ch.len_utf16() as u32;
         byte_offset += ch.len_utf8();
     }
 
-    byte_offset
+    // Check if we landed exactly at the end (valid position after last char)
+    if current_utf16 >= utf16_offset {
+        Some(byte_offset)
+    } else {
+        None // utf16_offset exceeds text length
+    }
 }
 
 /// Convert line and column (0-indexed) to byte offset
@@ -55,7 +62,7 @@ pub fn position_to_byte_offset(text: &str, line: u32, column_utf16: u32) -> Opti
             let line_end = line_text.find('\n').unwrap_or(line_text.len());
             let line_content = &line_text[..line_end];
 
-            let byte_in_line = utf16_to_byte(line_content, column_utf16);
+            let byte_in_line = utf16_to_byte(line_content, column_utf16)?;
             return Some(line_start + byte_in_line);
         }
 
@@ -68,7 +75,7 @@ pub fn position_to_byte_offset(text: &str, line: u32, column_utf16: u32) -> Opti
     // Handle last line (or only line with no newline)
     if current_line == line {
         let line_text = &text[line_start..];
-        let byte_in_line = utf16_to_byte(line_text, column_utf16);
+        let byte_in_line = utf16_to_byte(line_text, column_utf16)?;
         return Some(line_start + byte_in_line);
     }
 
@@ -125,7 +132,7 @@ mod tests {
         let text = "Hello World";
         let utf16_offset = 6;
         let byte_offset = utf16_to_byte(text, utf16_offset);
-        assert_eq!(byte_offset, 6);
+        assert_eq!(byte_offset, Some(6));
     }
 
     #[test]
@@ -133,7 +140,7 @@ mod tests {
         let text = "Hello 🌍 World";
         let utf16_offset = 9; // After "Hello 🌍 "
         let byte_offset = utf16_to_byte(text, utf16_offset);
-        assert_eq!(byte_offset, 11); // "Hello " (6) + emoji (4) + " " (1)
+        assert_eq!(byte_offset, Some(11)); // "Hello " (6) + emoji (4) + " " (1)
     }
 
     #[test]
@@ -143,8 +150,17 @@ mod tests {
         for (byte_idx, _) in text.char_indices() {
             let utf16 = byte_to_utf16(text, byte_idx);
             let back = utf16_to_byte(text, utf16);
-            assert_eq!(back, byte_idx, "Roundtrip failed at byte {}", byte_idx);
+            assert_eq!(back, Some(byte_idx), "Roundtrip failed at byte {}", byte_idx);
         }
+    }
+
+    #[test]
+    fn test_utf16_to_byte_out_of_bounds() {
+        let text = "Hello";
+        // "Hello" is 5 UTF-16 units, so offset 10 is out of bounds
+        assert_eq!(utf16_to_byte(text, 10), None);
+        // But offset 5 (end position) is valid
+        assert_eq!(utf16_to_byte(text, 5), Some(5));
     }
 
     #[test]

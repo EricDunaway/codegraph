@@ -191,10 +191,10 @@ impl LspClient {
         let content_length = content_length
             .ok_or_else(|| LspError::InvalidResponse("Missing Content-Length".to_string()))?;
 
-        // Sanity check (100MB max)
-        if content_length > 100 * 1024 * 1024 {
+        // Sanity check (10MB max - LSP responses are typically < 100KB)
+        if content_length > 10 * 1024 * 1024 {
             return Err(LspError::InvalidResponse(format!(
-                "Content-Length too large: {}",
+                "Content-Length too large: {} (max 10MB)",
                 content_length
             )));
         }
@@ -441,6 +441,10 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // Abort the reader task to ensure clean shutdown
+        if let Some(ref abort) = self.reader_abort {
+            abort.abort();
+        }
         // The process has kill_on_drop(true), so it will be cleaned up
     }
 }
