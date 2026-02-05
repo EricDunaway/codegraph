@@ -45,4 +45,8 @@ pub enum VectorError {
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Token counter initialization failed
+    #[error("Token counter initialization failed: {0}")]
+    TokenCounterFailed(String),
 }

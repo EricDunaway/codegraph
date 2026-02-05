@@ -21,6 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 rusqlite = { workspace = true }
+tiktoken-rs = { workspace = true }
 
 # Optional ONNX dependencies
 tokenizers = { workspace = true, optional = true }
