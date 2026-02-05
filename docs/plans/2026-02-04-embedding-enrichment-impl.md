@@ -1252,7 +1252,7 @@ git commit -m "feat(vectors): add embedding config version hash for re-embed det
 
 ## Milestone 3: Graph Context (Tasks 15-20)
 
-### Task 15: Add Graph Context Query Methods
+### Task 15: Add Graph Context Query Methods (G4, G5)
 
 **Files:**
 - Modify: `crates/codegraph-graph/src/traversal.rs`
@@ -1276,8 +1276,47 @@ fn test_get_callees_for_embedding() {
     assert!(callees.contains(&"fn_b".to_string()));
 }
 
+#[test]
+fn test_direct_only_no_transitive() {
+    // G4: Direct relationships only, no transitive
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    setup_chain_graph(&db); // fn_a -> fn_b -> fn_c
+
+    let mut queries = QueryBuilder::new(db.conn()).unwrap();
+    let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+    let callees = traverser.get_callees_for_embedding("fn_a", 10).unwrap();
+
+    // Should only get direct callee fn_b, NOT transitive fn_c
+    assert_eq!(callees.len(), 1);
+    assert!(callees.contains(&"fn_b".to_string()));
+    assert!(!callees.contains(&"fn_c".to_string()));
+}
+
+#[test]
+fn test_cycle_handling_safe() {
+    // G5: Direct-only (G4) means cycles don't cause infinite loops
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    setup_cyclic_graph(&db); // fn_a -> fn_b -> fn_c -> fn_a (cycle!)
+
+    let mut queries = QueryBuilder::new(db.conn()).unwrap();
+    let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+    // This should NOT hang or panic - direct-only makes it safe
+    let callees_a = traverser.get_callees_for_embedding("fn_a", 10).unwrap();
+    let callees_b = traverser.get_callees_for_embedding("fn_b", 10).unwrap();
+    let callees_c = traverser.get_callees_for_embedding("fn_c", 10).unwrap();
+
+    // Each node only sees its direct callee
+    assert_eq!(callees_a.len(), 1);
+    assert!(callees_a.contains(&"fn_b".to_string()));
+    assert_eq!(callees_b.len(), 1);
+    assert!(callees_b.contains(&"fn_c".to_string()));
+    assert_eq!(callees_c.len(), 1);
+    assert!(callees_c.contains(&"fn_a".to_string())); // Cycle edge, but safe
+}
+
 fn setup_test_graph(db: &DatabaseConnection) {
-    // Create test nodes
     let queries = QueryBuilder::new(db.conn()).unwrap();
 
     let nodes = vec![
@@ -1302,13 +1341,50 @@ fn setup_test_graph(db: &DatabaseConnection) {
         queries.insert_edge(db.conn(), edge).unwrap();
     }
 }
+
+fn setup_chain_graph(db: &DatabaseConnection) {
+    let queries = QueryBuilder::new(db.conn()).unwrap();
+
+    let nodes = vec![
+        Node::new("fn_a", NodeKind::Function, "fn_a", "test::fn_a", "test.rs", Language::Rust, 1, 5),
+        Node::new("fn_b", NodeKind::Function, "fn_b", "test::fn_b", "test.rs", Language::Rust, 10, 15),
+        Node::new("fn_c", NodeKind::Function, "fn_c", "test::fn_c", "test.rs", Language::Rust, 20, 25),
+    ];
+
+    for node in &nodes {
+        queries.insert_node(db.conn(), node).unwrap();
+    }
+
+    // Chain: fn_a -> fn_b -> fn_c
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("fn_a"), NodeId::new("fn_b"), EdgeKind::Calls)).unwrap();
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("fn_b"), NodeId::new("fn_c"), EdgeKind::Calls)).unwrap();
+}
+
+fn setup_cyclic_graph(db: &DatabaseConnection) {
+    let queries = QueryBuilder::new(db.conn()).unwrap();
+
+    let nodes = vec![
+        Node::new("fn_a", NodeKind::Function, "fn_a", "test::fn_a", "test.rs", Language::Rust, 1, 5),
+        Node::new("fn_b", NodeKind::Function, "fn_b", "test::fn_b", "test.rs", Language::Rust, 10, 15),
+        Node::new("fn_c", NodeKind::Function, "fn_c", "test::fn_c", "test.rs", Language::Rust, 20, 25),
+    ];
+
+    for node in &nodes {
+        queries.insert_node(db.conn(), node).unwrap();
+    }
+
+    // Cycle: fn_a -> fn_b -> fn_c -> fn_a
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("fn_a"), NodeId::new("fn_b"), EdgeKind::Calls)).unwrap();
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("fn_b"), NodeId::new("fn_c"), EdgeKind::Calls)).unwrap();
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("fn_c"), NodeId::new("fn_a"), EdgeKind::Calls)).unwrap();
+}
 ```
 
-**Step 2-5:** Implement using existing `get_callees()` method, extract names.
+**Step 2-5:** Implement using existing `get_callees()` method, extract names. Direct-only query naturally handles cycles (G5).
 
 **Commit:**
 ```bash
-git commit -m "feat(graph): add callee/caller queries for embedding with name extraction"
+git commit -m "feat(graph): add callee/caller queries for embedding (G4 direct-only, G5 cycle-safe)"
 ```
 
 ---
@@ -1341,7 +1417,7 @@ git commit -m "feat(graph): add implements/extends query for class context"
 
 ---
 
-### Task 18: Add Priority Sorting for Graph Lists (G3)
+### Task 18: Add Priority Sorting for Graph Lists (G3, G6)
 
 **Files:**
 - Modify: `crates/codegraph-graph/src/traversal.rs`
@@ -1350,7 +1426,7 @@ git commit -m "feat(graph): add implements/extends query for class context"
 
 ```rust
 #[test]
-fn test_callees_sorted_by_priority() {
+fn test_callees_sorted_decorated_first() {
     let db = DatabaseConnection::open_in_memory().unwrap();
     setup_graph_with_decorated_nodes(&db);
 
@@ -1359,17 +1435,117 @@ fn test_callees_sorted_by_priority() {
 
     let callees = traverser.get_callees_for_embedding("caller", 10).unwrap();
 
-    // Decorated nodes should come first
+    // G3: Decorated nodes should come first
     // fn_decorated has @Controller, fn_plain has no decorators
     assert_eq!(callees[0], "fn_decorated");
 }
+
+#[test]
+fn test_callees_sorted_by_call_frequency() {
+    // G3, G6: After decorated, sort by call frequency (counted at query time)
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    setup_graph_with_call_counts(&db);
+
+    // fn_popular is called by 10 other functions
+    // fn_rare is called by 1 function
+    // Neither is decorated
+
+    let mut queries = QueryBuilder::new(db.conn()).unwrap();
+    let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+    let callees = traverser.get_callees_for_embedding("caller", 10).unwrap();
+
+    // More frequently called functions come first
+    let popular_idx = callees.iter().position(|c| c == "fn_popular").unwrap();
+    let rare_idx = callees.iter().position(|c| c == "fn_rare").unwrap();
+    assert!(popular_idx < rare_idx, "Popular functions should rank higher");
+}
+
+#[test]
+fn test_callees_alphabetical_tiebreaker() {
+    // G3: Same decoration status and frequency -> alphabetical
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    setup_graph_with_same_priority(&db);
+
+    let mut queries = QueryBuilder::new(db.conn()).unwrap();
+    let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+    let callees = traverser.get_callees_for_embedding("caller", 10).unwrap();
+
+    // Alphabetical when tied
+    assert_eq!(callees[0], "fn_alpha");
+    assert_eq!(callees[1], "fn_beta");
+}
+
+fn setup_graph_with_call_counts(db: &DatabaseConnection) {
+    let queries = QueryBuilder::new(db.conn()).unwrap();
+
+    // fn_popular - called by many
+    let popular = Node::new("fn_popular", NodeKind::Function, "fn_popular", "test::fn_popular", "test.rs", Language::Rust, 1, 5);
+    queries.insert_node(db.conn(), &popular).unwrap();
+
+    // fn_rare - called by few
+    let rare = Node::new("fn_rare", NodeKind::Function, "fn_rare", "test::fn_rare", "test.rs", Language::Rust, 10, 15);
+    queries.insert_node(db.conn(), &rare).unwrap();
+
+    // Create many callers for fn_popular (G6: count at query time)
+    for i in 0..10 {
+        let caller = Node::new(format!("caller_{}", i), NodeKind::Function, format!("caller_{}", i), format!("test::caller_{}", i), "test.rs", Language::Rust, 20 + i, 25 + i);
+        queries.insert_node(db.conn(), &caller).unwrap();
+        queries.insert_edge(db.conn(), &Edge::new(NodeId::new(format!("caller_{}", i)), NodeId::new("fn_popular"), EdgeKind::Calls)).unwrap();
+    }
+
+    // Only 1 caller for fn_rare
+    queries.insert_edge(db.conn(), &Edge::new(NodeId::new("caller_0"), NodeId::new("fn_rare"), EdgeKind::Calls)).unwrap();
+}
 ```
 
-**Step 2-5:** Sort by: decorated > alphabetical (per G3).
+**Step 2-5:** Implement priority sorting: decorated → call frequency → alphabetical.
+
+```rust
+/// Sort callees by priority (G3): decorated first, then by call frequency (G6), then alphabetical
+fn sort_by_priority(nodes: &mut [Node], conn: &Connection) {
+    // Count incoming calls for each node (G6: count at query time)
+    let call_counts: HashMap<String, usize> = nodes.iter()
+        .map(|n| {
+            let count = count_incoming_calls(conn, &n.id.0).unwrap_or(0);
+            (n.id.0.clone(), count)
+        })
+        .collect();
+
+    nodes.sort_by(|a, b| {
+        // 1. Decorated first
+        let a_decorated = !a.decorators.is_empty();
+        let b_decorated = !b.decorators.is_empty();
+        if a_decorated != b_decorated {
+            return b_decorated.cmp(&a_decorated);
+        }
+
+        // 2. Higher call frequency (G6)
+        let a_freq = call_counts.get(&a.id.0).unwrap_or(&0);
+        let b_freq = call_counts.get(&b.id.0).unwrap_or(&0);
+        if a_freq != b_freq {
+            return b_freq.cmp(a_freq);
+        }
+
+        // 3. Alphabetical tiebreaker
+        a.name.cmp(&b.name)
+    });
+}
+
+fn count_incoming_calls(conn: &Connection, node_id: &str) -> Result<usize, DbError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE target = ?1 AND kind = 'calls'",
+        params![node_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+```
 
 **Commit:**
 ```bash
-git commit -m "feat(graph): add priority sorting (decorated first) for graph lists (G3)"
+git commit -m "feat(graph): add priority sorting (decorated → frequency → alpha) for graph lists (G3, G6)"
 ```
 
 ---
@@ -1704,11 +1880,115 @@ git commit -m "feat(lsp): add UTF-16 position encoding conversion (I9)"
 **Files:**
 - Create: `crates/codegraph-lsp/src/client.rs`
 
-**Step 1-5:** Implement base LSP client using tower-lsp.
+**Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_lsp_client_send_request() {
+        // Mock server that echoes back
+        let (mut client, _server) = create_mock_client_server();
+
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::parse("file:///test.ts").unwrap(),
+                },
+                position: lsp_types::Position { line: 0, character: 0 },
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let result = client.hover(params).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_handles_error_response() {
+        let (mut client, _server) = create_mock_client_server();
+
+        // Request for non-existent file
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::parse("file:///nonexistent.ts").unwrap(),
+                },
+                position: lsp_types::Position { line: 0, character: 0 },
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let result = client.hover(params).await;
+        // Should return None, not error (file not found is valid LSP response)
+        assert!(result.is_ok());
+    }
+}
+```
+
+**Step 2-5:** Implement base LSP client using async-lsp.
+
+```rust
+// crates/codegraph-lsp/src/client.rs
+use async_lsp::{LanguageClient, LspService, MainLoop};
+use lsp_types::*;
+use std::process::Stdio;
+use tokio::process::Command;
+use crate::error::LspError;
+
+/// LSP client wrapper for communication with language servers
+pub struct LspClient {
+    service: LspService,
+    main_loop: Option<MainLoop>,
+}
+
+impl LspClient {
+    /// Spawn a new LSP server process and connect
+    pub async fn spawn(command: &str, args: &[String], root_uri: Url) -> Result<Self, LspError> {
+        let mut child = Command::new(command)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| LspError::SpawnFailed(e.to_string()))?;
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let (service, main_loop) = LspService::build(stdin, stdout)
+            .finish();
+
+        Ok(Self { service, main_loop: Some(main_loop) })
+    }
+
+    /// Send hover request
+    pub async fn hover(&mut self, params: HoverParams) -> Result<Option<Hover>, LspError> {
+        self.service.hover(params).await
+            .map_err(|e| LspError::RequestFailed(e.to_string()))
+    }
+
+    /// Send go-to-definition request
+    pub async fn definition(&mut self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>, LspError> {
+        self.service.definition(params).await
+            .map_err(|e| LspError::RequestFailed(e.to_string()))
+    }
+
+    /// Shutdown the server
+    pub async fn shutdown(&mut self) -> Result<(), LspError> {
+        self.service.shutdown().await
+            .map_err(|e| LspError::ShutdownFailed(e.to_string()))?;
+        self.service.exit().await;
+        Ok(())
+    }
+}
+```
 
 **Commit:**
 ```bash
-git commit -m "feat(lsp): add base LSP client using tower-lsp"
+git commit -m "feat(lsp): add base LSP client using async-lsp"
 ```
 
 ---
@@ -1718,11 +1998,163 @@ git commit -m "feat(lsp): add base LSP client using tower-lsp"
 **Files:**
 - Create: `crates/codegraph-lsp/src/lifecycle.rs`
 
-**Step 1-5:** Implement lazy spawn, keep-alive, shutdown.
+**Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+
+    fn setup_test_project() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("package.json"), r#"{"name": "test"}"#).unwrap();
+        fs::write(temp.path().join("tsconfig.json"), r#"{"compilerOptions": {}}"#).unwrap();
+        fs::write(temp.path().join("index.ts"), "export const x = 1;").unwrap();
+        temp
+    }
+
+    #[tokio::test]
+    async fn test_lazy_spawn_not_started_until_needed() {
+        let config = LspServerConfig {
+            enabled: true,
+            server: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        };
+
+        let manager = LspServerManager::new(config);
+
+        // Not spawned yet
+        assert!(!manager.is_running());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires typescript-language-server
+    async fn test_lazy_spawn_starts_on_first_request() {
+        let temp = setup_test_project();
+        let config = LspServerConfig {
+            enabled: true,
+            server: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        };
+
+        let mut manager = LspServerManager::new(config);
+
+        // First request triggers spawn
+        manager.ensure_started(temp.path()).await.unwrap();
+        assert!(manager.is_running());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires typescript-language-server
+    async fn test_keep_alive_during_indexing() {
+        let temp = setup_test_project();
+        let config = LspServerConfig {
+            enabled: true,
+            server: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        };
+
+        let mut manager = LspServerManager::new(config);
+        manager.ensure_started(temp.path()).await.unwrap();
+
+        // Should stay alive during batch operations
+        for _ in 0..10 {
+            assert!(manager.is_running());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires typescript-language-server
+    async fn test_shutdown_after_indexing() {
+        let temp = setup_test_project();
+        let config = LspServerConfig {
+            enabled: true,
+            server: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        };
+
+        let mut manager = LspServerManager::new(config);
+        manager.ensure_started(temp.path()).await.unwrap();
+        assert!(manager.is_running());
+
+        manager.shutdown().await.unwrap();
+        assert!(!manager.is_running());
+    }
+}
+```
+
+**Step 2-5:** Implement server lifecycle.
+
+```rust
+// crates/codegraph-lsp/src/lifecycle.rs
+use crate::client::LspClient;
+use crate::error::LspError;
+use codegraph_types::LspServerConfig;
+use std::path::Path;
+use lsp_types::Url;
+
+/// Manages LSP server lifecycle (L5: lazy spawn, keep-alive, shutdown)
+pub struct LspServerManager {
+    config: LspServerConfig,
+    client: Option<LspClient>,
+    root_uri: Option<Url>,
+}
+
+impl LspServerManager {
+    pub fn new(config: LspServerConfig) -> Self {
+        Self {
+            config,
+            client: None,
+            root_uri: None,
+        }
+    }
+
+    /// Check if server is currently running
+    pub fn is_running(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Ensure server is started (lazy spawn)
+    pub async fn ensure_started(&mut self, project_root: &Path) -> Result<&mut LspClient, LspError> {
+        if self.client.is_none() {
+            let root_uri = Url::from_file_path(project_root)
+                .map_err(|_| LspError::InvalidPath(project_root.display().to_string()))?;
+
+            let client = LspClient::spawn(
+                &self.config.server,
+                &self.config.args,
+                root_uri.clone(),
+            ).await?;
+
+            self.client = Some(client);
+            self.root_uri = Some(root_uri);
+        }
+
+        Ok(self.client.as_mut().unwrap())
+    }
+
+    /// Get client if running
+    pub fn client(&mut self) -> Option<&mut LspClient> {
+        self.client.as_mut()
+    }
+
+    /// Shutdown the server
+    pub async fn shutdown(&mut self) -> Result<(), LspError> {
+        if let Some(mut client) = self.client.take() {
+            client.shutdown().await?;
+        }
+        self.root_uri = None;
+        Ok(())
+    }
+}
+```
 
 **Commit:**
 ```bash
-git commit -m "feat(lsp): add server lifecycle management (lazy spawn, keep-alive) (L5)"
+git commit -m "feat(lsp): add server lifecycle management (lazy spawn, keep-alive, shutdown) (L5)"
 ```
 
 ---
@@ -1745,12 +2177,219 @@ git commit -m "feat(lsp): add workspace initialization waiting with timeout (I10
 
 **Files:**
 - Modify: `crates/codegraph-lsp/src/lifecycle.rs`
+- Create: `crates/codegraph-lsp/src/batch.rs`
 
-**Step 1-5:** 3x retry with backoff, per-file error skipping.
+**Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_spawn_retry_with_backoff() {
+        let config = LspServerConfig {
+            enabled: true,
+            server: "nonexistent-server-that-will-fail".to_string(),
+            args: vec![],
+        };
+
+        let mut manager = LspServerManager::new(config);
+        let result = manager.ensure_started_with_retry(Path::new("/tmp"), 3).await;
+
+        // Should fail after 3 retries
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LspError::SpawnFailed(msg) => assert!(msg.contains("after 3 retries")),
+            e => panic!("Unexpected error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_per_file_error_skips_and_continues() {
+        let mut enricher = MockEnricher::new();
+        enricher.fail_on_file("bad_syntax.ts");
+
+        let files = vec!["good1.ts", "bad_syntax.ts", "good2.ts"];
+        let results = enricher.enrich_files(&files).await.unwrap();
+
+        // Should have 2 results (bad_syntax.ts skipped)
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r.file_path == "good1.ts"));
+        assert!(results.iter().any(|r| r.file_path == "good2.ts"));
+        // bad_syntax.ts was skipped with warning
+    }
+
+    #[tokio::test]
+    async fn test_server_crash_restarts_and_continues() {
+        let mut enricher = MockEnricher::new();
+        enricher.crash_on_file("crash_trigger.ts");
+
+        let files = vec!["a.ts", "crash_trigger.ts", "b.ts"];
+        let results = enricher.enrich_files(&files).await.unwrap();
+
+        // Server should restart, continue with remaining files
+        assert!(results.iter().any(|r| r.file_path == "a.ts"));
+        assert!(results.iter().any(|r| r.file_path == "b.ts"));
+        assert_eq!(enricher.restart_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_degrade_mode_continues_without_lsp() {
+        let config = EnrichmentConfig {
+            on_lsp_unavailable: LspUnavailableAction::Degrade,
+            ..Default::default()
+        };
+
+        let mut enricher = LspEnricherBatch::new(config);
+        // LSP server unavailable
+        enricher.set_lsp_available(false);
+
+        let files = vec!["test.ts"];
+        let results = enricher.enrich_files(&files).await.unwrap();
+
+        // Should return empty enrichment, not error
+        assert_eq!(results.len(), 1);
+        assert!(results[0].inferred_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fail_mode_errors_without_lsp() {
+        let config = EnrichmentConfig {
+            on_lsp_unavailable: LspUnavailableAction::Fail,
+            ..Default::default()
+        };
+
+        let mut enricher = LspEnricherBatch::new(config);
+        enricher.set_lsp_available(false);
+
+        let files = vec!["test.ts"];
+        let result = enricher.enrich_files(&files).await;
+
+        // Should fail
+        assert!(result.is_err());
+    }
+}
+```
+
+**Step 2-5:** Implement error handling and retry logic.
+
+```rust
+// crates/codegraph-lsp/src/batch.rs
+use crate::error::LspError;
+use crate::lifecycle::LspServerManager;
+use codegraph_types::{EnrichmentConfig, LspUnavailableAction, Node};
+use std::path::Path;
+use std::time::Duration;
+
+/// Batch LSP enrichment with error handling (I6, I7)
+pub struct LspEnricherBatch {
+    config: EnrichmentConfig,
+    manager: Option<LspServerManager>,
+    restart_count: usize,
+}
+
+/// Result of enriching a single file
+#[derive(Debug, Clone)]
+pub struct FileEnrichmentResult {
+    pub file_path: String,
+    pub inferred_type: Option<String>,
+    pub resolved_import_path: Option<String>,
+}
+
+impl LspEnricherBatch {
+    pub fn new(config: EnrichmentConfig) -> Self {
+        Self {
+            config,
+            manager: None,
+            restart_count: 0,
+        }
+    }
+
+    /// Enrich multiple files with per-file error handling (I7)
+    pub async fn enrich_files(&mut self, files: &[&str]) -> Result<Vec<FileEnrichmentResult>, LspError> {
+        let mut results = Vec::new();
+
+        for file in files {
+            match self.enrich_file(file).await {
+                Ok(result) => results.push(result),
+                Err(LspError::ServerCrashed) => {
+                    log::warn!("LSP server crashed on {}, restarting...", file);
+                    self.restart_server().await?;
+                    self.restart_count += 1;
+                    // Skip this file, continue with next
+                }
+                Err(e) => {
+                    log::warn!("LSP error on {}: {}, skipping file", file, e);
+                    // Skip this file, continue with next (I7)
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Enrich a single file
+    async fn enrich_file(&mut self, file: &str) -> Result<FileEnrichmentResult, LspError> {
+        // ... implementation
+        Ok(FileEnrichmentResult {
+            file_path: file.to_string(),
+            inferred_type: None,
+            resolved_import_path: None,
+        })
+    }
+
+    /// Restart the LSP server after crash
+    async fn restart_server(&mut self) -> Result<(), LspError> {
+        if let Some(ref mut manager) = self.manager {
+            manager.shutdown().await.ok(); // Ignore shutdown errors
+        }
+        // Will lazy-restart on next request
+        Ok(())
+    }
+
+    pub fn restart_count(&self) -> usize {
+        self.restart_count
+    }
+}
+
+// Add to lifecycle.rs
+impl LspServerManager {
+    /// Ensure started with retry logic (I6: 3x with backoff)
+    pub async fn ensure_started_with_retry(
+        &mut self,
+        project_root: &Path,
+        max_retries: u32,
+    ) -> Result<&mut LspClient, LspError> {
+        let mut last_error = None;
+        let mut delay = Duration::from_millis(100);
+
+        for attempt in 1..=max_retries {
+            match self.ensure_started(project_root).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    log::warn!("LSP spawn attempt {} failed: {}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2; // Exponential backoff
+                    }
+                }
+            }
+        }
+
+        Err(LspError::SpawnFailed(format!(
+            "Failed to spawn LSP server after {} retries: {:?}",
+            max_retries,
+            last_error
+        )))
+    }
+}
+```
 
 **Commit:**
 ```bash
-git commit -m "feat(lsp): add retry logic and per-file error handling (I6, I7)"
+git commit -m "feat(lsp): add retry logic (I6) and per-file error handling (I7)"
 ```
 
 ---
@@ -1829,41 +2468,1445 @@ git commit -m "feat(lsp): add sync bridge for calling async LSP from sync code"
 
 ---
 
-## Milestones 5-8: Remaining Tasks (31-54)
+## Milestone 5: LSP Languages (Tasks 31-34)
 
-The remaining milestones follow the same TDD pattern:
+### Task 31: Implement Dart Enricher (L3)
 
-### Milestone 5: LSP Languages (Tasks 31-34)
-- Task 31: Implement Dart Enricher
-- Task 32: Implement Rust Enricher
-- Task 33: Add Multi-Instance LSP Pool (I5, I5a)
-- Task 34: Add LSP Configuration Validation
+**Files:**
+- Create: `crates/codegraph-lsp/src/dart.rs`
 
-### Milestone 6: Incremental Updates (Tasks 35-42)
-- Task 35: Add enrichment_deps Table Operations
-- Task 36: Populate enrichment_deps from LSP
-- Task 37: Implement Selective Scope (L4a)
-- Task 38: Add Edge Change Detection (I11)
-- Task 39: Add File Locking (I12)
-- Task 40: Implement Full Re-embed Triggers (I13)
-- Task 41: Add Cascade Depth Config (I3)
-- Task 42: Integrate with Sync Command
+**Step 1: Write the failing test**
 
-### Milestone 7: New Extraction (Tasks 43-48)
-- Task 43: Extract Code Snippets (E4)
-- Task 44: Extract Thrown Errors (E8)
-- Task 45: Implement Test Convention Detection (E6a)
-- Task 46: Add Test Association via Imports (E6)
-- Task 47: Extract Package Names (M1)
-- Task 48: Add Workspace Detection (M3)
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
 
-### Milestone 8: Quality & Polish (Tasks 49-54)
-- Task 49: Create Evaluation Test Cases
-- Task 50: Implement A/B Comparison (Q1)
-- Task 51: Add CLI Flags
-- Task 52: Add Git Activity Boost (B8)
-- Task 53: Final Integration Test
-- Task 54: Update Documentation
+    fn setup_dart_project() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("pubspec.yaml"), "name: test_app\n").unwrap();
+        fs::write(temp.path().join("lib/main.dart"), r#"
+void main() {
+  final greeting = getGreeting();
+  print(greeting);
+}
+
+String getGreeting() => 'Hello, World!';
+"#).unwrap();
+        temp
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires dart analysis server
+    async fn test_dart_enricher_hover() {
+        let temp = setup_dart_project();
+        let config = LspServerConfig {
+            enabled: true,
+            server: "dart".to_string(),
+            args: vec!["language-server".to_string(), "--protocol=lsp".to_string()],
+        };
+
+        let mut enricher = DartEnricher::new(config);
+        enricher.start(temp.path()).await.unwrap();
+
+        let hover = enricher.hover(
+            temp.path().join("lib/main.dart").to_str().unwrap(),
+            5, // line of getGreeting()
+            10,
+        ).await.unwrap();
+
+        assert!(hover.inferred_type.is_some());
+        assert!(hover.inferred_type.unwrap().contains("String"));
+
+        enricher.shutdown().await.unwrap();
+    }
+}
+```
+
+**Step 2-5:** Implement Dart LSP enricher following TypeScript pattern.
+
+```rust
+// crates/codegraph-lsp/src/dart.rs
+use crate::client::LspClient;
+use crate::enricher::{LspEnricher, HoverResult, DefinitionResult};
+use crate::error::LspError;
+use async_trait::async_trait;
+use codegraph_types::{Language, LspServerConfig};
+use std::path::Path;
+
+pub struct DartEnricher {
+    config: LspServerConfig,
+    client: Option<LspClient>,
+}
+
+impl DartEnricher {
+    pub fn new(config: LspServerConfig) -> Self {
+        Self { config, client: None }
+    }
+}
+
+#[async_trait]
+impl LspEnricher for DartEnricher {
+    fn language(&self) -> Language {
+        Language::Dart
+    }
+
+    async fn start(&mut self, project_root: &Path) -> Result<(), LspError> {
+        let root_uri = lsp_types::Url::from_file_path(project_root)
+            .map_err(|_| LspError::InvalidPath(project_root.display().to_string()))?;
+
+        self.client = Some(LspClient::spawn(
+            &self.config.server,
+            &self.config.args,
+            root_uri,
+        ).await?);
+
+        Ok(())
+    }
+
+    async fn hover(&mut self, file: &str, line: u32, col: u32) -> Result<HoverResult, LspError> {
+        let client = self.client.as_mut()
+            .ok_or(LspError::NotStarted)?;
+
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: lsp_types::Url::from_file_path(file)
+                        .map_err(|_| LspError::InvalidPath(file.to_string()))?,
+                },
+                position: lsp_types::Position { line, character: col },
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hover = client.hover(params).await?;
+        Ok(HoverResult::from_lsp(hover))
+    }
+
+    async fn definition(&mut self, file: &str, line: u32, col: u32) -> Result<Option<DefinitionResult>, LspError> {
+        // Similar to hover implementation
+        Ok(None)
+    }
+
+    async fn shutdown(&mut self) -> Result<(), LspError> {
+        if let Some(mut client) = self.client.take() {
+            client.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        self.client.is_some()
+    }
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(lsp): implement Dart LSP enricher (L3)"
+```
+
+---
+
+### Task 32: Implement Rust Enricher (L3)
+
+**Files:**
+- Create: `crates/codegraph-lsp/src/rust_analyzer.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+
+    fn setup_rust_project() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("Cargo.toml"), r#"
+[package]
+name = "test"
+version = "0.1.0"
+edition = "2021"
+"#).unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#).unwrap();
+        temp
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires rust-analyzer
+    async fn test_rust_enricher_hover() {
+        let temp = setup_rust_project();
+        let config = LspServerConfig {
+            enabled: true,
+            server: "rust-analyzer".to_string(),
+            args: vec![],
+        };
+
+        let mut enricher = RustEnricher::new(config);
+        enricher.start(temp.path()).await.unwrap();
+
+        // Wait for rust-analyzer to index
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let hover = enricher.hover(
+            temp.path().join("src/lib.rs").to_str().unwrap(),
+            1, // fn add line
+            7, // position of 'add'
+        ).await.unwrap();
+
+        assert!(hover.inferred_type.is_some());
+        assert!(hover.inferred_type.unwrap().contains("i32"));
+
+        enricher.shutdown().await.unwrap();
+    }
+}
+```
+
+**Step 2-5:** Implement Rust enricher following same pattern as Dart.
+
+**Commit:**
+```bash
+git commit -m "feat(lsp): implement Rust LSP enricher (L3)"
+```
+
+---
+
+### Task 33: Add Multi-Instance LSP Pool (I5, I5a, I4)
+
+**Files:**
+- Create: `crates/codegraph-lsp/src/pool.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pool_single_instance_default() {
+        let config = EnrichmentConfig {
+            lsp_instances: 1,
+            ..Default::default()
+        };
+
+        let pool = LspPool::new(config);
+        assert_eq!(pool.instance_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_multiple_instances() {
+        let config = EnrichmentConfig {
+            lsp_instances: 4,
+            ..Default::default()
+        };
+
+        let pool = LspPool::new(config);
+        assert_eq!(pool.instance_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_work_stealing_queue_distribution() {
+        let config = EnrichmentConfig {
+            lsp_instances: 2,
+            ..Default::default()
+        };
+
+        let mut pool = LspPool::new(config);
+
+        // Submit 10 files
+        let files: Vec<String> = (0..10).map(|i| format!("file{}.ts", i)).collect();
+        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+
+        pool.submit_batch(&file_refs).await;
+
+        // Work should be distributed across instances
+        let stats = pool.get_stats();
+        assert!(stats.instance_0_processed > 0);
+        assert!(stats.instance_1_processed > 0);
+    }
+
+    #[tokio::test]
+    async fn test_blocking_execution_waits_for_completion() {
+        // I4: Blocking execution - indexing waits for enrichment
+        let config = EnrichmentConfig::default();
+        let mut pool = LspPool::new(config);
+
+        let files = vec!["a.ts", "b.ts", "c.ts"];
+        let results = pool.enrich_all_blocking(&files).await.unwrap();
+
+        // All files should be enriched before returning
+        assert_eq!(results.len(), 3);
+    }
+}
+```
+
+**Step 2-5:** Implement LSP pool with work-stealing.
+
+```rust
+// crates/codegraph-lsp/src/pool.rs
+use crate::batch::LspEnricherBatch;
+use crate::error::LspError;
+use codegraph_types::EnrichmentConfig;
+use tokio::sync::mpsc;
+use std::sync::Arc;
+
+/// Multi-instance LSP pool with work-stealing (I5, I5a)
+pub struct LspPool {
+    config: EnrichmentConfig,
+    instances: Vec<LspEnricherBatch>,
+    work_queue: mpsc::Sender<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct PoolStats {
+    pub instance_0_processed: usize,
+    pub instance_1_processed: usize,
+}
+
+impl LspPool {
+    pub fn new(config: EnrichmentConfig) -> Self {
+        let count = config.lsp_instances as usize;
+        let instances = (0..count)
+            .map(|_| LspEnricherBatch::new(config.clone()))
+            .collect();
+
+        let (tx, _rx) = mpsc::channel(1000);
+
+        Self {
+            config,
+            instances,
+            work_queue: tx,
+        }
+    }
+
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Enrich all files, blocking until complete (I4)
+    pub async fn enrich_all_blocking(
+        &mut self,
+        files: &[&str],
+    ) -> Result<Vec<crate::batch::FileEnrichmentResult>, LspError> {
+        // Distribute work across instances using work-stealing
+        let chunk_size = (files.len() + self.instances.len() - 1) / self.instances.len();
+        let mut all_results = Vec::new();
+
+        for (i, chunk) in files.chunks(chunk_size).enumerate() {
+            if i < self.instances.len() {
+                let results = self.instances[i].enrich_files(chunk).await?;
+                all_results.extend(results);
+            }
+        }
+
+        Ok(all_results)
+    }
+
+    pub async fn submit_batch(&mut self, _files: &[&str]) {
+        // Work-stealing implementation
+    }
+
+    pub fn get_stats(&self) -> PoolStats {
+        PoolStats::default()
+    }
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(lsp): add multi-instance LSP pool with work-stealing (I4, I5, I5a)"
+```
+
+---
+
+### Task 34: Add LSP Configuration Validation
+
+**Files:**
+- Modify: `crates/codegraph-lsp/src/lib.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_validate_typescript_config() {
+    let config = LspConfig {
+        enabled: true,
+        typescript: Some(LspServerConfig {
+            enabled: true,
+            server: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+        }),
+        ..Default::default()
+    };
+
+    assert!(validate_lsp_config(&config).is_ok());
+}
+
+#[test]
+fn test_validate_empty_server_fails() {
+    let config = LspConfig {
+        enabled: true,
+        typescript: Some(LspServerConfig {
+            enabled: true,
+            server: "".to_string(), // Empty!
+            args: vec![],
+        }),
+        ..Default::default()
+    };
+
+    assert!(validate_lsp_config(&config).is_err());
+}
+```
+
+**Step 2-5:** Implement validation.
+
+**Commit:**
+```bash
+git commit -m "feat(lsp): add configuration validation"
+```
+
+---
+
+## Milestone 6: Incremental Updates (Tasks 35-42)
+
+### Task 35: Add enrichment_deps Table Operations (I2)
+
+**Files:**
+- Create: `crates/codegraph-db/src/enrichment_deps.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_insert_enrichment_dep() {
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    run_migrations(db.conn()).unwrap();
+
+    insert_enrichment_dep(db.conn(), "node_123", "src/utils.ts").unwrap();
+
+    let deps = get_deps_for_node(db.conn(), "node_123").unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0], "src/utils.ts");
+}
+
+#[test]
+fn test_get_affected_nodes_by_file() {
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    run_migrations(db.conn()).unwrap();
+
+    insert_enrichment_dep(db.conn(), "node_1", "src/types.ts").unwrap();
+    insert_enrichment_dep(db.conn(), "node_2", "src/types.ts").unwrap();
+    insert_enrichment_dep(db.conn(), "node_3", "src/other.ts").unwrap();
+
+    let affected = get_nodes_depending_on_file(db.conn(), "src/types.ts").unwrap();
+    assert_eq!(affected.len(), 2);
+    assert!(affected.contains(&"node_1".to_string()));
+    assert!(affected.contains(&"node_2".to_string()));
+}
+
+#[test]
+fn test_clear_deps_for_node() {
+    let db = DatabaseConnection::open_in_memory().unwrap();
+    run_migrations(db.conn()).unwrap();
+
+    insert_enrichment_dep(db.conn(), "node_1", "a.ts").unwrap();
+    insert_enrichment_dep(db.conn(), "node_1", "b.ts").unwrap();
+
+    clear_deps_for_node(db.conn(), "node_1").unwrap();
+
+    let deps = get_deps_for_node(db.conn(), "node_1").unwrap();
+    assert!(deps.is_empty());
+}
+```
+
+**Step 2-5:** Implement enrichment_deps operations.
+
+```rust
+// crates/codegraph-db/src/enrichment_deps.rs
+use rusqlite::{Connection, params};
+use crate::error::DbError;
+
+pub fn insert_enrichment_dep(conn: &Connection, node_id: &str, depends_on_file: &str) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO enrichment_deps (node_id, depends_on_file) VALUES (?1, ?2)",
+        params![node_id, depends_on_file],
+    )?;
+    Ok(())
+}
+
+pub fn get_deps_for_node(conn: &Connection, node_id: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT depends_on_file FROM enrichment_deps WHERE node_id = ?1")?;
+    let deps = stmt.query_map(params![node_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(deps)
+}
+
+pub fn get_nodes_depending_on_file(conn: &Connection, file_path: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT node_id FROM enrichment_deps WHERE depends_on_file = ?1")?;
+    let nodes = stmt.query_map(params![file_path], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(nodes)
+}
+
+pub fn clear_deps_for_node(conn: &Connection, node_id: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM enrichment_deps WHERE node_id = ?1", params![node_id])?;
+    Ok(())
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(db): add enrichment_deps table operations (I2)"
+```
+
+---
+
+### Task 36: Populate enrichment_deps from LSP
+
+**Files:**
+- Modify: `crates/codegraph-lsp/src/batch.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_lsp_definition_populates_deps() {
+    // When LSP resolves an import to another file,
+    // we record that dependency
+    let mut enricher = MockEnricher::new();
+    enricher.set_definition_response("src/api.ts", "src/types.ts");
+
+    let result = enricher.enrich_node_sync(
+        "node_123",
+        "src/api.ts",
+        10, 5, // import position
+    ).unwrap();
+
+    assert_eq!(result.resolved_import_path, Some("src/types.ts".to_string()));
+    assert!(result.deps_to_record.contains(&"src/types.ts".to_string()));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(lsp): populate enrichment_deps from LSP definition responses"
+```
+
+---
+
+### Task 37: Implement Selective Scope (L4a)
+
+**Files:**
+- Create: `crates/codegraph-sync/src/selective.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_selective_scope_includes_changed_files() {
+    let changed_files = vec!["src/api.ts", "src/utils.ts"];
+    let scope = SelectiveScope::from_changed_files(&changed_files);
+
+    assert!(scope.should_enrich("src/api.ts"));
+    assert!(scope.should_enrich("src/utils.ts"));
+    assert!(!scope.should_enrich("src/other.ts"));
+}
+
+#[test]
+fn test_selective_scope_includes_dependents() {
+    let db = setup_test_db_with_deps();
+    // node_1 depends on types.ts
+    // node_2 depends on types.ts
+
+    let changed_files = vec!["src/types.ts"];
+    let scope = SelectiveScope::from_changed_files_with_deps(&db, &changed_files);
+
+    // Should include nodes that depend on changed files
+    assert!(scope.should_enrich_node("node_1"));
+    assert!(scope.should_enrich_node("node_2"));
+}
+
+#[test]
+fn test_selective_scope_includes_new_imports() {
+    // L4a: selective scope includes new/changed imports
+    let old_imports = vec!["./utils"];
+    let new_imports = vec!["./utils", "./newModule"];
+
+    let scope = SelectiveScope::from_import_diff(&old_imports, &new_imports);
+
+    // Nodes with new imports should be re-enriched
+    assert!(scope.has_new_imports());
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(sync): implement selective enrichment scope (L4a)"
+```
+
+---
+
+### Task 38: Add Edge Change Detection (I11)
+
+**Files:**
+- Create: `crates/codegraph-sync/src/edge_diff.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_edge_snapshot_and_diff() {
+    let db = setup_test_db();
+
+    // Take snapshot before extraction
+    let before = EdgeSnapshot::capture(&db);
+
+    // Simulate extraction adding new edges
+    add_edge(&db, "node_a", "node_b", EdgeKind::Calls);
+
+    // Take snapshot after
+    let after = EdgeSnapshot::capture(&db);
+
+    // Diff should show affected nodes
+    let diff = EdgeDiff::compute(&before, &after);
+
+    assert!(diff.affected_nodes.contains(&"node_a".to_string()));
+    assert!(diff.affected_nodes.contains(&"node_b".to_string()));
+}
+
+#[test]
+fn test_edge_removal_detected() {
+    let db = setup_test_db();
+    add_edge(&db, "node_a", "node_b", EdgeKind::Calls);
+
+    let before = EdgeSnapshot::capture(&db);
+
+    remove_edge(&db, "node_a", "node_b");
+
+    let after = EdgeSnapshot::capture(&db);
+    let diff = EdgeDiff::compute(&before, &after);
+
+    // Removed edge should mark both nodes as affected
+    assert!(diff.affected_nodes.contains(&"node_a".to_string()));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(sync): add edge change detection via snapshot/diff (I11)"
+```
+
+---
+
+### Task 39: Add File Locking (I12)
+
+**Files:**
+- Create: `crates/codegraph-sync/src/lock.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_acquire_index_lock() {
+    let temp = TempDir::new().unwrap();
+    let codegraph_dir = temp.path().join(".codegraph");
+    fs::create_dir_all(&codegraph_dir).unwrap();
+
+    let lock = IndexLock::acquire(&codegraph_dir).unwrap();
+    assert!(lock.is_held());
+
+    // Lock file should exist
+    assert!(codegraph_dir.join("index.lock").exists());
+}
+
+#[test]
+fn test_lock_prevents_concurrent_access() {
+    let temp = TempDir::new().unwrap();
+    let codegraph_dir = temp.path().join(".codegraph");
+    fs::create_dir_all(&codegraph_dir).unwrap();
+
+    let lock1 = IndexLock::acquire(&codegraph_dir).unwrap();
+
+    // Second acquire should fail
+    let lock2 = IndexLock::try_acquire(&codegraph_dir);
+    assert!(lock2.is_err());
+
+    drop(lock1);
+
+    // Now it should succeed
+    let lock3 = IndexLock::acquire(&codegraph_dir).unwrap();
+    assert!(lock3.is_held());
+}
+
+#[test]
+fn test_stale_lock_detected_by_mtime() {
+    let temp = TempDir::new().unwrap();
+    let codegraph_dir = temp.path().join(".codegraph");
+    fs::create_dir_all(&codegraph_dir).unwrap();
+
+    // Create stale lock file (old mtime)
+    let lock_path = codegraph_dir.join("index.lock");
+    fs::write(&lock_path, "stale").unwrap();
+
+    // Set mtime to 10 minutes ago
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    filetime::set_file_mtime(&lock_path, filetime::FileTime::from_system_time(old_time)).unwrap();
+
+    // Should be able to acquire (stale lock broken)
+    let lock = IndexLock::acquire(&codegraph_dir).unwrap();
+    assert!(lock.is_held());
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(sync): add file locking with stale detection (I12)"
+```
+
+---
+
+### Task 40: Implement Full Re-embed Triggers (I13)
+
+**Files:**
+- Modify: `crates/codegraph-core/src/embedding.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_schema_migration_triggers_reembed() {
+    let db = setup_test_db();
+    set_metadata(&db, "schema_version", "1");
+
+    // Migrate schema
+    run_migrations(db.conn()).unwrap(); // Now v2
+
+    assert!(should_full_reembed(&db));
+}
+
+#[test]
+fn test_config_change_triggers_reembed() {
+    let db = setup_test_db();
+    let old_config = EmbeddingTextConfig { max_tokens: 2000, ..Default::default() };
+    save_config_hash(&db, &old_config);
+
+    let new_config = EmbeddingTextConfig { max_tokens: 3000, ..Default::default() };
+
+    assert!(config_changed(&db, &new_config));
+    assert!(should_full_reembed(&db));
+}
+
+#[test]
+fn test_force_flag_triggers_reembed() {
+    let options = IndexOptions { force_reembed: true, ..Default::default() };
+    assert!(should_full_reembed_with_options(&options));
+}
+
+#[test]
+fn test_model_change_triggers_reembed() {
+    let db = setup_test_db();
+    set_metadata(&db, "embedding_model_hash", "abc123");
+
+    // Model changed
+    let new_model_hash = "def456";
+    assert!(model_changed(&db, new_model_hash));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(core): implement full re-embed triggers (I13)"
+```
+
+---
+
+### Task 41: Add Cascade Depth Config (I3)
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_cascade_depth_default_one() {
+    let config = EnrichmentConfig::default();
+    assert_eq!(config.cascade_depth, 1);
+}
+
+#[test]
+fn test_cascade_finds_direct_dependents_only() {
+    let db = setup_test_db_with_deps();
+    // a.ts -> b.ts -> c.ts (chain)
+
+    let config = EnrichmentConfig { cascade_depth: 1, ..Default::default() };
+    let affected = find_affected_nodes(&db, &["a.ts"], &config);
+
+    // Should only find direct dependents of a.ts
+    assert!(affected.contains(&"b.ts"));
+    assert!(!affected.contains(&"c.ts")); // Not at depth 1
+}
+
+#[test]
+fn test_cascade_depth_two_finds_transitive() {
+    let db = setup_test_db_with_deps();
+
+    let config = EnrichmentConfig { cascade_depth: 2, ..Default::default() };
+    let affected = find_affected_nodes(&db, &["a.ts"], &config);
+
+    // Depth 2 should find transitive
+    assert!(affected.contains(&"b.ts"));
+    assert!(affected.contains(&"c.ts"));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(sync): add configurable cascade depth (I3)"
+```
+
+---
+
+### Task 42: Integrate with Sync Command
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_sync_uses_selective_scope_by_default() {
+    let project = setup_test_project();
+    index_project(&project).unwrap();
+
+    // Modify one file
+    modify_file(&project, "src/api.ts");
+
+    // Sync should only re-enrich affected nodes
+    let stats = sync_project(&project).unwrap();
+
+    assert!(stats.nodes_enriched < stats.total_nodes);
+    assert!(stats.nodes_enriched > 0);
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(sync): integrate incremental enrichment with sync command"
+```
+
+---
+
+## Milestone 7: New Extraction (Tasks 43-48)
+
+### Task 43: Extract Code Snippets (E4)
+
+**Files:**
+- Modify: `crates/codegraph-extraction/src/extractor.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_extract_code_snippet_under_limit() {
+    let source = r#"
+function add(a: number, b: number): number {
+    return a + b;
+}
+"#;
+
+    let node = extract_function(source, "add");
+    let snippet = extract_code_snippet(source, &node, 50); // 50 line limit
+
+    assert!(snippet.is_some());
+    assert!(snippet.unwrap().contains("return a + b"));
+}
+
+#[test]
+fn test_extract_code_snippet_truncates_long_functions() {
+    let source = generate_long_function(100); // 100 lines
+
+    let node = extract_function(&source, "longFunc");
+    let snippet = extract_code_snippet(&source, &node, 50);
+
+    assert!(snippet.is_some());
+    let snippet = snippet.unwrap();
+    let line_count = snippet.lines().count();
+    assert!(line_count <= 50);
+    assert!(snippet.ends_with("// ... truncated"));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): extract code snippets with configurable limit (E4)"
+```
+
+---
+
+### Task 44: Extract Thrown Errors (E8)
+
+**Files:**
+- Modify: `crates/codegraph-extraction/src/extractor.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_extract_thrown_errors_typescript() {
+    let source = r#"
+function validate(input: string): void {
+    if (!input) {
+        throw new ValidationError("Input required");
+    }
+    if (input.length > 100) {
+        throw new LengthError("Too long");
+    }
+}
+"#;
+
+    let node = extract_function(source, "validate");
+    let errors = extract_thrown_errors(source, &node, Language::TypeScript);
+
+    assert_eq!(errors.len(), 2);
+    assert!(errors.contains(&"ValidationError".to_string()));
+    assert!(errors.contains(&"LengthError".to_string()));
+}
+
+#[test]
+fn test_extract_thrown_errors_rust() {
+    let source = r#"
+fn validate(input: &str) -> Result<(), AppError> {
+    if input.is_empty() {
+        return Err(AppError::ValidationError("Input required".into()));
+    }
+    Ok(())
+}
+"#;
+
+    let node = extract_function(source, "validate");
+    let errors = extract_thrown_errors(source, &node, Language::Rust);
+
+    // Rust uses Result types, extract from Err() calls
+    assert!(errors.contains(&"AppError::ValidationError".to_string()));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): extract thrown error types (E8)"
+```
+
+---
+
+### Task 45: Implement Test Convention Detection (E6a)
+
+**Files:**
+- Create: `crates/codegraph-extraction/src/test_detection.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_detect_test_file_typescript() {
+    assert!(is_test_file("src/utils.test.ts", Language::TypeScript));
+    assert!(is_test_file("src/utils.spec.ts", Language::TypeScript));
+    assert!(is_test_file("__tests__/utils.ts", Language::TypeScript));
+    assert!(!is_test_file("src/utils.ts", Language::TypeScript));
+}
+
+#[test]
+fn test_detect_test_file_rust() {
+    assert!(is_test_file("src/utils_test.rs", Language::Rust));
+    assert!(is_test_file("tests/integration.rs", Language::Rust));
+    assert!(!is_test_file("src/utils.rs", Language::Rust));
+}
+
+#[test]
+fn test_detect_test_file_python() {
+    assert!(is_test_file("test_utils.py", Language::Python));
+    assert!(is_test_file("tests/test_api.py", Language::Python));
+    assert!(!is_test_file("utils.py", Language::Python));
+}
+
+#[test]
+fn test_find_test_functions_for_symbol() {
+    let test_source = r#"
+describe('UserService', () => {
+    it('should create user', () => {});
+    it('should delete user', () => {});
+});
+"#;
+
+    let tests = find_test_names_for_symbol(test_source, "UserService", Language::TypeScript);
+    assert_eq!(tests.len(), 2);
+    assert!(tests.contains(&"should create user".to_string()));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): implement test file convention detection (E6a)"
+```
+
+---
+
+### Task 46: Add Test Association via Imports (E6)
+
+**Files:**
+- Modify: `crates/codegraph-extraction/src/test_detection.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_associate_via_import() {
+    let test_source = r#"
+import { UserService } from '../services/user';
+
+describe('UserService', () => {
+    it('should work', () => {});
+});
+"#;
+
+    let imports = extract_imports(test_source, Language::TypeScript);
+    let associations = associate_tests_via_imports(&imports, "services/user.ts");
+
+    assert!(associations.contains(&"should work".to_string()));
+}
+
+#[test]
+fn test_hybrid_association_prefers_convention() {
+    // E6: Convention first, imports as fallback
+    let symbol_name = "UserService";
+    let test_file = "user.test.ts";
+
+    // Convention matches - use convention
+    let result = find_tests_for_symbol(symbol_name, test_file, Language::TypeScript);
+    assert!(result.method == AssociationMethod::Convention);
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): add test association via imports (E6)"
+```
+
+---
+
+### Task 47: Extract Package Names (M1)
+
+**Files:**
+- Create: `crates/codegraph-extraction/src/package.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_extract_package_from_package_json() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("package.json"), r#"{"name": "@myorg/utils"}"#).unwrap();
+
+    let package = extract_package_name(temp.path(), "src/index.ts").unwrap();
+    assert_eq!(package, "@myorg/utils");
+}
+
+#[test]
+fn test_extract_package_from_cargo_toml() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("Cargo.toml"), r#"
+[package]
+name = "my-crate"
+"#).unwrap();
+
+    let package = extract_package_name(temp.path(), "src/lib.rs").unwrap();
+    assert_eq!(package, "my-crate");
+}
+
+#[test]
+fn test_extract_package_from_pubspec_yaml() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("pubspec.yaml"), "name: my_app\n").unwrap();
+
+    let package = extract_package_name(temp.path(), "lib/main.dart").unwrap();
+    assert_eq!(package, "my_app");
+}
+
+#[test]
+fn test_fallback_to_directory_name() {
+    // M2: No manifest - use directory path
+    let temp = TempDir::new().unwrap();
+    // No package.json, Cargo.toml, etc.
+
+    let package = extract_package_name(temp.path(), "src/index.ts");
+    // Should use directory name as fallback
+    assert!(package.is_some());
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): extract package names from manifests (M1, M2)"
+```
+
+---
+
+### Task 48: Add Workspace Detection (M3)
+
+**Files:**
+- Modify: `crates/codegraph-extraction/src/package.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_monorepo_preserves_package_name() {
+    let temp = TempDir::new().unwrap();
+
+    // Root workspace
+    fs::write(temp.path().join("package.json"), r#"
+{
+    "name": "monorepo-root",
+    "workspaces": ["packages/*"]
+}
+"#).unwrap();
+
+    // Sub-package
+    fs::create_dir_all(temp.path().join("packages/utils")).unwrap();
+    fs::write(temp.path().join("packages/utils/package.json"), r#"
+{
+    "name": "@myorg/utils"
+}
+"#).unwrap();
+
+    let package = extract_package_name(
+        temp.path(),
+        "packages/utils/src/index.ts"
+    ).unwrap();
+
+    // M3: Should preserve sub-package name, not root
+    assert_eq!(package, "@myorg/utils");
+}
+
+#[test]
+fn test_cargo_workspace_detection() {
+    let temp = TempDir::new().unwrap();
+
+    // Root workspace
+    fs::write(temp.path().join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/*"]
+"#).unwrap();
+
+    // Sub-crate
+    fs::create_dir_all(temp.path().join("crates/utils")).unwrap();
+    fs::write(temp.path().join("crates/utils/Cargo.toml"), r#"
+[package]
+name = "my-utils"
+"#).unwrap();
+
+    let package = extract_package_name(
+        temp.path(),
+        "crates/utils/src/lib.rs"
+    ).unwrap();
+
+    assert_eq!(package, "my-utils");
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(extraction): add workspace/monorepo detection (M3)"
+```
+
+---
+
+## Milestone 8: Quality & Polish (Tasks 49-54)
+
+### Task 49: Create Evaluation Test Cases (Q1)
+
+**Files:**
+- Create: `crates/codegraph-core/src/eval.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_golden_query_format() {
+    let query = GoldenQuery {
+        query: "payment processing function".to_string(),
+        expected_top_results: vec![
+            "src/payment.ts::processPayment".to_string(),
+            "src/payment.ts::chargeCard".to_string(),
+        ],
+        tags: vec!["payment".to_string()],
+    };
+
+    assert!(query.is_valid());
+}
+
+#[test]
+fn test_evaluate_single_query() {
+    let db = setup_indexed_test_project();
+    let query = GoldenQuery {
+        query: "user authentication".to_string(),
+        expected_top_results: vec!["src/auth.ts::authenticate".to_string()],
+        tags: vec![],
+    };
+
+    let result = evaluate_query(&db, &query, 10).unwrap();
+
+    assert!(result.recall_at_10 >= 0.0);
+    assert!(result.recall_at_10 <= 1.0);
+    assert!(result.mrr >= 0.0);
+}
+
+#[test]
+fn test_evaluate_query_set() {
+    let db = setup_indexed_test_project();
+    let queries = load_golden_queries("test_fixtures/golden_queries.json").unwrap();
+
+    let results = evaluate_query_set(&db, &queries).unwrap();
+
+    assert!(results.avg_recall_at_10 >= 0.0);
+    assert!(results.avg_mrr >= 0.0);
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(eval): create evaluation test cases with golden queries (Q1)"
+```
+
+---
+
+### Task 50: Implement A/B Comparison (Q1)
+
+**Files:**
+- Modify: `crates/codegraph-core/src/eval.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_ab_comparison() {
+    let baseline = EvalResults {
+        avg_recall_at_10: 0.7,
+        avg_mrr: 0.5,
+        query_count: 100,
+    };
+
+    let current = EvalResults {
+        avg_recall_at_10: 0.75,
+        avg_mrr: 0.55,
+        query_count: 100,
+    };
+
+    let comparison = ABComparison::compare(&baseline, &current);
+
+    assert!(comparison.recall_delta > 0.0);
+    assert!(comparison.mrr_delta > 0.0);
+    assert!(comparison.is_improvement());
+}
+
+#[test]
+fn test_ab_detects_regression() {
+    let baseline = EvalResults {
+        avg_recall_at_10: 0.8,
+        avg_mrr: 0.6,
+        query_count: 100,
+    };
+
+    let current = EvalResults {
+        avg_recall_at_10: 0.7, // Worse!
+        avg_mrr: 0.5,
+        query_count: 100,
+    };
+
+    let comparison = ABComparison::compare(&baseline, &current);
+
+    assert!(comparison.recall_delta < 0.0);
+    assert!(comparison.is_regression());
+}
+
+#[test]
+fn test_save_and_load_baseline() {
+    let temp = TempDir::new().unwrap();
+    let results = EvalResults {
+        avg_recall_at_10: 0.75,
+        avg_mrr: 0.55,
+        query_count: 50,
+    };
+
+    save_baseline(&temp.path().join("baseline.json"), &results).unwrap();
+    let loaded = load_baseline(&temp.path().join("baseline.json")).unwrap();
+
+    assert_eq!(loaded.avg_recall_at_10, results.avg_recall_at_10);
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(eval): implement A/B comparison for quality measurement (Q1)"
+```
+
+---
+
+### Task 51: Add CLI Flags
+
+**Files:**
+- Modify: `crates/codegraph-cli/src/main.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_cli_force_reembed_flag() {
+    let args = Args::parse_from(&["codegraph", "index", "--force-reembed", "."]);
+    assert!(args.force_reembed);
+}
+
+#[test]
+fn test_cli_eval_save_baseline() {
+    let args = Args::parse_from(&["codegraph", "eval", "--save-baseline", "."]);
+    assert!(args.save_baseline);
+}
+
+#[test]
+fn test_cli_eval_compare() {
+    let args = Args::parse_from(&["codegraph", "eval", "--compare", "baseline.json", "."]);
+    assert_eq!(args.compare, Some("baseline.json".to_string()));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(cli): add --force-reembed and eval flags"
+```
+
+---
+
+### Task 52: Add Git Activity Boost (B8)
+
+**Files:**
+- Create: `crates/codegraph-vectors/src/git_boost.rs`
+
+**Step 1: Write the failing test**
+
+```rust
+#[test]
+fn test_git_activity_boost_prioritizes_recent() {
+    let files = vec![
+        FileActivity { path: "old.ts", last_modified: days_ago(30), churn: 10 },
+        FileActivity { path: "recent.ts", last_modified: days_ago(1), churn: 5 },
+    ];
+
+    let sorted = sort_by_activity(&files);
+
+    // Recent file should come first despite lower churn
+    assert_eq!(sorted[0].path, "recent.ts");
+}
+
+#[test]
+fn test_truncation_prefers_active_content() {
+    let config = EmbeddingTextConfig {
+        max_tokens: 100,
+        git_activity_boost: true,
+        ..Default::default()
+    };
+
+    let context = GraphContext {
+        callees: vec!["activeFunc".to_string(), "staleFunc".to_string()],
+        ..Default::default()
+    };
+
+    let activity = HashMap::from([
+        ("activeFunc", days_ago(1)),
+        ("staleFunc", days_ago(100)),
+    ]);
+
+    let text = build_text_with_activity(&config, &context, &activity);
+
+    // When truncating, should keep activeFunc
+    assert!(text.contains("activeFunc"));
+}
+```
+
+**Commit:**
+```bash
+git commit -m "feat(vectors): add optional git activity boost for truncation (B8)"
+```
+
+---
+
+### Task 53: Final Integration Test
+
+**Files:**
+- Create: `tests/integration/enrichment_e2e.rs`
+
+**Step 1: Write the test**
+
+```rust
+#[test]
+#[ignore] // Requires full setup
+fn test_full_enrichment_pipeline() {
+    let temp = setup_full_test_project();
+
+    // Index with enrichment
+    let result = index_project_with_enrichment(&temp, EnrichmentConfig::default());
+    assert!(result.is_ok());
+
+    // Verify embeddings include enriched content
+    let node = get_node(&temp, "src/api.ts::handleRequest");
+    assert!(node.inferred_type.is_some());
+    assert!(!node.thrown_errors.is_empty());
+
+    // Verify search quality improved
+    let results = search(&temp, "error handling in API");
+    assert!(results[0].qualified_name.contains("handleRequest"));
+}
+
+#[test]
+#[ignore]
+fn test_incremental_enrichment_after_change() {
+    let temp = setup_full_test_project();
+    index_project_with_enrichment(&temp, EnrichmentConfig::default()).unwrap();
+
+    let stats_before = get_stats(&temp);
+
+    // Modify one file
+    modify_file(&temp, "src/utils.ts");
+
+    // Sync should only re-enrich affected nodes
+    let sync_result = sync_project(&temp).unwrap();
+    assert!(sync_result.nodes_enriched < stats_before.total_nodes);
+}
+```
+
+**Commit:**
+```bash
+git commit -m "test: add end-to-end enrichment integration tests"
+```
+
+---
+
+### Task 54: Update Documentation
+
+**Files:**
+- Modify: `README.md`
+- Modify: `CLAUDE.md`
+
+**Step 1:** Add enrichment documentation.
+
+**Commit:**
+```bash
+git commit -m "docs: add embedding enrichment documentation"
+```
 
 ---
 
