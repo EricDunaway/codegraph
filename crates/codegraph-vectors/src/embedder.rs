@@ -563,4 +563,63 @@ mod tests {
             assert_eq!(e.len(), 384);
         }
     }
+
+    #[test]
+    #[cfg(not(feature = "onnx"))]
+    fn test_integration_text_builder_with_embedder() {
+        use crate::text_builder::{EmbeddingTextBuilder, GraphContext, NodeEnrichment};
+        use codegraph_types::{EmbeddingTextConfig, Language, Node, NodeKind};
+
+        // Build text using text_builder
+        let text_config = EmbeddingTextConfig::default();
+        let text_builder = EmbeddingTextBuilder::new(text_config);
+
+        let mut node = Node::new(
+            "test-fn",
+            NodeKind::Function,
+            "processPayment",
+            "PaymentService.processPayment",
+            "src/payment.ts",
+            Language::TypeScript,
+            10,
+            25,
+        );
+        node.decorators = vec!["@Controller".to_string()];
+        node.signature = Some("async processPayment(order: Order): Promise<Receipt>".to_string());
+
+        let context = GraphContext {
+            callees: vec!["validateOrder".to_string(), "chargeCard".to_string()],
+            callers: vec!["handleCheckout".to_string()],
+            ..Default::default()
+        };
+
+        let enrichment = NodeEnrichment {
+            inferred_type: Some("Promise<Receipt>".to_string()),
+            package_name: Some("@myapp/payments".to_string()),
+            ..Default::default()
+        };
+
+        let text = text_builder.build_text(&node, &context, &enrichment);
+
+        // Verify text has expected content
+        assert!(text.contains("@Controller"));
+        assert!(text.contains("processPayment"));
+        assert!(text.contains("calls: validateOrder"));
+
+        // Embed the text
+        let embedder_config = EmbedderConfig {
+            dimension: 768, // nomic-embed dimension
+            ..Default::default()
+        };
+        let mut embedder = TextEmbedder::new(embedder_config);
+
+        let embedding = embedder.embed(&text).unwrap();
+
+        // Should have correct dimension
+        assert_eq!(embedding.len(), 768);
+
+        // Should be unit normalized
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 0.001);
+    }
 }

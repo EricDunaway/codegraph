@@ -121,8 +121,17 @@ impl EmbeddingTextBuilder {
             parts.push(format!("type: {}", typ));
         }
 
-        // Package name
+        // Resolved import path (for import nodes)
+        if matches!(node.kind, NodeKind::Import) {
+            if let Some(ref path) = enrichment.resolved_import_path {
+                parts.push(format!("resolves to: {}", path));
+            }
+        }
+
+        // Package name (from enrichment or derived from directory)
         if let Some(ref pkg) = enrichment.package_name {
+            parts.push(format!("package: {}", pkg));
+        } else if let Some(pkg) = Self::derive_package_from_path(&node.file_path) {
             parts.push(format!("package: {}", pkg));
         }
 
@@ -240,6 +249,15 @@ impl EmbeddingTextBuilder {
             modified_node.name,
             modified_node.file_path
         )
+    }
+
+    /// Derive a package name from the file path (M2: directory fallback)
+    ///
+    /// Takes the parent directory of the file as the package name.
+    /// E.g., "src/services/payment/handler.ts" -> "src/services/payment"
+    fn derive_package_from_path(file_path: &str) -> Option<String> {
+        let path = std::path::Path::new(file_path);
+        path.parent().map(|p| p.to_string_lossy().to_string())
     }
 }
 
@@ -529,5 +547,87 @@ mod tests {
         let code_section = text.split("code:\n").nth(1).unwrap_or("");
         let line_count = code_section.lines().count();
         assert!(line_count <= 3, "Should limit snippet to 3 lines, got {}", line_count);
+    }
+
+    #[test]
+    fn test_import_resolved_path() {
+        let config = EmbeddingTextConfig::default();
+        let builder = EmbeddingTextBuilder::new(config);
+
+        let mut node = make_test_node();
+        node.kind = NodeKind::Import;
+        node.name = "PaymentService".to_string();
+        node.decorators = vec![];
+
+        let enrichment = NodeEnrichment {
+            resolved_import_path: Some("src/services/payment.ts".to_string()),
+            ..Default::default()
+        };
+
+        let text = builder.build_text(&node, &GraphContext::default(), &enrichment);
+
+        assert!(text.contains("resolves to: src/services/payment.ts"));
+    }
+
+    #[test]
+    fn test_package_name_fallback_to_directory() {
+        let config = EmbeddingTextConfig::default();
+        let builder = EmbeddingTextBuilder::new(config);
+
+        let mut node = make_test_node();
+        node.file_path = "src/services/payment/handler.ts".to_string();
+        node.decorators = vec![];
+
+        // No package_name in enrichment - should derive from path
+        let enrichment = NodeEnrichment::default();
+
+        let text = builder.build_text(&node, &GraphContext::default(), &enrichment);
+
+        assert!(text.contains("package: src/services/payment"));
+    }
+
+    #[test]
+    fn test_package_name_from_enrichment_takes_precedence() {
+        let config = EmbeddingTextConfig::default();
+        let builder = EmbeddingTextBuilder::new(config);
+
+        let mut node = make_test_node();
+        node.file_path = "src/services/payment/handler.ts".to_string();
+        node.decorators = vec![];
+
+        let enrichment = NodeEnrichment {
+            package_name: Some("@myapp/payments".to_string()),
+            ..Default::default()
+        };
+
+        let text = builder.build_text(&node, &GraphContext::default(), &enrichment);
+
+        // Should use enrichment value, not derived
+        // Count package lines - should only have one with the enrichment value
+        let package_lines: Vec<_> = text.lines().filter(|l| l.starts_with("package:")).collect();
+        assert_eq!(package_lines.len(), 1, "Should have exactly one package line");
+        assert!(
+            package_lines[0].contains("@myapp/payments"),
+            "Package line should use enrichment value: {}",
+            package_lines[0]
+        );
+        // Derived value should NOT appear as a separate package line
+        assert!(
+            !package_lines[0].contains("src/services/payment"),
+            "Should not use derived package: {}",
+            package_lines[0]
+        );
+    }
+
+    #[test]
+    fn test_derive_package_from_path() {
+        assert_eq!(
+            EmbeddingTextBuilder::derive_package_from_path("src/services/payment/handler.ts"),
+            Some("src/services/payment".to_string())
+        );
+        assert_eq!(
+            EmbeddingTextBuilder::derive_package_from_path("main.ts"),
+            Some("".to_string())
+        );
     }
 }

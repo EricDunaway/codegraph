@@ -4,6 +4,7 @@
 //! This crate contains shared types used across all CodeGraph crates.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 // =============================================================================
@@ -1231,6 +1232,29 @@ impl Default for EmbeddingTextConfig {
     }
 }
 
+impl EmbeddingTextConfig {
+    /// Compute a version hash for this configuration (I13)
+    ///
+    /// Used to detect when embeddings need to be regenerated due to config changes.
+    /// The hash is deterministic and includes all config fields that affect embedding text.
+    pub fn version_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // Hash all fields that affect embedding generation
+        hasher.update(b"v1:"); // Version prefix for future-proofing
+        hasher.update(self.max_tokens.to_le_bytes());
+        hasher.update(self.max_callees.to_le_bytes());
+        hasher.update(self.max_callers.to_le_bytes());
+        hasher.update(self.max_siblings.to_le_bytes());
+        hasher.update(self.max_snippet_lines.to_le_bytes());
+        hasher.update([self.git_activity_boost as u8]);
+
+        let result = hasher.finalize();
+        // Return first 16 hex chars (64 bits) for a reasonably short but unique hash
+        format!("{:x}", result)[..16].to_string()
+    }
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -1779,5 +1803,49 @@ mod tests {
 
         assert_eq!(parsed.lsp_scope, LspScope::Comprehensive);
         assert_eq!(parsed.cascade_depth, 2);
+    }
+
+    #[test]
+    fn test_embedding_config_version_hash() {
+        let config1 = EmbeddingTextConfig::default();
+        let config2 = EmbeddingTextConfig {
+            max_tokens: 3000,
+            ..Default::default()
+        };
+
+        let hash1 = config1.version_hash();
+        let hash2 = config2.version_hash();
+
+        // Different configs should have different hashes
+        assert_ne!(hash1, hash2, "Different configs should have different hashes");
+
+        // Same config should have same hash
+        let hash1_again = config1.version_hash();
+        assert_eq!(hash1, hash1_again, "Same config should have same hash");
+
+        // Hash should be 16 hex chars
+        assert_eq!(hash1.len(), 16, "Hash should be 16 hex chars");
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()), "Hash should be hex");
+    }
+
+    #[test]
+    fn test_embedding_config_version_hash_all_fields() {
+        let default_config = EmbeddingTextConfig::default();
+        let default_hash = default_config.version_hash();
+
+        // Each field change should produce a different hash
+        let configs = vec![
+            EmbeddingTextConfig { max_tokens: 1000, ..Default::default() },
+            EmbeddingTextConfig { max_callees: 5, ..Default::default() },
+            EmbeddingTextConfig { max_callers: 10, ..Default::default() },
+            EmbeddingTextConfig { max_siblings: 4, ..Default::default() },
+            EmbeddingTextConfig { max_snippet_lines: 25, ..Default::default() },
+            EmbeddingTextConfig { git_activity_boost: true, ..Default::default() },
+        ];
+
+        for (i, config) in configs.iter().enumerate() {
+            let hash = config.version_hash();
+            assert_ne!(hash, default_hash, "Config {} should have different hash", i);
+        }
     }
 }
