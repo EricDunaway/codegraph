@@ -64,4 +64,8 @@ pub enum CodeGraphError {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Embedding error
+    #[error("Embedding error: {0}")]
+    Embedding(String),
 }

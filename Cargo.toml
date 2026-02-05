@@ -9,6 +9,7 @@ members = [
     "crates/codegraph-vectors",
     "crates/codegraph-context",
     "crates/codegraph-sync",
+    "crates/codegraph-lsp",
     "crates/codegraph-mcp",
     "crates/codegraph-core",
     "crates/codegraph-cli",
