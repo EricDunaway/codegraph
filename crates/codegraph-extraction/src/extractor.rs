@@ -77,7 +77,15 @@ impl ExtractorRegistry {
             Language::CSharp,
             #[cfg(feature = "lang-ruby")]
             Language::Ruby,
-            // Note: Swift, Kotlin, Dart disabled due to tree-sitter version conflicts
+            #[cfg(feature = "lang-dart")]
+            Language::Dart,
+            #[cfg(feature = "lang-swift")]
+            Language::Swift,
+            #[cfg(feature = "lang-graphql")]
+            Language::GraphQL,
+            #[cfg(feature = "lang-hcl")]
+            Language::Hcl,
+            // Note: Kotlin blocked by tree-sitter version constraint
             #[cfg(feature = "lang-c")]
             Language::C,
             #[cfg(feature = "lang-cpp")]

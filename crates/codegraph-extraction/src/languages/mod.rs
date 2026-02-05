@@ -70,7 +70,11 @@ pub fn get_language_config(lang: Language) -> Option<LanguageConfig> {
         Language::Java => Some(java_config()),
         Language::CSharp => Some(csharp_config()),
         Language::Ruby => Some(ruby_config()),
-        // Note: Swift, Kotlin, Dart disabled due to tree-sitter version conflicts
+        Language::Dart => Some(dart_config()),
+        Language::Swift => Some(swift_config()),
+        Language::GraphQL => Some(graphql_config()),
+        Language::Hcl => Some(hcl_config()),
+        // Note: Kotlin blocked by tree-sitter version constraint
         _ => None,
     }
 }
@@ -260,8 +264,107 @@ fn ruby_config() -> LanguageConfig {
     }
 }
 
-// Note: Swift, Kotlin, Dart configs removed due to tree-sitter version conflicts
-// They can be re-added when compatible tree-sitter grammars are available
+fn dart_config() -> LanguageConfig {
+    let mut mappings = HashMap::new();
+
+    // Dart class with methods and fields
+    mappings.insert(
+        "class_definition",
+        NodeMapping::with_children(NodeKind::Class, vec!["method_signature", "getter_signature", "setter_signature"]),
+    );
+    // Functions
+    mappings.insert("function_signature", NodeMapping::simple(NodeKind::Function));
+    mappings.insert("method_signature", NodeMapping::simple(NodeKind::Method));
+    mappings.insert("getter_signature", NodeMapping::simple(NodeKind::Method));
+    mappings.insert("setter_signature", NodeMapping::simple(NodeKind::Method));
+    // Enums
+    mappings.insert("enum_declaration", NodeMapping::simple(NodeKind::Enum));
+    // Mixins (treat as traits)
+    mappings.insert("mixin_declaration", NodeMapping::simple(NodeKind::Trait));
+
+    LanguageConfig {
+        language: Language::Dart,
+        node_mappings: mappings,
+        decorator_node_type: Some("annotation"), // Dart uses @annotation syntax
+        name_field: "name",
+        body_field: Some("body"),
+        export_indicators: vec![], // Dart uses library-level exports, not declaration-level
+    }
+}
+
+fn swift_config() -> LanguageConfig {
+    let mut mappings = HashMap::new();
+
+    // Swift class with methods
+    mappings.insert(
+        "class_declaration",
+        NodeMapping::with_children(NodeKind::Class, vec!["function_declaration"]),
+    );
+    // Structs
+    mappings.insert(
+        "struct_declaration",
+        NodeMapping::with_children(NodeKind::Struct, vec!["function_declaration"]),
+    );
+    // Protocols (like interfaces)
+    mappings.insert("protocol_declaration", NodeMapping::simple(NodeKind::Interface));
+    // Functions
+    mappings.insert("function_declaration", NodeMapping::simple(NodeKind::Function));
+    // Enums
+    mappings.insert("enum_declaration", NodeMapping::simple(NodeKind::Enum));
+
+    LanguageConfig {
+        language: Language::Swift,
+        node_mappings: mappings,
+        decorator_node_type: Some("attribute"), // Swift uses @attribute syntax
+        name_field: "name",
+        body_field: Some("body"),
+        export_indicators: vec!["public", "open"],
+    }
+}
+
+fn graphql_config() -> LanguageConfig {
+    let mut mappings = HashMap::new();
+
+    // GraphQL types
+    mappings.insert("object_type_definition", NodeMapping::simple(NodeKind::Class));
+    mappings.insert("interface_type_definition", NodeMapping::simple(NodeKind::Interface));
+    mappings.insert("input_object_type_definition", NodeMapping::simple(NodeKind::Class));
+    mappings.insert("enum_type_definition", NodeMapping::simple(NodeKind::Enum));
+    // Operations
+    mappings.insert("operation_definition", NodeMapping::simple(NodeKind::Function));
+    mappings.insert("fragment_definition", NodeMapping::simple(NodeKind::Function));
+    // Fields
+    mappings.insert("field_definition", NodeMapping::simple(NodeKind::Field));
+
+    LanguageConfig {
+        language: Language::GraphQL,
+        node_mappings: mappings,
+        decorator_node_type: Some("directive"), // GraphQL uses @directive syntax
+        name_field: "name",
+        body_field: None,
+        export_indicators: vec![],
+    }
+}
+
+fn hcl_config() -> LanguageConfig {
+    let mut mappings = HashMap::new();
+
+    // HCL/Terraform blocks
+    mappings.insert("block", NodeMapping::simple(NodeKind::Module));
+    // Resources, data sources, variables, outputs
+    mappings.insert("attribute", NodeMapping::simple(NodeKind::Variable));
+
+    LanguageConfig {
+        language: Language::Hcl,
+        node_mappings: mappings,
+        decorator_node_type: None, // HCL doesn't have decorators
+        name_field: "identifier",
+        body_field: Some("body"),
+        export_indicators: vec![],
+    }
+}
+
+// Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
 
 #[cfg(test)]
 mod tests {

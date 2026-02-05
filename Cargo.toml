@@ -36,21 +36,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled", "blob", "functions", "vtab"] }
 
 # Tree-sitter (core + grammars)
-# Using 0.20 for consistent compatibility
-tree-sitter = "0.20"
-tree-sitter-typescript = "0.20"
-tree-sitter-javascript = "0.20"
-tree-sitter-rust = "0.20"
-tree-sitter-python = "0.20"
-tree-sitter-go = "0.20"
-tree-sitter-java = "0.20"
-tree-sitter-php = "0.21"
-tree-sitter-c = "0.20"
-tree-sitter-cpp = "0.20"
-tree-sitter-c-sharp = "0.20"
-tree-sitter-ruby = "0.20"
-tree-sitter-bash = "0.20"
-# Note: Swift, Kotlin, Dart, GraphQL, HCL disabled due to version conflicts
+# Updated to latest versions (2026-02)
+tree-sitter = "0.26"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-dart = { package = "tree-sitter-dart-orchard", version = "0.3" }
+tree-sitter-swift = "0.7"
+tree-sitter-graphql = "0.1"
+tree-sitter-hcl = "1.1"
+# Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
 
 # File system
 walkdir = "2.5"

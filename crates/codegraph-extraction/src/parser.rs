@@ -40,7 +40,7 @@ impl TreeSitterParser {
         if !self.parsers.contains_key(&lang) {
             let mut parser = Parser::new();
             let ts_lang = get_tree_sitter_language(lang)?;
-            parser.set_language(ts_lang).map_err(|e| {
+            parser.set_language(&ts_lang).map_err(|e| {
                 ExtractionError::ParseFailed {
                     language: lang.as_str().to_string(),
                     message: format!("Failed to set language: {e}"),
@@ -58,38 +58,46 @@ impl TreeSitterParser {
 }
 
 /// Get the tree-sitter language for a CodeGraph language
-/// Note: tree-sitter 0.20 uses function-based API instead of constants
+/// Note: tree-sitter 0.23+ uses LANGUAGE constants instead of language() functions
 fn get_tree_sitter_language(lang: Language) -> Result<tree_sitter::Language, ExtractionError> {
     match lang {
         #[cfg(feature = "lang-typescript")]
         Language::TypeScript | Language::Tsx => {
-            Ok(tree_sitter_typescript::language_typescript())
+            Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
         }
         #[cfg(feature = "lang-typescript")]
         Language::JavaScript | Language::Jsx => {
-            Ok(tree_sitter_javascript::language())
+            Ok(tree_sitter_javascript::LANGUAGE.into())
         }
         #[cfg(feature = "lang-rust")]
-        Language::Rust => Ok(tree_sitter_rust::language()),
+        Language::Rust => Ok(tree_sitter_rust::LANGUAGE.into()),
         #[cfg(feature = "lang-python")]
-        Language::Python => Ok(tree_sitter_python::language()),
+        Language::Python => Ok(tree_sitter_python::LANGUAGE.into()),
         #[cfg(feature = "lang-go")]
-        Language::Go => Ok(tree_sitter_go::language()),
+        Language::Go => Ok(tree_sitter_go::LANGUAGE.into()),
         #[cfg(feature = "lang-php")]
-        Language::Php => Ok(tree_sitter_php::language_php()),
+        Language::Php => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
         #[cfg(feature = "lang-java")]
-        Language::Java => Ok(tree_sitter_java::language()),
+        Language::Java => Ok(tree_sitter_java::LANGUAGE.into()),
         #[cfg(feature = "lang-c")]
-        Language::C => Ok(tree_sitter_c::language()),
+        Language::C => Ok(tree_sitter_c::LANGUAGE.into()),
         #[cfg(feature = "lang-cpp")]
-        Language::Cpp => Ok(tree_sitter_cpp::language()),
+        Language::Cpp => Ok(tree_sitter_cpp::LANGUAGE.into()),
         #[cfg(feature = "lang-csharp")]
-        Language::CSharp => Ok(tree_sitter_c_sharp::language()),
+        Language::CSharp => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
         #[cfg(feature = "lang-ruby")]
-        Language::Ruby => Ok(tree_sitter_ruby::language()),
+        Language::Ruby => Ok(tree_sitter_ruby::LANGUAGE.into()),
         #[cfg(feature = "lang-bash")]
-        Language::Bash => Ok(tree_sitter_bash::language()),
-        // Note: Swift, Kotlin, Dart, GraphQL, HCL disabled due to tree-sitter version conflicts
+        Language::Bash => Ok(tree_sitter_bash::LANGUAGE.into()),
+        #[cfg(feature = "lang-dart")]
+        Language::Dart => Ok(tree_sitter_dart::LANGUAGE.into()),
+        #[cfg(feature = "lang-swift")]
+        Language::Swift => Ok(tree_sitter_swift::LANGUAGE.into()),
+        #[cfg(feature = "lang-graphql")]
+        Language::GraphQL => Ok(tree_sitter_graphql::LANGUAGE.into()),
+        #[cfg(feature = "lang-hcl")]
+        Language::Hcl => Ok(tree_sitter_hcl::LANGUAGE.into()),
+        // Note: Kotlin blocked by tree-sitter version constraint
         _ => Err(ExtractionError::UnsupportedLanguage(
             lang.as_str().to_string(),
         )),
@@ -137,6 +145,22 @@ mod tests {
             }
         "#;
         let tree = parser.parse(source, Language::TypeScript).unwrap();
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    #[cfg(feature = "lang-dart")]
+    fn test_parse_dart() {
+        let mut parser = TreeSitterParser::new();
+        let source = r#"
+            class MyWidget extends StatelessWidget {
+                @override
+                Widget build(BuildContext context) {
+                    return Container();
+                }
+            }
+        "#;
+        let tree = parser.parse(source, Language::Dart).unwrap();
         assert!(!tree.root_node().has_error());
     }
 }

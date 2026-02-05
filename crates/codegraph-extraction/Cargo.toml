@@ -8,11 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["lang-rust", "lang-typescript", "lang-python", "lang-go", "lang-php"]
+default = ["lang-rust", "lang-typescript", "lang-python", "lang-go", "lang-php", "lang-dart"]
 # Primary target languages (with framework support)
 lang-typescript = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-php = ["dep:tree-sitter-php"]
+lang-dart = ["dep:tree-sitter-dart"]
+lang-swift = ["dep:tree-sitter-swift"]
+lang-graphql = ["dep:tree-sitter-graphql"]
+lang-hcl = ["dep:tree-sitter-hcl"]
 lang-bash = ["dep:tree-sitter-bash"]
 # Secondary languages (extraction only)
 lang-python = ["dep:tree-sitter-python"]
@@ -24,10 +28,10 @@ lang-csharp = ["dep:tree-sitter-c-sharp"]
 lang-ruby = ["dep:tree-sitter-ruby"]
 # All stable languages
 all-languages = [
-    "lang-typescript", "lang-rust", "lang-php", "lang-bash",
+    "lang-typescript", "lang-rust", "lang-php", "lang-dart", "lang-swift", "lang-graphql", "lang-hcl", "lang-bash",
     "lang-python", "lang-go", "lang-java", "lang-c", "lang-cpp", "lang-csharp", "lang-ruby"
 ]
-# Note: Swift, Kotlin, Dart, GraphQL, HCL disabled due to tree-sitter version conflicts
+# Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
 
 [dependencies]
 codegraph-types = { path = "../codegraph-types" }
@@ -56,7 +60,11 @@ tree-sitter-cpp = { workspace = true, optional = true }
 tree-sitter-c-sharp = { workspace = true, optional = true }
 tree-sitter-ruby = { workspace = true, optional = true }
 tree-sitter-bash = { workspace = true, optional = true }
-# Disabled: Swift, Kotlin, Dart, GraphQL, HCL (tree-sitter version conflicts)
+tree-sitter-dart = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-graphql = { workspace = true, optional = true }
+tree-sitter-hcl = { workspace = true, optional = true }
+# Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
 
 [dev-dependencies]
 tempfile = { workspace = true }
