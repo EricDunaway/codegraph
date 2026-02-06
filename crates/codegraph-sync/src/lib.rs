@@ -19,4 +19,4 @@ pub use git_hooks::GitHooksManager;
 pub use lock::IndexLock;
 pub use reembed::{check_reembed_triggers, should_full_reembed, ReembedConfig, ReembedReason};
 pub use selective::SelectiveScope;
-pub use sync::{SyncManager, SyncResult, SyncStats};
+pub use sync::{SyncConfig, SyncManager, SyncResult, SyncStats};

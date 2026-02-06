@@ -121,22 +121,37 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
     );
     pb.set_message("Checking for changes...");
 
-    // For now, just do a full re-index
-    // TODO: Implement proper incremental sync
     let mut cg = CodeGraph::open(&path)?;
-    let result = cg.index_all()?;
+    let result = cg.sync()?;
 
     pb.finish_and_clear();
 
-    println!(
-        "{} Sync complete",
-        style("✓").green().bold()
-    );
-    println!(
-        "   {} files, {} nodes",
-        style(result.files_indexed).cyan(),
-        style(result.nodes_created).cyan()
-    );
+    if !result.had_changes {
+        println!(
+            "{} Already up to date",
+            style("✓").green().bold()
+        );
+    } else {
+        let stats = &result.stats;
+        println!(
+            "{} Sync complete in {}ms",
+            style("✓").green().bold(),
+            result.duration_ms
+        );
+        if stats.files_added > 0 {
+            println!("   {} files added", style(stats.files_added).green());
+        }
+        if stats.files_modified > 0 {
+            println!("   {} files modified", style(stats.files_modified).yellow());
+        }
+        if stats.files_deleted > 0 {
+            println!("   {} files deleted", style(stats.files_deleted).red());
+        }
+        println!(
+            "   {} total nodes",
+            style(stats.total_nodes).cyan()
+        );
+    }
 
     Ok(())
 }

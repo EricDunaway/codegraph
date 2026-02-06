@@ -33,7 +33,12 @@ cargo run --message-format=json -p codegraph-cli -- index <path>     # Index a c
 cargo run --message-format=json -p codegraph-cli -- status <path>    # Show statistics
 
 # Verify indexed data
-sqlite3 .codegraph/codegraph.db "SELECT name, decorators FROM nodes WHERE decorators != '[]' LIMIT 10;"
+sqlite3 .codegraph/codegraph.db "SELECT name, decorators FROM nodes WHERE decorators <> '[]' LIMIT 10;"
+
+# Verify extraction state
+sqlite3 .codegraph/codegraph.db "SELECT kind, COUNT(*) FROM edges GROUP BY kind;"  # Should show calls, imports, not just contains
+sqlite3 .codegraph/codegraph.db "SELECT COUNT(*) FROM nodes WHERE code_snippet IS NOT NULL;"  # Should be >0
+sqlite3 .codegraph/codegraph.db "SELECT name, decorators FROM nodes WHERE length(decorators) > 2 LIMIT 5;"  # Verify decorators work
 ```
 
 ## Architecture
@@ -114,14 +119,16 @@ codegraph serve --mcp       # Start MCP server
 
 These tools are designed to be used by **Explore agents** for faster codebase exploration:
 
-| Tool | Use For |
-|------|---------|
-| `codegraph_search` | Find symbols by name (functions, classes, types) |
-| `codegraph_context` | Get relevant code context for a task |
-| `codegraph_callers` | Find what calls a function |
-| `codegraph_callees` | Find what a function calls |
-| `codegraph_impact` | See what's affected by changing a symbol |
-| `codegraph_node` | Get details + source code for a symbol |
+| Tool | Status | Use For |
+|------|--------|---------|
+| `codegraph_search` | ✅ | Find symbols by name (functions, classes, types) |
+| `codegraph_context` | ✅ | Get relevant code context for a task |
+| `codegraph_file_nodes` | ✅ | List all symbols in a file |
+| `codegraph_status` | ✅ | Index status and dirty file detection |
+| `codegraph_node` | ⚠️ | Get symbol location (code snippet not yet implemented) |
+| `codegraph_callers` | ❌ | Find what calls a function (needs edge extraction) |
+| `codegraph_callees` | ❌ | Find what a function calls (needs edge extraction) |
+| `codegraph_impact` | ❌ | See what's affected by changes (needs edge extraction) |
 
 ### Important
 CodeGraph provides **code context**, not product requirements. For new features, still ask the user about:
@@ -144,7 +151,11 @@ Tests use temporary directories created with `tempfile` crate and cleaned up aft
 
 ## Known Issues / In Progress
 
-**Tree-sitter wiring (P0):** Tree-sitter grammars are declared in `Cargo.toml` but extraction currently uses regex. This prevents decorator/attribute extraction. See `docs/plans/LINKED_REPOS.md` and the deviation audit plan.
+**See also:** `docs/issues.md` (bugs) and `docs/gaps.md` (feature gaps)
+
+**Gotcha:** `!=` gets escaped to `\!=` in this environment. Use `<>` or `length(column) > 2` instead.
+
+**Relationship edges not implemented (P0):** Tree-sitter extraction works and captures decorators (verified), but only creates `contains` edges (structural). No `calls`, `imports`, or `extends` edges are created, which breaks `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` tools. See `crates/codegraph-extraction/src/tree_sitter_extractor.rs` lines 124-129.
 
 **Key plan documents:**
 - `RUST_REWRITE_PLAN.md` - Original requirements
@@ -158,3 +169,9 @@ To check if a tree-sitter grammar supports specific AST nodes:
 curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/master/common/define-grammar.js | grep -A5 "decorator:"
 curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-rust/master/grammar.js | grep -A5 "attribute_item:"
 ```
+
+## Documentation Maintenance
+
+- **Always verify claims against code** - don't trust plan docs; check actual implementation
+- **Use `docs/issues.md`** for bugs, **`docs/gaps.md`** for missing features
+- **Don't track fixed issues** - remove from issues.md once resolved

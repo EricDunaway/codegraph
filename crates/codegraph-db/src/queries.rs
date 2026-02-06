@@ -31,11 +31,11 @@ impl QueryBuilder {
     // Node Operations
     // =========================================================================
 
-    /// Insert a new node
+    /// Insert or update a node (upsert semantics)
     pub fn insert_node(&self, conn: &Connection, node: &Node) -> Result<(), DbError> {
         conn.execute(
             r#"
-            INSERT INTO nodes (
+            INSERT OR REPLACE INTO nodes (
                 id, kind, name, qualified_name, file_path, language,
                 start_line, end_line, start_column, end_column,
                 docstring, signature, visibility,

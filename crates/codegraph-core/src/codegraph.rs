@@ -122,6 +122,9 @@ impl CodeGraph {
     /// This scans the project, extracts AST information, and stores it in the database.
     /// Call this after `init()` or when you want to rebuild the index.
     pub fn index_all(&mut self) -> Result<IndexingResult, CodeGraphError> {
+        use codegraph_types::FileRecord;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let extraction_config = Config {
             root_dir: self.config.root.to_string_lossy().to_string(),
             exclude: self.config.exclude_patterns.clone(),
@@ -129,39 +132,59 @@ impl CodeGraph {
             ..Config::default()
         };
 
-        // Create orchestrator and run extraction
-        let orchestrator = ExtractionOrchestrator::new(&self.config.root, extraction_config)?;
-        let result = orchestrator.index_all(|_progress| {})?;
-
-        log::info!("Found {} files to index", result.files_indexed);
-
-        // Note: The orchestrator extracts nodes/edges. We need to store them.
-        // Re-extract to get the actual nodes/edges for storage
-        let orchestrator2 = ExtractionOrchestrator::with_defaults(&self.config.root)?;
+        // Create orchestrator
+        let orchestrator = ExtractionOrchestrator::new(&self.config.root, extraction_config.clone())?;
         let mut nodes_created = 0;
         let mut edges_created = 0;
+        let mut files_indexed = 0;
 
         // Scan and extract files individually for storage
         let scan_result = codegraph_extraction::FileScanner::new(
             &self.config.root,
-            &Config {
-                root_dir: self.config.root.to_string_lossy().to_string(),
-                exclude: self.config.exclude_patterns.clone(),
-                max_file_size: self.config.max_file_size as u64,
-                ..Config::default()
-            },
+            &extraction_config,
         )?
         .scan()?;
 
-        for file in scan_result.files {
-            if let Ok(extraction_result) = orchestrator2.extract_file(&file) {
-                for node in &extraction_result.nodes {
-                    self.queries.insert_node(self.db.conn(), node)?;
-                    nodes_created += 1;
+        log::info!("Found {} files to index", scan_result.files.len());
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        for file in &scan_result.files {
+            match orchestrator.extract_file(file) {
+                Ok(extraction_result) => {
+                    let node_count = extraction_result.nodes.len();
+
+                    // Insert nodes (upsert semantics)
+                    for node in &extraction_result.nodes {
+                        self.queries.insert_node(self.db.conn(), node)?;
+                        nodes_created += 1;
+                    }
+
+                    // Insert edges
+                    for edge in &extraction_result.edges {
+                        self.queries.insert_edge(self.db.conn(), edge)?;
+                        edges_created += 1;
+                    }
+
+                    // Track file in files table
+                    let file_record = FileRecord {
+                        path: file.path.clone(),
+                        content_hash: file.content_hash.clone(),
+                        language: file.language,
+                        size: file.size,
+                        modified_at: now,
+                        indexed_at: now,
+                        node_count: node_count as u32,
+                        errors: extraction_result.errors.clone(),
+                    };
+                    self.queries.upsert_file(self.db.conn(), &file_record)?;
+                    files_indexed += 1;
                 }
-                for edge in &extraction_result.edges {
-                    self.queries.insert_edge(self.db.conn(), edge)?;
-                    edges_created += 1;
+                Err(e) => {
+                    log::warn!("Failed to extract {}: {}", file.path, e);
                 }
             }
         }
@@ -181,7 +204,7 @@ impl CodeGraph {
         }
 
         let stats = IndexingResult {
-            files_indexed: result.files_indexed,
+            files_indexed,
             nodes_created,
             edges_created,
             references_resolved: resolved_count,
@@ -201,6 +224,40 @@ impl CodeGraph {
     pub fn index_all_dry_run(&self) -> Result<ExtractionIndexResult, CodeGraphError> {
         let orchestrator = ExtractionOrchestrator::with_defaults(&self.config.root)?;
         let result = orchestrator.index_all(|_progress| {})?;
+        Ok(result)
+    }
+
+    /// Incrementally sync changes since last index
+    ///
+    /// This detects files that have been added, modified, or deleted since the last
+    /// index/sync operation and updates the database accordingly. Much faster than
+    /// a full re-index for small changes.
+    pub fn sync(&mut self) -> Result<codegraph_sync::SyncResult, CodeGraphError> {
+        use codegraph_sync::{SyncConfig, SyncManager};
+
+        let sync_config = SyncConfig {
+            excludes: self.config.exclude_patterns.clone(),
+            continue_on_error: true,
+            ..SyncConfig::default()
+        };
+
+        let manager = SyncManager::with_config(
+            self.config.root.to_string_lossy().to_string(),
+            sync_config,
+        );
+
+        let result = manager.sync_with_codegraph_dir(
+            self.db.conn(),
+            &mut self.queries,
+            Some(&self.config.data_dir),
+        )?;
+
+        // Resolve references for changed files if enabled
+        if self.config.resolve_references && result.had_changes {
+            let mut resolver = ReferenceResolver::new(self.db.conn(), &mut self.queries);
+            let _ = resolver.resolve_all();
+        }
+
         Ok(result)
     }
 
