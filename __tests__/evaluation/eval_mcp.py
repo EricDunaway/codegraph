@@ -456,23 +456,269 @@ def extract_symbols_from_text(text: str) -> list[str]:
 def extract_symbols_from_context(text: str) -> list[str]:
     """Extract symbol names from context markdown output.
 
-    Context output is markdown with code blocks. We look for symbol names
-    mentioned anywhere in the text.
+    The context tool returns markdown in this format:
+
+        # Context: <query>
+        **N symbols** across **M files**
+
+        ## Files
+        - `auth.py` (3 symbols)
+
+        ## Symbols
+        ### function `auth.py::login`
+        - **File:** `auth.py:57:68`
+        - **Signature:** `def login(self, email, password)`
+        > Docstring text
+        ```python
+        def login(self, email: str, password: str) -> Optional[str]:
+            user = db.get_user_by_email(email)
+            ...
+        ```
+
+        ## Relationships
+        - `hash1` --[calls]--> `hash2`
+
+    We extract symbol names from all of these sections.
     """
-    # Pull out all identifiers that look like function/class/method names
-    # from headers, code blocks, etc.
     symbols = set()
 
-    # Match ## headers like "## function `name`"
-    for m in re.finditer(r"## \w+ `([^`]+)`", text):
-        name = m.group(1).split("::")[-1] if "::" in m.group(1) else m.group(1)
-        symbols.add(name)
+    # 1. Symbol section headers: "### kind `qualified_name`"
+    #    e.g. "### function `auth.py::login`" or "### class `models.py::User`"
+    for m in re.finditer(r"###\s+\w+\s+`([^`]+)`", text):
+        qualified = m.group(1)
+        # Extract simple name from "file.py::ClassName.method" or "file.py::func"
+        after_file = qualified.split("::")[-1] if "::" in qualified else qualified
+        # Handle dotted names like "AuthService.login" -> add both parts and compound
+        parts = after_file.split(".")
+        for part in parts:
+            if part and not _is_file_name(part):
+                symbols.add(part)
 
-    # Match backtick-quoted names
-    for m in re.finditer(r"`([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*)`", text):
-        symbols.add(m.group(1))
+    # 2. Signature lines: "- **Signature:** `def login(self, email, password)`"
+    #    or "- **Signature:** `async createOrder(token: string, items: OrderItem[]): Promise<Order>`"
+    for m in re.finditer(r"\*\*Signature:\*\*\s*`([^`]+)`", text):
+        sig = m.group(1)
+        _extract_identifiers_from_signature(sig, symbols)
+
+    # 3. Code blocks: extract function/class/type definitions and call sites
+    in_code_block = False
+    code_lang = ""
+    for line in text.split("\n"):
+        if line.startswith("```") and not in_code_block:
+            in_code_block = True
+            code_lang = line[3:].strip()
+            continue
+        elif line.startswith("```") and in_code_block:
+            in_code_block = False
+            code_lang = ""
+            continue
+
+        if in_code_block:
+            _extract_identifiers_from_code(line, code_lang, symbols)
+
+    # 4. Relationship lines: "- `hash1` --[calls]--> `hash2`"
+    #    These are node IDs (hashes), not useful for symbol matching.
+    #    Skip them.
+
+    # 5. Backtick-quoted identifiers outside of file references
+    #    e.g. `validate_email`, `User`, `AuthService`
+    #    But skip file paths like `auth.py:57:68` and `auth.py`
+    for m in re.finditer(r"`([a-zA-Z_]\w*(?:\.\w+)*)`", text):
+        name = m.group(1)
+        # Skip file names (contain dots with common extensions)
+        if _is_file_name(name):
+            continue
+        # Handle dotted names
+        parts = name.split(".")
+        for part in parts:
+            if part and re.match(r"^[a-zA-Z_]\w*$", part) and not _is_file_name(part):
+                symbols.add(part)
+
+    # 6. File section entries: "- `auth.py` (3 symbols)" -- skip these
+    #    Already handled by the file name filter above.
+
+    # Remove common noise words that aren't actual symbols
+    noise = {
+        "self", "None", "True", "False", "str", "int", "float", "bool",
+        "list", "dict", "set", "tuple", "Optional", "List", "Dict", "Tuple",
+        "return", "if", "else", "for", "while", "class", "def", "import",
+        "from", "async", "await", "const", "let", "var", "function",
+        "export", "interface", "type", "enum", "string", "number", "boolean",
+        "void", "null", "undefined", "Promise", "any", "new", "this",
+        "not", "and", "or", "in", "is", "with", "as", "try", "except",
+        "raise", "throw", "Error", "Date",
+    }
+    symbols -= noise
 
     return list(symbols)
+
+
+def _is_file_name(name: str) -> bool:
+    """Check if a name looks like a file path rather than a symbol."""
+    file_extensions = {
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".java",
+        ".rb", ".php", ".swift", ".kt", ".c", ".h", ".cpp", ".cs",
+    }
+    for ext in file_extensions:
+        if name.endswith(ext):
+            return True
+    # Also match file:line patterns
+    if re.match(r".*\.\w+:\d+", name):
+        return True
+    return False
+
+
+def _extract_identifiers_from_signature(sig: str, symbols: set):
+    """Extract meaningful identifiers from a function/method signature.
+
+    Examples:
+        def login(self, email: str, password: str) -> Optional[str]
+        async createOrder(token: string, items: OrderItem[]): Promise<Order>
+        fn get_user_by_email(&self, email: &str) -> Option<User>
+    """
+    # Extract the function/method name
+    # Python: def name(  or  async def name(
+    m = re.search(r"(?:async\s+)?(?:def|fn)\s+(\w+)", sig)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS: async? name( or name(
+    m = re.search(r"(?:async\s+)?(\w+)\s*\(", sig)
+    if m and m.group(1) not in ("def", "fn", "function", "async"):
+        symbols.add(m.group(1))
+
+    # Extract type names from type annotations
+    # Match capitalized identifiers that look like type/class names
+    for m in re.finditer(r"\b([A-Z]\w+)\b", sig):
+        name = m.group(1)
+        if name not in ("Optional", "List", "Dict", "Tuple", "Set",
+                        "Promise", "Partial", "Record", "Array",
+                        "String", "Number", "Boolean", "None", "True", "False"):
+            symbols.add(name)
+
+
+def _extract_identifiers_from_code(line: str, lang: str, symbols: set):
+    """Extract symbol names from a line of source code.
+
+    Looks for function/method definitions, class definitions,
+    type definitions, function calls, and import statements.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+        return
+
+    # Python function/method definitions
+    m = re.match(r"\s*(?:async\s+)?def\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # Python class definitions
+    m = re.match(r"\s*class\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # Python import statements
+    # from module import name1, name2
+    m = re.match(r"\s*from\s+\w+\s+import\s+(.+)", line)
+    if m:
+        for name in re.findall(r"(\w+)", m.group(1)):
+            if name not in ("as", "import"):
+                symbols.add(name)
+
+    # import module
+    m = re.match(r"\s*import\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS function definitions
+    m = re.match(r"\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS class definitions
+    m = re.match(r"\s*(?:export\s+)?class\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS interface definitions
+    m = re.match(r"\s*(?:export\s+)?interface\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS type alias definitions
+    m = re.match(r"\s*(?:export\s+)?type\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # TypeScript/JS method definitions in classes
+    m = re.match(r"\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*(?::\s*\S+)?\s*\{", line)
+    if m and m.group(1) not in ("if", "for", "while", "switch", "catch", "function"):
+        symbols.add(m.group(1))
+
+    # TypeScript/JS import statements
+    # import { Name1, Name2 } from './module'
+    m = re.match(r"\s*import\s+\{([^}]+)\}", line)
+    if m:
+        for name in re.findall(r"(\w+)", m.group(1)):
+            if name not in ("as", "from", "type"):
+                symbols.add(name)
+
+    # Function calls: name( or obj.name(
+    for m in re.finditer(r"(?:^|[\s=({,])(\w+)\s*\(", line):
+        name = m.group(1)
+        if name not in ("if", "for", "while", "switch", "catch", "return",
+                        "print", "len", "str", "int", "float", "bool",
+                        "list", "dict", "set", "tuple", "type",
+                        "isinstance", "hasattr", "getattr", "super",
+                        "format", "range", "enumerate", "zip", "map", "filter",
+                        "def", "class", "function", "async", "await", "not"):
+            symbols.add(name)
+
+    # Method calls: obj.method(
+    for m in re.finditer(r"\.(\w+)\s*\(", line):
+        name = m.group(1)
+        if name not in ("get", "set", "has", "add", "remove", "delete",
+                        "append", "extend", "pop", "push", "join", "split",
+                        "strip", "replace", "format", "encode", "decode",
+                        "keys", "values", "items", "update", "copy",
+                        "startswith", "endswith", "lower", "upper",
+                        "then", "catch", "finally", "map", "filter",
+                        "reduce", "forEach", "find", "some", "every",
+                        "log", "error", "warn", "info", "hexdigest"):
+            symbols.add(name)
+
+    # Attribute access for known patterns: obj.attribute (for type-like names)
+    for m in re.finditer(r"\.(\w+)", line):
+        name = m.group(1)
+        # Only add if it starts with uppercase (likely a class/type reference)
+        if name and name[0].isupper():
+            symbols.add(name)
+
+    # Rust function/method definitions
+    m = re.match(r"\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # Rust struct/enum/trait definitions
+    m = re.match(r"\s*(?:pub\s+)?(?:struct|enum|trait|impl)\s+(\w+)", line)
+    if m:
+        symbols.add(m.group(1))
+
+    # Capitalized identifiers in the line (likely class/type names)
+    for m in re.finditer(r"\b([A-Z][a-zA-Z0-9_]*)\b", line):
+        name = m.group(1)
+        # Filter out common non-symbol capitalized words
+        if name not in ("None", "True", "False", "Optional", "List", "Dict",
+                        "Tuple", "Set", "Union", "Any", "Type",
+                        "Promise", "Partial", "Record", "Array", "Map",
+                        "String", "Number", "Boolean", "Symbol", "BigInt",
+                        "Error", "Date", "RegExp", "Math", "JSON",
+                        "Object", "Function", "Infinity", "NaN",
+                        "GET", "POST", "PUT", "DELETE", "PATCH",
+                        "OK", "NULL", "EOF", "TODO", "FIXME",
+                        "If", "For", "While", "Return", "Import", "From",
+                        "Cannot", "Invalid", "Insufficient"):
+            symbols.add(name)
 
 
 def get_tool_text(response: dict) -> str:
