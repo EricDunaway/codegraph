@@ -4,18 +4,18 @@
  * Installs and manages git hooks for automatic incremental indexing.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 /**
  * Name of the post-commit hook file
  */
-const POST_COMMIT_HOOK = 'post-commit';
+const POST_COMMIT_HOOK = "post-commit";
 
 /**
  * Marker comment to identify CodeGraph-managed hooks
  */
-const CODEGRAPH_MARKER = '# CodeGraph auto-sync hook';
+const CODEGRAPH_MARKER = "# CodeGraph auto-sync hook";
 
 /**
  * The post-commit hook script content
@@ -78,8 +78,8 @@ export class GitHooksManager {
   private hooksDir: string;
 
   constructor(projectRoot: string) {
-    this.gitDir = path.join(projectRoot, '.git');
-    this.hooksDir = path.join(this.gitDir, 'hooks');
+    this.gitDir = path.join(projectRoot, ".git");
+    this.hooksDir = path.join(this.gitDir, "hooks");
   }
 
   /**
@@ -100,7 +100,7 @@ export class GitHooksManager {
     }
 
     try {
-      const content = fs.readFileSync(hookPath, 'utf-8');
+      const content = fs.readFileSync(hookPath, "utf-8");
       return content.includes(CODEGRAPH_MARKER);
     } catch {
       return false;
@@ -122,7 +122,7 @@ export class GitHooksManager {
       return {
         success: false,
         hookPath,
-        message: 'Not a git repository. Initialize git first with: git init',
+        message: "Not a git repository. Initialize git first with: git init",
       };
     }
 
@@ -145,7 +145,7 @@ export class GitHooksManager {
 
     if (fs.existsSync(hookPath)) {
       try {
-        const existingContent = fs.readFileSync(hookPath, 'utf-8');
+        const existingContent = fs.readFileSync(hookPath, "utf-8");
 
         // If it's already our hook, just update it
         if (existingContent.includes(CODEGRAPH_MARKER)) {
@@ -153,7 +153,7 @@ export class GitHooksManager {
           return {
             success: true,
             hookPath,
-            message: 'Post-commit hook updated.',
+            message: "Post-commit hook updated.",
           };
         }
 
@@ -183,7 +183,7 @@ export class GitHooksManager {
 
     const message = previousHookBackedUp
       ? `Post-commit hook installed. Previous hook backed up to: ${backupPath}`
-      : 'Post-commit hook installed.';
+      : "Post-commit hook installed.";
 
     return {
       success: true,
@@ -207,17 +207,18 @@ export class GitHooksManager {
     if (!fs.existsSync(hookPath)) {
       return {
         success: true,
-        message: 'No post-commit hook found.',
+        message: "No post-commit hook found.",
       };
     }
 
     // Check if it's our hook
     try {
-      const content = fs.readFileSync(hookPath, 'utf-8');
+      const content = fs.readFileSync(hookPath, "utf-8");
       if (!content.includes(CODEGRAPH_MARKER)) {
         return {
           success: false,
-          message: 'Post-commit hook was not installed by CodeGraph. Not removing.',
+          message:
+            "Post-commit hook was not installed by CodeGraph. Not removing.",
         };
       }
     } catch (error) {
@@ -243,7 +244,8 @@ export class GitHooksManager {
         fs.renameSync(backupPath, hookPath);
         return {
           success: true,
-          message: 'Post-commit hook removed. Previous hook restored from backup.',
+          message:
+            "Post-commit hook removed. Previous hook restored from backup.",
           restoredFromBackup: true,
         };
       } catch (error) {
@@ -257,7 +259,7 @@ export class GitHooksManager {
 
     return {
       success: true,
-      message: 'Post-commit hook removed.',
+      message: "Post-commit hook removed.",
     };
   }
 

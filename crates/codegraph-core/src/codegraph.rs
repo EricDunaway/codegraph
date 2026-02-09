@@ -147,6 +147,9 @@ impl CodeGraph {
 
         log::info!("Found {} files to index", scan_result.files.len());
 
+        // Clear previous unresolved refs before re-indexing
+        self.queries.clear_unresolved_refs(self.db.conn())?;
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -167,6 +170,11 @@ impl CodeGraph {
                     for edge in &extraction_result.edges {
                         self.queries.insert_edge(self.db.conn(), edge)?;
                         edges_created += 1;
+                    }
+
+                    // Store unresolved references for later resolution
+                    for ref_info in &extraction_result.unresolved_references {
+                        let _ = self.queries.insert_unresolved_ref(self.db.conn(), ref_info);
                     }
 
                     // Track file in files table

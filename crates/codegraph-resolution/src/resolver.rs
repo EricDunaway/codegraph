@@ -143,15 +143,19 @@ impl<'a> ReferenceResolver<'a> {
 
     /// Resolve all unresolved references in the database
     pub fn resolve_all(&mut self) -> Result<ResolutionStats, ResolutionError> {
-        let unresolved = self.queries.get_unresolved_references(self.conn)?;
+        let unresolved = self.queries.get_all_unresolved_refs(self.conn)?;
 
         log::info!(
             "Starting resolution of {} unresolved references",
             unresolved.len()
         );
 
-        for (source_id, ref_name, _file_path, _line) in unresolved {
-            let result = self.resolve_reference(&source_id, &ref_name)?;
+        for unresolved_ref in unresolved {
+            let result = self.resolve_reference_with_kind(
+                unresolved_ref.from_node_id.as_str(),
+                &unresolved_ref.reference_name,
+                unresolved_ref.reference_kind,
+            )?;
             self.stats.total_processed += 1;
 
             if result.target.is_some() {
@@ -186,11 +190,21 @@ impl<'a> ReferenceResolver<'a> {
         Ok(self.stats.clone())
     }
 
-    /// Resolve a single reference
+    /// Resolve a single reference (defaults to EdgeKind::References for backward compat)
     pub fn resolve_reference(
         &mut self,
         source_id: &str,
         ref_name: &str,
+    ) -> Result<ResolutionResult, ResolutionError> {
+        self.resolve_reference_with_kind(source_id, ref_name, EdgeKind::References)
+    }
+
+    /// Resolve a single reference with a specific edge kind
+    pub fn resolve_reference_with_kind(
+        &mut self,
+        source_id: &str,
+        ref_name: &str,
+        edge_kind: EdgeKind,
     ) -> Result<ResolutionResult, ResolutionError> {
         let source_node_id = NodeId::new(source_id);
 
@@ -207,11 +221,17 @@ impl<'a> ReferenceResolver<'a> {
         // Get the source node to understand context
         let source_node = self.queries.get_node_by_id(self.conn, source_id)?;
 
+        // Get source file path for scope-aware resolution
+        let source_file = source_node
+            .as_ref()
+            .map(|n| n.file_path.as_str())
+            .unwrap_or("");
+
         // Try resolution strategies in order
         let target = self
             .try_import_resolution(source_id, ref_name)?
-            .or_else(|| self.try_exact_match(ref_name).ok().flatten())
-            .or_else(|| self.try_qualified_match(ref_name).ok().flatten())
+            .or_else(|| self.try_exact_match(ref_name, source_file).ok().flatten())
+            .or_else(|| self.try_qualified_match(ref_name, source_file).ok().flatten())
             .or_else(|| {
                 if self.config.fuzzy_matching {
                     self.try_fuzzy_match(ref_name).ok().flatten()
@@ -229,9 +249,9 @@ impl<'a> ReferenceResolver<'a> {
                 }
             });
 
-        // If resolved, create the edge
+        // If resolved, create the edge with the actual reference kind
         if let Some(ref resolved) = target {
-            let edge = Edge::new(source_id, resolved.node_id.as_str(), EdgeKind::References);
+            let edge = Edge::new(source_id, resolved.node_id.as_str(), edge_kind);
             // Ignore duplicate edge errors
             let _ = self.queries.insert_edge(self.conn, &edge);
 
@@ -292,38 +312,86 @@ impl<'a> ReferenceResolver<'a> {
         Ok(None)
     }
 
-    /// Try exact name match
-    fn try_exact_match(&self, ref_name: &str) -> Result<Option<ResolvedTarget>, ResolutionError> {
-        let candidates = self.queries.search_symbols(self.conn, ref_name)?;
-
-        for node in candidates {
-            if node.name == ref_name {
-                return Ok(Some(ResolvedTarget {
-                    node_id: node.id,
-                    confidence: 1.0,
-                    method: ResolutionMethod::ExactMatch,
-                }));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Try qualified name suffix match
-    fn try_qualified_match(
+    /// Try exact name match with scope-aware resolution.
+    /// Prefers same-file matches; skips ambiguous cross-file matches for common names.
+    fn try_exact_match(
         &self,
         ref_name: &str,
+        source_file: &str,
     ) -> Result<Option<ResolvedTarget>, ResolutionError> {
         let candidates = self.queries.search_symbols(self.conn, ref_name)?;
 
-        for node in candidates {
-            if self.matcher.qualified_suffix_match(ref_name, &node.qualified_name) {
-                return Ok(Some(ResolvedTarget {
-                    node_id: node.id,
-                    confidence: 0.95,
-                    method: ResolutionMethod::QualifiedMatch,
-                }));
+        // Collect all exact matches, partitioned by file proximity
+        let mut same_file = Vec::new();
+        let mut other_file = Vec::new();
+        for node in &candidates {
+            if node.name == ref_name {
+                if node.file_path == source_file {
+                    same_file.push(node);
+                } else {
+                    other_file.push(node);
+                }
             }
+        }
+
+        // Prefer same-file match (highest confidence)
+        if same_file.len() == 1 {
+            return Ok(Some(ResolvedTarget {
+                node_id: same_file[0].id.clone(),
+                confidence: 1.0,
+                method: ResolutionMethod::ExactMatch,
+            }));
+        }
+
+        // If exactly one cross-file match, return it
+        if same_file.is_empty() && other_file.len() == 1 {
+            return Ok(Some(ResolvedTarget {
+                node_id: other_file[0].id.clone(),
+                confidence: 0.9,
+                method: ResolutionMethod::ExactMatch,
+            }));
+        }
+
+        // Multiple matches = ambiguous, skip to avoid false positives
+        Ok(None)
+    }
+
+    /// Try qualified name suffix match with scope-aware resolution.
+    fn try_qualified_match(
+        &self,
+        ref_name: &str,
+        source_file: &str,
+    ) -> Result<Option<ResolvedTarget>, ResolutionError> {
+        let candidates = self.queries.search_symbols(self.conn, ref_name)?;
+
+        let mut same_file = Vec::new();
+        let mut other_file = Vec::new();
+        for node in &candidates {
+            if self.matcher.qualified_suffix_match(ref_name, &node.qualified_name) {
+                if node.file_path == source_file {
+                    same_file.push(node);
+                } else {
+                    other_file.push(node);
+                }
+            }
+        }
+
+        // Prefer same-file match
+        if same_file.len() == 1 {
+            return Ok(Some(ResolvedTarget {
+                node_id: same_file[0].id.clone(),
+                confidence: 0.95,
+                method: ResolutionMethod::QualifiedMatch,
+            }));
+        }
+
+        // Single cross-file match
+        if same_file.is_empty() && other_file.len() == 1 {
+            return Ok(Some(ResolvedTarget {
+                node_id: other_file[0].id.clone(),
+                confidence: 0.85,
+                method: ResolutionMethod::QualifiedMatch,
+            }));
         }
 
         Ok(None)

@@ -471,6 +471,14 @@ impl McpTools {
             output.push_str(&format!("\n**Documentation:**\n> {}\n", doc.replace('\n', "\n> ")));
         }
 
+        if let Some(ref snippet) = node.code_snippet {
+            output.push_str(&format!(
+                "\n**Source:**\n```{}\n{}\n```\n",
+                node.language.as_str(),
+                snippet
+            ));
+        }
+
         if let Some(warning) = Self::staleness_warning(&[&node.file_path], git_status) {
             output.push_str(&warning);
         }

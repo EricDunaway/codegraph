@@ -7,8 +7,10 @@
 use crate::error::ExtractionError;
 use crate::languages::{get_language_config, LanguageConfig};
 use crate::parser::TreeSitterParser;
+use crate::snippet::{extract_code_snippet_for_range, DEFAULT_MAX_LINES};
 use codegraph_types::{
-    Edge, EdgeKind, ExtractionResult, Language, Node, NodeId, NodeKind, Visibility,
+    Edge, EdgeKind, ExtractionResult, Language, Node, NodeId, NodeKind, UnresolvedReference,
+    Visibility, BUILTIN_SYMBOLS,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -86,6 +88,12 @@ impl TreeSitterExtractor {
     ) {
         let node_kind = node.kind();
 
+        // Handle import statements before checking mapped nodes
+        if config.import_node_types.contains(&node_kind) {
+            self.extract_import(node, source, file_path, parent_id, lang, config, result, seen_ids);
+            return;
+        }
+
         // Check if this node type is mapped
         if let Some(mapping) = config.node_mappings.get(node_kind) {
             // Extract this node
@@ -120,6 +128,8 @@ impl TreeSitterExtractor {
                 } else {
                     Some(Visibility::Private)
                 };
+                extracted_node.code_snippet =
+                    extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
 
                 // Add contains edge from parent
                 result.edges.push(Edge::new(
@@ -127,6 +137,23 @@ impl TreeSitterExtractor {
                     node_id.clone(),
                     EdgeKind::Contains,
                 ));
+
+                // Extract calls from function/method bodies
+                if matches!(mapping.kind, NodeKind::Function | NodeKind::Method) {
+                    if let Some(call_type) = config.call_node_type {
+                        self.extract_calls_from_subtree(
+                            node, source, file_path, &node_id, lang, config, call_type, result,
+                        );
+                    }
+                }
+
+                // Extract inheritance from class/interface/struct
+                if matches!(
+                    mapping.kind,
+                    NodeKind::Class | NodeKind::Interface | NodeKind::Struct
+                ) {
+                    self.extract_inheritance(node, source, file_path, &node_id, lang, config, result);
+                }
 
                 // If this node has children, process them with this node as parent
                 if mapping.has_children {
@@ -211,12 +238,24 @@ impl TreeSitterExtractor {
                         } else {
                             Some(Visibility::Public)
                         };
+                        extracted_node.code_snippet =
+                            extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
 
                         result.edges.push(Edge::new(
                             parent_id.clone(),
                             node_id.clone(),
                             EdgeKind::Contains,
                         ));
+
+                        // Extract calls from method bodies
+                        if matches!(mapping.kind, NodeKind::Function | NodeKind::Method) {
+                            if let Some(call_type) = config.call_node_type {
+                                self.extract_calls_from_subtree(
+                                    child, source, file_path, &node_id, lang, config, call_type, result,
+                                );
+                            }
+                        }
+
                         result.nodes.push(extracted_node);
                     }
                 }
@@ -317,6 +356,347 @@ impl TreeSitterExtractor {
         }
 
         false
+    }
+
+    // =========================================================================
+    // Import Extraction
+    // =========================================================================
+
+    /// Extract an import statement node and create an unresolved reference
+    fn extract_import(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        file_path: &str,
+        parent_id: &NodeId,
+        lang: Language,
+        _config: &LanguageConfig,
+        result: &mut ExtractionResult,
+        seen_ids: &mut HashSet<String>,
+    ) {
+        let import_name = match self.extract_import_name(node, source, lang) {
+            Some(name) => name,
+            None => return,
+        };
+
+        let line = node.start_position().row as u32 + 1;
+        let end_line = node.end_position().row as u32 + 1;
+        let node_id = generate_node_id(file_path, NodeKind::Import, &import_name, line);
+
+        if seen_ids.contains(node_id.as_str()) {
+            return;
+        }
+        seen_ids.insert(node_id.as_str().to_string());
+
+        let mut import_node = Node::new(
+            node_id.clone(),
+            NodeKind::Import,
+            &import_name,
+            format!("{file_path}::{import_name}"),
+            file_path,
+            lang,
+            line,
+            end_line,
+        );
+        import_node.code_snippet =
+            extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
+
+        // Contains edge: file → import
+        result.edges.push(Edge::new(
+            parent_id.clone(),
+            node_id.clone(),
+            EdgeKind::Contains,
+        ));
+
+        // Create unresolved reference for the import
+        result.unresolved_references.push(UnresolvedReference {
+            from_node_id: node_id.clone(),
+            reference_name: import_name.clone(),
+            reference_kind: EdgeKind::Imports,
+            line,
+            column: node.start_position().column as u32,
+            candidates: vec![],
+        });
+
+        result.nodes.push(import_node);
+    }
+
+    /// Extract the module/package name from an import statement
+    fn extract_import_name(&self, node: TsNode<'_>, source: &str, lang: Language) -> Option<String> {
+        match lang {
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
+                // import ... from "source" → get "source" field
+                node.child_by_field_name("source")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
+            }
+            Language::Rust => {
+                // use foo::bar::baz → find the path
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    match child.kind() {
+                        "scoped_identifier" | "identifier" | "use_list"
+                        | "scoped_use_list" => {
+                            return child
+                                .utf8_text(source.as_bytes())
+                                .ok()
+                                .map(|s| s.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Language::Python => {
+                // import foo  OR  from foo import bar
+                node.child_by_field_name("module_name")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        // Fallback: find dotted_name child
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            if child.kind() == "dotted_name" {
+                                return child
+                                    .utf8_text(source.as_bytes())
+                                    .ok()
+                                    .map(|s| s.to_string());
+                            }
+                        }
+                        None
+                    })
+            }
+            Language::Go => {
+                // import "path" → get path field
+                node.child_by_field_name("path")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.trim_matches('"').to_string())
+            }
+            _ => {
+                // Generic: try to get text of the whole import
+                node.utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string())
+            }
+        }
+    }
+
+    // =========================================================================
+    // Call Extraction
+    // =========================================================================
+
+    /// Extract function calls from within a function/method subtree
+    fn extract_calls_from_subtree(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        file_path: &str,
+        from_node_id: &NodeId,
+        lang: Language,
+        config: &LanguageConfig,
+        call_type: &str,
+        result: &mut ExtractionResult,
+    ) {
+        self.find_calls_recursive(node, source, file_path, from_node_id, lang, config, call_type, result, 0);
+    }
+
+    /// Recursively find call expressions, skipping nested function definitions
+    fn find_calls_recursive(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        file_path: &str,
+        from_node_id: &NodeId,
+        lang: Language,
+        config: &LanguageConfig,
+        call_type: &str,
+        result: &mut ExtractionResult,
+        depth: usize,
+    ) {
+        // Skip nested function definitions to avoid attributing their calls to the parent
+        if depth > 0 && config.node_mappings.contains_key(node.kind()) {
+            let kind = &config.node_mappings[node.kind()].kind;
+            if matches!(kind, NodeKind::Function | NodeKind::Method) {
+                return;
+            }
+        }
+
+        if node.kind() == call_type {
+            if let Some(callee_name) = self.extract_callee_name(node, source, config) {
+                // Skip built-in symbols
+                let base_name = callee_name.split("::").last().unwrap_or(&callee_name);
+                let base_name = base_name.split('.').last().unwrap_or(base_name);
+                if !BUILTIN_SYMBOLS.contains(&base_name) {
+                    let line = node.start_position().row as u32 + 1;
+                    result.unresolved_references.push(UnresolvedReference {
+                        from_node_id: from_node_id.clone(),
+                        reference_name: callee_name,
+                        reference_kind: EdgeKind::Calls,
+                        line,
+                        column: node.start_position().column as u32,
+                        candidates: vec![],
+                    });
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.find_calls_recursive(
+                child, source, file_path, from_node_id, lang, config, call_type, result, depth + 1,
+            );
+        }
+    }
+
+    /// Extract the name of the called function from a call expression
+    fn extract_callee_name(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        config: &LanguageConfig,
+    ) -> Option<String> {
+        let func_field = config.call_function_field?;
+        let func_node = node.child_by_field_name(func_field)?;
+
+        match func_node.kind() {
+            // Direct function call: foo()
+            "identifier" => func_node
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string()),
+            // Method call: obj.method() (JS/TS/Python)
+            "member_expression" | "attribute" => {
+                // Extract just the method name (rightmost part)
+                func_node
+                    .child_by_field_name("property")
+                    .or_else(|| func_node.child_by_field_name("attribute"))
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.to_string())
+            }
+            // Rust: foo::bar() or self.method()
+            "scoped_identifier" => func_node
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string()),
+            "field_expression" => func_node
+                .child_by_field_name("field")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .map(|s| s.to_string()),
+            // Go: selector expression pkg.Func()
+            "selector_expression" => func_node
+                .child_by_field_name("field")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .map(|s| s.to_string()),
+            _ => {
+                // Fallback: use the full text
+                func_node
+                    .utf8_text(source.as_bytes())
+                    .ok()
+                    .map(|s| s.to_string())
+            }
+        }
+    }
+
+    // =========================================================================
+    // Inheritance Extraction
+    // =========================================================================
+
+    /// Extract inheritance relationships (extends/implements) from a class/interface/struct
+    fn extract_inheritance(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        _file_path: &str,
+        from_node_id: &NodeId,
+        lang: Language,
+        config: &LanguageConfig,
+        result: &mut ExtractionResult,
+    ) {
+        // Check config-defined inheritance node types
+        for (inherit_type, edge_kind) in &config.inheritance_node_types {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == *inherit_type {
+                    let type_names = self.extract_type_names(child, source);
+                    for type_name in type_names {
+                        let line = child.start_position().row as u32 + 1;
+                        result.unresolved_references.push(UnresolvedReference {
+                            from_node_id: from_node_id.clone(),
+                            reference_name: type_name,
+                            reference_kind: *edge_kind,
+                            line,
+                            column: child.start_position().column as u32,
+                            candidates: vec![],
+                        });
+                    }
+                }
+            }
+        }
+
+        // Python special handling: class Foo(Bar, Baz)
+        if lang == Language::Python {
+            self.extract_python_bases(node, source, from_node_id, result);
+        }
+    }
+
+    /// Extract type identifiers from an extends/implements clause
+    fn extract_type_names(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "type_identifier" | "identifier" | "generic_type" | "nested_type_identifier" => {
+                    // For generic_type, get just the type name (not the type params)
+                    if child.kind() == "generic_type" {
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            if let Ok(text) = name_node.utf8_text(source.as_bytes()) {
+                                names.push(text.to_string());
+                            }
+                        }
+                    } else if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                        names.push(text.to_string());
+                    }
+                }
+                _ => {
+                    // Recurse to find nested type identifiers
+                    let nested = self.extract_type_names(child, source);
+                    names.extend(nested);
+                }
+            }
+        }
+        names
+    }
+
+    /// Extract base classes from Python class definition: class Foo(Bar, Baz):
+    fn extract_python_bases(
+        &self,
+        node: TsNode<'_>,
+        source: &str,
+        from_node_id: &NodeId,
+        result: &mut ExtractionResult,
+    ) {
+        if let Some(superclasses) = node.child_by_field_name("superclasses") {
+            let mut cursor = superclasses.walk();
+            for child in superclasses.children(&mut cursor) {
+                if child.kind() == "identifier" || child.kind() == "attribute" {
+                    if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                        let name = text.to_string();
+                        if !BUILTIN_SYMBOLS.contains(&name.as_str()) {
+                            let line = child.start_position().row as u32 + 1;
+                            result.unresolved_references.push(UnresolvedReference {
+                                from_node_id: from_node_id.clone(),
+                                reference_name: name,
+                                reference_kind: EdgeKind::Extends,
+                                line,
+                                column: child.start_position().column as u32,
+                                candidates: vec![],
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Check if a member is private (for methods/fields)

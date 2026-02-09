@@ -4,7 +4,7 @@
 //! types to CodeGraph node kinds. The actual extraction is handled by a generic
 //! TreeSitterExtractor that uses these configurations.
 
-use codegraph_types::{Language, NodeKind};
+use codegraph_types::{EdgeKind, Language, NodeKind};
 use std::collections::HashMap;
 
 /// Configuration for extracting from a specific language
@@ -27,6 +27,18 @@ pub struct LanguageConfig {
 
     /// Node types that indicate "exported" or "public" visibility
     pub export_indicators: Vec<&'static str>,
+
+    /// Tree-sitter node types for import statements
+    pub import_node_types: Vec<&'static str>,
+
+    /// Tree-sitter node type for call expressions (e.g., "call_expression")
+    pub call_node_type: Option<&'static str>,
+
+    /// Field name to extract the called function from a call expression
+    pub call_function_field: Option<&'static str>,
+
+    /// Tree-sitter node types for inheritance clauses with their edge kinds
+    pub inheritance_node_types: Vec<(&'static str, EdgeKind)>,
 }
 
 /// Mapping from tree-sitter node type to CodeGraph node kind
@@ -105,6 +117,13 @@ fn typescript_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["export_statement"],
+        import_node_types: vec!["import_statement"],
+        call_node_type: Some("call_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![
+            ("extends_clause", EdgeKind::Extends),
+            ("implements_clause", EdgeKind::Implements),
+        ],
     }
 }
 
@@ -119,7 +138,13 @@ fn rust_config() -> LanguageConfig {
     mappings.insert("enum_item", NodeMapping::simple(NodeKind::Enum));
     mappings.insert("trait_item", NodeMapping::simple(NodeKind::Trait));
     mappings.insert("impl_item", NodeMapping::with_children(NodeKind::Module, vec!["function_item"]));
-    mappings.insert("mod_item", NodeMapping::simple(NodeKind::Module));
+    mappings.insert(
+        "mod_item",
+        NodeMapping::with_children(
+            NodeKind::Module,
+            vec!["function_item", "struct_item", "enum_item", "trait_item", "impl_item"],
+        ),
+    );
     mappings.insert("field_declaration", NodeMapping::simple(NodeKind::Field));
 
     LanguageConfig {
@@ -129,6 +154,10 @@ fn rust_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["visibility_modifier"],
+        import_node_types: vec!["use_declaration"],
+        call_node_type: Some("call_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![],
     }
 }
 
@@ -148,6 +177,10 @@ fn python_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec![],
+        import_node_types: vec!["import_statement", "import_from_statement"],
+        call_node_type: Some("call"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![],
     }
 }
 
@@ -165,6 +198,10 @@ fn go_config() -> LanguageConfig {
         name_field: "name",
         body_field: None,
         export_indicators: vec![], // Go uses capitalization
+        import_node_types: vec!["import_spec"],
+        call_node_type: Some("call_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![],
     }
 }
 
@@ -188,6 +225,13 @@ fn php_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["visibility_modifier"],
+        import_node_types: vec!["namespace_use_declaration"],
+        call_node_type: Some("function_call_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![
+            ("base_clause", EdgeKind::Extends),
+            ("class_interface_clause", EdgeKind::Implements),
+        ],
     }
 }
 
@@ -213,6 +257,13 @@ fn java_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["public"],
+        import_node_types: vec!["import_declaration"],
+        call_node_type: Some("method_invocation"),
+        call_function_field: Some("name"),
+        inheritance_node_types: vec![
+            ("superclass", EdgeKind::Extends),
+            ("super_interfaces", EdgeKind::Implements),
+        ],
     }
 }
 
@@ -237,6 +288,12 @@ fn csharp_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["public"],
+        import_node_types: vec!["using_directive"],
+        call_node_type: Some("invocation_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![
+            ("base_list", EdgeKind::Extends),
+        ],
     }
 }
 
@@ -261,6 +318,12 @@ fn ruby_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec![],
+        import_node_types: vec![],
+        call_node_type: Some("call"),
+        call_function_field: Some("method"),
+        inheritance_node_types: vec![
+            ("superclass", EdgeKind::Extends),
+        ],
     }
 }
 
@@ -289,6 +352,10 @@ fn dart_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec![], // Dart uses library-level exports, not declaration-level
+        import_node_types: vec!["import_or_export"],
+        call_node_type: None,
+        call_function_field: None,
+        inheritance_node_types: vec![],
     }
 }
 
@@ -319,6 +386,10 @@ fn swift_config() -> LanguageConfig {
         name_field: "name",
         body_field: Some("body"),
         export_indicators: vec!["public", "open"],
+        import_node_types: vec!["import_declaration"],
+        call_node_type: Some("call_expression"),
+        call_function_field: Some("function"),
+        inheritance_node_types: vec![],
     }
 }
 
@@ -343,6 +414,10 @@ fn graphql_config() -> LanguageConfig {
         name_field: "name",
         body_field: None,
         export_indicators: vec![],
+        import_node_types: vec![],
+        call_node_type: None,
+        call_function_field: None,
+        inheritance_node_types: vec![],
     }
 }
 
@@ -361,6 +436,10 @@ fn hcl_config() -> LanguageConfig {
         name_field: "identifier",
         body_field: Some("body"),
         export_indicators: vec![],
+        import_node_types: vec![],
+        call_node_type: None,
+        call_function_field: None,
+        inheritance_node_types: vec![],
     }
 }
 
