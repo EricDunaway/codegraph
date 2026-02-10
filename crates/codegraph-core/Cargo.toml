@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+onnx = ["codegraph-vectors/onnx"]
+
 [dependencies]
 codegraph-types = { path = "../codegraph-types" }
 codegraph-db = { path = "../codegraph-db" }
