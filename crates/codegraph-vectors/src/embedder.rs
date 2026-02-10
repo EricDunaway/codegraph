@@ -398,7 +398,7 @@ impl TextEmbedder {
             // Token-level embeddings (e.g. last_hidden_state [1, seq_len, dim]):
             // apply mean pooling across tokens
             let output_seq_len = total_elements / dimension;
-            Ok(mean_pool(&data, output_seq_len, dimension))
+            Ok(mean_pool(data, output_seq_len, dimension))
         } else {
             // Sentence-level embedding (e.g. sentence_embedding [1, dim]):
             // use directly, truncating to configured dimension
