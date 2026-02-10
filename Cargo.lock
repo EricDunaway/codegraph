@@ -377,6 +377,7 @@ dependencies = [
  "codegraph-db",
  "codegraph-graph",
  "codegraph-types",
+ "codegraph-vectors",
  "log",
  "rusqlite",
  "serde",

@@ -18,6 +18,6 @@ pub mod text_builder;
 
 pub use embedder::{EmbedderConfig, TextEmbedder};
 pub use error::VectorError;
-pub use search::{cosine_similarity, SimilarityResult, SimilaritySearch};
+pub use search::{cosine_similarity, SearchConfig, SimilarityResult, SimilaritySearch};
 pub use storage::VectorStorage;
 pub use text_builder::{EmbeddingTextBuilder, GraphContext, NodeEnrichment, TokenCounter};

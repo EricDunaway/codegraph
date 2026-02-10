@@ -210,6 +210,57 @@ impl<'a> ContextBuilder<'a> {
         self.finalize_context(subgraph, search_query)
     }
 
+    /// Build context from pre-selected seed node IDs (e.g. from semantic search)
+    ///
+    /// Similar to `build_for_query` but skips FTS search and uses the provided
+    /// node IDs directly as seeds. Each seed is expanded with shallow traversal.
+    pub fn build_for_seed_nodes(
+        &mut self,
+        seed_node_ids: &[&str],
+        query: &str,
+    ) -> Result<ContextResult, ContextError> {
+        let mut subgraph = Subgraph::default();
+        let mut visited: HashSet<String> = HashSet::new();
+
+        for node_id in seed_node_ids {
+            if visited.contains(*node_id) {
+                continue;
+            }
+
+            let node = match self.queries.get_node_by_id(self.conn, node_id)? {
+                Some(n) => n,
+                None => continue, // Skip missing nodes
+            };
+
+            subgraph.add_node(node.clone());
+            subgraph.roots.push(node.id.clone());
+            visited.insert(node_id.to_string());
+
+            // Shallow expansion of each seed
+            if self.options.include_callees || self.options.include_callers {
+                let traversal_opts = TraversalOptions {
+                    direction: if self.options.include_callees {
+                        TraversalDirection::Both
+                    } else {
+                        TraversalDirection::Incoming
+                    },
+                    max_depth: Some(1),
+                    limit: Some(5),
+                    include_start: false,
+                    edge_kinds: self.build_edge_kinds(),
+                    node_kinds: self.options.node_kinds.clone(),
+                };
+
+                let mut traverser = GraphTraverser::new(self.conn, self.queries);
+                if let Ok(result) = traverser.bfs(node_id, &traversal_opts) {
+                    self.merge_subgraph(&mut subgraph, &result.subgraph, &mut visited);
+                }
+            }
+        }
+
+        self.finalize_context(subgraph, query)
+    }
+
     /// Build context for a file
     pub fn build_for_file(&mut self, file_path: &str) -> Result<ContextResult, ContextError> {
         let mut subgraph = Subgraph::default();
@@ -493,6 +544,47 @@ mod tests {
         let result = builder.build_for_file("test.rs").unwrap();
 
         assert_eq!(result.context.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_build_for_seed_nodes() {
+        let (db, mut queries) = setup_test_db();
+
+        let func1 = create_test_node("f1", "processPayment", NodeKind::Function);
+        let func2 = create_test_node("f2", "validateOrder", NodeKind::Function);
+        let func3 = create_test_node("f3", "unrelatedFunc", NodeKind::Function);
+
+        queries.insert_node(db.conn(), &func1).unwrap();
+        queries.insert_node(db.conn(), &func2).unwrap();
+        queries.insert_node(db.conn(), &func3).unwrap();
+
+        let mut builder = ContextBuilder::new(db.conn(), &mut queries);
+        let result = builder
+            .build_for_seed_nodes(&["f1", "f2"], "payment processing")
+            .unwrap();
+
+        // Should include both seed nodes
+        assert_eq!(result.context.nodes.len(), 2);
+        assert_eq!(result.context.query, "payment processing");
+
+        // Should have both as roots
+        assert_eq!(result.context.roots.len(), 2);
+    }
+
+    #[test]
+    fn test_build_for_seed_nodes_missing_ids() {
+        let (db, mut queries) = setup_test_db();
+
+        let func1 = create_test_node("f1", "func1", NodeKind::Function);
+        queries.insert_node(db.conn(), &func1).unwrap();
+
+        let mut builder = ContextBuilder::new(db.conn(), &mut queries);
+        // "missing" doesn't exist, should be skipped gracefully
+        let result = builder
+            .build_for_seed_nodes(&["f1", "missing"], "test")
+            .unwrap();
+
+        assert_eq!(result.context.nodes.len(), 1);
     }
 
     #[test]

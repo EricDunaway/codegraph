@@ -6,6 +6,7 @@ use crate::protocol::{ContentBlock, ToolCallResult, ToolDefinition};
 use codegraph_context::{ContextBuilder, ContextFormat, ContextOptions};
 use codegraph_db::QueryBuilder;
 use codegraph_graph::{GraphQueryManager, GraphTraverser};
+use codegraph_vectors::{EmbedderConfig, SearchConfig, SimilaritySearch, TextEmbedder, VectorError, VectorStorage};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -242,7 +243,7 @@ impl McpTools {
         })
     }
 
-    /// Get context for a query
+    /// Get context for a query (semantic-first with FTS fallback)
     fn tool_context(
         conn: &Connection,
         queries: &mut QueryBuilder,
@@ -262,13 +263,63 @@ impl McpTools {
             ..Default::default()
         };
 
+        // Try semantic search first, fall back to FTS
+        let semantic_seeds = Self::try_semantic_search(conn, query, options.max_nodes);
+
         let mut builder = ContextBuilder::with_options(conn, queries, options);
-        let result = builder.build_for_query(query)?;
+        let result = if let Some(seeds) = semantic_seeds {
+            if !seeds.is_empty() {
+                let seed_refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+                builder.build_for_seed_nodes(&seed_refs, query)?
+            } else {
+                // Semantic search available but no hits - still fall back to FTS
+                builder.build_for_query(query)?
+            }
+        } else {
+            // Semantic search unavailable - use FTS
+            builder.build_for_query(query)?
+        };
 
         Ok(ToolCallResult {
             content: vec![ContentBlock::text(result.output)],
             is_error: false,
         })
+    }
+
+    /// Try semantic search, returning Some(node_ids) if available, None if unavailable
+    fn try_semantic_search(conn: &Connection, query: &str, limit: usize) -> Option<Vec<String>> {
+        let dimension = EmbedderConfig::default().dimension;
+        let storage = VectorStorage::new(dimension);
+
+        // Check if vectors exist
+        if storage.count(conn).unwrap_or(0) == 0 {
+            return None;
+        }
+
+        let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+        match embedder.load() {
+            Ok(()) => {}
+            Err(VectorError::ModelNotFound { .. } | VectorError::FeatureNotEnabled { .. }) => {
+                return None;
+            }
+            Err(e) => {
+                log::debug!("Failed to load embedder: {}", e);
+                return None;
+            }
+        }
+
+        let config = SearchConfig {
+            max_results: limit,
+            min_score: 0.3,
+        };
+        let mut search = SimilaritySearch::with_config(&storage, &mut embedder, config);
+        match search.search_by_text(conn, query) {
+            Ok(results) => Some(results.into_iter().map(|r| r.node_id).collect()),
+            Err(e) => {
+                log::debug!("Semantic search failed: {}", e);
+                None
+            }
+        }
     }
 
     /// Find callers of a node

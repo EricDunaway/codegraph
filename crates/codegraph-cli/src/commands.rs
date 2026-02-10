@@ -100,6 +100,13 @@ pub fn index(path: &Path) -> Result<(), CliError> {
         );
     }
 
+    if result.embeddings_generated > 0 {
+        println!(
+            "   {} embeddings generated",
+            style(result.embeddings_generated).cyan()
+        );
+    }
+
     Ok(())
 }
 

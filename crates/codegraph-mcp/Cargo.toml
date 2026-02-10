@@ -12,6 +12,7 @@ codegraph-types = { path = "../codegraph-types" }
 codegraph-db = { path = "../codegraph-db" }
 codegraph-graph = { path = "../codegraph-graph" }
 codegraph-context = { path = "../codegraph-context" }
+codegraph-vectors = { path = "../codegraph-vectors" }
 thiserror = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }

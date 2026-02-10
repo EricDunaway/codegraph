@@ -8,7 +8,7 @@ use codegraph_extraction::{ExtractionOrchestrator, IndexResult as ExtractionInde
 use codegraph_graph::{GraphQueryManager, GraphTraverser, ImpactRadius};
 use codegraph_resolution::ReferenceResolver;
 use codegraph_types::{Config, Node, NodeKind, SearchResult};
-use codegraph_vectors::{SimilarityResult, VectorStorage};
+use codegraph_vectors::{EmbedderConfig, SimilarityResult, TextEmbedder, VectorError, VectorStorage};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -211,18 +211,23 @@ impl CodeGraph {
             );
         }
 
+        // Generate embeddings if model is available
+        let embeddings_generated = self.generate_embeddings()?;
+
         let stats = IndexingResult {
             files_indexed,
             nodes_created,
             edges_created,
             references_resolved: resolved_count,
+            embeddings_generated,
         };
 
         log::info!(
-            "Indexing complete: {} files, {} nodes, {} edges",
+            "Indexing complete: {} files, {} nodes, {} edges, {} embeddings",
             stats.files_indexed,
             stats.nodes_created,
-            stats.edges_created
+            stats.edges_created,
+            stats.embeddings_generated,
         );
 
         Ok(stats)
@@ -374,6 +379,86 @@ impl CodeGraph {
         Ok(result)
     }
 
+    // ========== Embedding Generation ==========
+
+    /// Node kinds that should get embeddings for semantic search
+    const EMBEDDABLE_KINDS: &'static [NodeKind] = &[
+        NodeKind::Function,
+        NodeKind::Method,
+        NodeKind::Class,
+        NodeKind::Struct,
+        NodeKind::Interface,
+        NodeKind::Trait,
+        NodeKind::Enum,
+        NodeKind::Module,
+    ];
+
+    /// Generate embeddings for all embeddable nodes
+    ///
+    /// Tries to load the ONNX model. If the model is not found or the ONNX
+    /// feature is not enabled, logs a message and returns 0 (graceful skip).
+    fn generate_embeddings(&mut self) -> Result<usize, CodeGraphError> {
+        let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+        match embedder.load() {
+            Ok(()) => {}
+            Err(VectorError::ModelNotFound { .. }) => {
+                log::info!("Embedding model not found, skipping embedding generation. \
+                    Place nomic-embed-text-v1.5.onnx in .codegraph/models/ or ~/.codegraph/models/");
+                return Ok(0);
+            }
+            Err(VectorError::FeatureNotEnabled { .. }) => {
+                log::debug!("ONNX feature not enabled, skipping embedding generation");
+                return Ok(0);
+            }
+            Err(e) => return Err(CodeGraphError::Vector(e)),
+        }
+
+        // Initialize vectors table and clear stale vectors from previous index
+        let dimension = embedder.dimension();
+        let storage = VectorStorage::new(dimension);
+        storage.init(self.db.conn())?;
+        storage.clear(self.db.conn())?;
+
+        let model_name = "nomic-embed-text-v1.5";
+        let mut count = 0;
+
+        for kind in Self::EMBEDDABLE_KINDS {
+            let nodes = self.queries.get_nodes_by_kind(self.db.conn(), *kind)?;
+
+            for node in &nodes {
+                // Build rich embedding text with graph context
+                let text = match crate::embedding::build_embedding_text(
+                    self.db.conn(),
+                    &mut self.queries,
+                    node,
+                    &self.config.embedding,
+                ) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        log::debug!("Failed to build embedding text for {}: {}", node.id.0, e);
+                        continue;
+                    }
+                };
+
+                // Generate embedding with document prefix
+                let embedding = match embedder.embed_document(&text) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("Failed to embed {}: {}", node.id.0, e);
+                        continue;
+                    }
+                };
+
+                // Store embedding
+                storage.store(self.db.conn(), &node.id.0, &embedding, model_name)?;
+                count += 1;
+            }
+        }
+
+        log::info!("Generated {} embeddings", count);
+        Ok(count)
+    }
+
     // ========== Vector/Semantic Search ==========
 
     /// Store embedding for a node
@@ -406,6 +491,88 @@ impl CodeGraph {
         results.truncate(limit);
 
         Ok(results)
+    }
+
+    /// Semantic search using embeddings
+    ///
+    /// Loads the embedding model, embeds the query with `search_query:` prefix,
+    /// and finds the most similar nodes.
+    ///
+    /// Returns `None` if embeddings are unavailable (no vectors, no model, ONNX
+    /// feature disabled). Returns `Some(vec)` with results (possibly empty if
+    /// no nodes exceed the similarity threshold).
+    pub fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<SimilarityResult>>, CodeGraphError> {
+        use codegraph_vectors::SimilaritySearch;
+
+        let dimension = EmbedderConfig::default().dimension;
+        let storage = VectorStorage::new(dimension);
+
+        // Check if vectors table has data
+        let count = storage.count(self.db.conn()).unwrap_or(0);
+        if count == 0 {
+            return Ok(None); // Embeddings not available
+        }
+
+        let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+        match embedder.load() {
+            Ok(()) => {}
+            Err(VectorError::ModelNotFound { .. } | VectorError::FeatureNotEnabled { .. }) => {
+                return Ok(None); // Model not available
+            }
+            Err(e) => return Err(CodeGraphError::Vector(e)),
+        }
+
+        let config = codegraph_vectors::search::SearchConfig {
+            max_results: limit,
+            min_score: 0.3, // Reasonable threshold for code search
+        };
+        let mut search = SimilaritySearch::with_config(&storage, &mut embedder, config);
+        let results = search.search_by_text(self.db.conn(), query)?;
+        Ok(Some(results))
+    }
+
+    /// Build context using semantic search as primary, FTS as fallback
+    ///
+    /// 1. Try semantic search to find the most relevant seed nodes
+    /// 2. If semantic search returns results, build context around those seeds
+    /// 3. If embeddings unavailable (None), fall back to FTS-based context
+    /// 4. If embeddings available but no hits (Some(empty)), still fall back to FTS
+    pub fn build_context_semantic(
+        &mut self,
+        query: &str,
+    ) -> Result<ContextResult, CodeGraphError> {
+        self.build_context_semantic_with_options(query, ContextOptions::default())
+    }
+
+    /// Build context using semantic search with custom options
+    pub fn build_context_semantic_with_options(
+        &mut self,
+        query: &str,
+        options: ContextOptions,
+    ) -> Result<ContextResult, CodeGraphError> {
+        // Try semantic search first
+        if let Some(semantic_results) = self.semantic_search(query, options.max_nodes)? {
+            if !semantic_results.is_empty() {
+                // Use semantic results as seeds
+                let seed_ids: Vec<&str> = semantic_results
+                    .iter()
+                    .map(|r| r.node_id.as_str())
+                    .collect();
+
+                let mut builder = ContextBuilder::with_options(self.db.conn(), &mut self.queries, options);
+                let result = builder.build_for_seed_nodes(&seed_ids, query)?;
+                return Ok(result);
+            }
+        }
+
+        // Fall back to FTS-based context (embeddings unavailable OR no semantic hits)
+        let mut builder = ContextBuilder::with_options(self.db.conn(), &mut self.queries, options);
+        let result = builder.build_for_query(query)?;
+        Ok(result)
     }
 
     // ========== Statistics ==========
@@ -478,6 +645,8 @@ pub struct IndexingResult {
     pub edges_created: usize,
     /// Number of references resolved
     pub references_resolved: usize,
+    /// Number of embeddings generated
+    pub embeddings_generated: usize,
 }
 
 /// Project statistics
