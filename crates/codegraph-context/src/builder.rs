@@ -176,71 +176,32 @@ impl<'a> ContextBuilder<'a> {
             0,
         )?;
 
-        // Collect all nodes that should get BFS expansion (seeds + container children)
-        let mut expand_ids: Vec<String> = Vec::new();
-
         for result in results {
             if visited.contains(&result.node.id.0) {
                 continue;
             }
 
-            let node_id = result.node.id.0.clone();
             subgraph.add_node(result.node.clone());
             subgraph.roots.push(result.node.id.clone());
-            visited.insert(node_id.clone());
-            expand_ids.push(node_id.clone());
+            visited.insert(result.node.id.0.clone());
 
-            // Auto-expand container nodes (class, struct, module, etc.) to include
-            // their children. A class should always show its methods. The children
-            // also get BFS-expanded so their callees are discovered.
-            if matches!(
-                result.node.kind,
-                NodeKind::Class
-                    | NodeKind::Struct
-                    | NodeKind::Interface
-                    | NodeKind::Trait
-                    | NodeKind::Module
-                    | NodeKind::Namespace
-            ) {
-                let contains_edges = self.queries.get_outgoing_edges(
-                    self.conn,
-                    &node_id,
-                    Some(&[EdgeKind::Contains]),
-                )?;
-                for edge in contains_edges {
-                    if !visited.contains(&edge.target.0) {
-                        if let Some(child) =
-                            self.queries.get_node_by_id(self.conn, &edge.target.0)?
-                        {
-                            let child_id = child.id.0.clone();
-                            visited.insert(child_id.clone());
-                            subgraph.add_node(child);
-                            subgraph.add_edge(edge);
-                            expand_ids.push(child_id);
-                        }
-                    }
-                }
-            }
-        }
+            // Optionally expand each result
+            if self.options.include_callees || self.options.include_callers {
+                let traversal_opts = TraversalOptions {
+                    direction: if self.options.include_callees {
+                        TraversalDirection::Both
+                    } else {
+                        TraversalDirection::Incoming
+                    },
+                    max_depth: Some(1), // Shallow expansion for search results
+                    limit: Some(5),
+                    include_start: false,
+                    edge_kinds: self.build_edge_kinds(),
+                    node_kinds: self.options.node_kinds.clone(),
+                };
 
-        // BFS-expand all collected nodes (seeds + container children)
-        if self.options.include_callees || self.options.include_callers {
-            let traversal_opts = TraversalOptions {
-                direction: if self.options.include_callees {
-                    TraversalDirection::Both
-                } else {
-                    TraversalDirection::Incoming
-                },
-                max_depth: Some(1),
-                limit: Some(5),
-                include_start: false,
-                edge_kinds: self.build_edge_kinds(),
-                node_kinds: self.options.node_kinds.clone(),
-            };
-
-            for node_id in &expand_ids {
                 let mut traverser = GraphTraverser::new(self.conn, self.queries);
-                if let Ok(result) = traverser.bfs(node_id, &traversal_opts) {
+                if let Ok(result) = traverser.bfs(&result.node.id.0, &traversal_opts) {
                     self.merge_subgraph(&mut subgraph, &result.subgraph, &mut visited);
                 }
             }
