@@ -11,3 +11,6 @@ pub mod formatter;
 pub use builder::{ContextBuilder, ContextOptions, ContextResult};
 pub use error::ContextError;
 pub use formatter::{ContextFormat, ContextFormatter};
+
+/// Callback type for loading source code snippets by file path and line range
+pub(crate) type SourceLoader = dyn Fn(&str, u32, u32) -> Option<String>;

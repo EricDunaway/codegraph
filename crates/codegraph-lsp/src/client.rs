@@ -28,6 +28,9 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Timeout for graceful shutdown before force kill
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
+/// Map of pending response channels keyed by request ID
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, LspError>>>>>;
+
 /// Async LSP client supporting concurrent requests (I5)
 ///
 /// Uses a background task to read responses and dispatch them to waiting
@@ -43,7 +46,7 @@ pub struct LspClient {
     /// Request ID counter
     next_id: AtomicU64,
     /// Pending response channels by request ID
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, LspError>>>>>,
+    pending: PendingMap,
     /// Whether server is initialized
     initialized: Arc<Mutex<bool>>,
     /// Timeout for operations
@@ -82,7 +85,7 @@ impl LspClient {
             .take()
             .ok_or_else(|| LspError::StartFailed("Failed to get stdout".to_string()))?;
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, LspError>>>>> =
+        let pending: PendingMap =
             Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn background task to read and dispatch responses
@@ -108,7 +111,7 @@ impl LspClient {
     /// Background task that reads responses and dispatches to waiting requests
     async fn response_reader_task(
         stdout: ChildStdout,
-        pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, LspError>>>>>,
+        pending: PendingMap,
     ) {
         let mut reader = BufReader::new(stdout);
 
@@ -218,7 +221,7 @@ impl LspClient {
             uri: uri.clone(),
             name: root_uri
                 .path_segments()
-                .and_then(|s| s.last())
+                .and_then(|mut s| s.next_back())
                 .unwrap_or("workspace")
                 .to_string(),
         };

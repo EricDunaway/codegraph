@@ -120,6 +120,7 @@ pub fn find_test_names_for_symbol(source: &str, symbol_name: &str, language: Lan
         Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx => {
             // Look for describe blocks mentioning the symbol
             let describe_re = Regex::new(r#"describe\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
+            let it_re = Regex::new(r#"(?:it|test)\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
             for cap in describe_re.captures_iter(source) {
                 if let Some(name) = cap.get(1) {
                     let name_str = name.as_str();
@@ -127,7 +128,6 @@ pub fn find_test_names_for_symbol(source: &str, symbol_name: &str, language: Lan
                     if name_str.contains(symbol_name) {
                         // Find all it/test blocks within the general vicinity
                         // This is a simplification - full implementation would parse AST
-                        let it_re = Regex::new(r#"(?:it|test)\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
                         for it_cap in it_re.captures_iter(source) {
                             if let Some(test_name) = it_cap.get(1) {
                                 tests.push(test_name.as_str().to_string());
@@ -315,7 +315,7 @@ pub fn extract_imports(source: &str, language: Language) -> Vec<ImportInfo> {
             let import_re = Regex::new(r#"^import\s+([\w.]+)"#).unwrap();
             for cap in import_re.captures_iter(source) {
                 if let Some(module) = cap.get(1) {
-                    let name = module.as_str().split('.').last().unwrap_or(module.as_str());
+                    let name = module.as_str().split('.').next_back().unwrap_or(module.as_str());
                     imports.push(ImportInfo {
                         names: vec![name.to_string()],
                         path: module.as_str().to_string(),
@@ -376,9 +376,9 @@ pub fn extract_imports(source: &str, language: Language) -> Vec<ImportInfo> {
 
             // import block
             let block_re = Regex::new(r#"import\s*\(([^)]+)\)"#).unwrap();
+            let line_re = Regex::new(r#"(?:(\w+)\s+)?["']([^"']+)["']"#).unwrap();
             for cap in block_re.captures_iter(source) {
                 if let Some(block) = cap.get(1) {
-                    let line_re = Regex::new(r#"(?:(\w+)\s+)?["']([^"']+)["']"#).unwrap();
                     for line_cap in line_re.captures_iter(block.as_str()) {
                         let path = line_cap.get(2).map(|m| m.as_str()).unwrap_or("");
                         let name = line_cap.get(1)

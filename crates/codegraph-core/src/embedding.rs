@@ -101,7 +101,7 @@ mod tests {
 
     fn setup_test_graph() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Create nodes: main_fn calls helper_a, helper_b
         let main_fn = create_test_node("main_fn", "main_fn", NodeKind::Function);

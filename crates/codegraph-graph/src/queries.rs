@@ -1,13 +1,12 @@
 //! High-level graph queries
 
 use crate::error::GraphError;
-use crate::traversal::GraphTraverser;
 use codegraph_db::QueryBuilder;
 use codegraph_types::{
-    Edge, EdgeKind, Node, NodeId, NodeKind, Subgraph, TraversalDirection, TraversalOptions,
+    EdgeKind, Node, NodeId, NodeKind, Subgraph,
 };
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 /// Call graph representation
 #[derive(Debug, Default)]
@@ -101,7 +100,7 @@ impl<'a> GraphQueryManager<'a> {
             .map(|e| e.target.0.clone())
             .collect();
 
-        for (id, _) in &call_graph.subgraph.nodes {
+        for id in call_graph.subgraph.nodes.keys() {
             if !incoming_targets.contains(&id.0) {
                 call_graph.entry_points.push(id.clone());
             }
@@ -115,7 +114,7 @@ impl<'a> GraphQueryManager<'a> {
             .map(|e| e.source.0.clone())
             .collect();
 
-        for (id, _) in &call_graph.subgraph.nodes {
+        for id in call_graph.subgraph.nodes.keys() {
             if !outgoing_sources.contains(&id.0) {
                 call_graph.leaf_nodes.push(id.clone());
             }
@@ -253,7 +252,7 @@ impl<'a> GraphQueryManager<'a> {
                 let cycle_start = path.iter().position(|p| p == &neighbor_id);
                 if let Some(start) = cycle_start {
                     let cycle_nodes: Vec<NodeId> =
-                        path[start..].iter().map(|s| NodeId::new(s)).collect();
+                        path[start..].iter().map(NodeId::new).collect();
 
                     let files: Vec<String> = cycle_nodes
                         .iter()
@@ -423,7 +422,7 @@ impl<'a> GraphQueryManager<'a> {
 mod tests {
     use super::*;
     use codegraph_db::DatabaseConnection;
-    use codegraph_types::Language;
+    use codegraph_types::{Edge, Language};
 
     fn create_test_node(id: &str, name: &str, kind: NodeKind) -> Node {
         Node::new(
@@ -440,7 +439,7 @@ mod tests {
 
     fn setup_call_graph() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Create a call graph: main -> a -> b, main -> c, a -> c
         let main = create_test_node("main", "main", NodeKind::Function);

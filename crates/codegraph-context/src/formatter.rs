@@ -1,6 +1,7 @@
 //! Context formatting for different output formats
 
 use crate::error::ContextError;
+use crate::SourceLoader;
 use codegraph_types::{Edge, Node, Subgraph};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -281,12 +282,12 @@ impl ContextFormatter {
 pub fn format_subgraph(
     subgraph: &Subgraph,
     query: &str,
-    source_loader: Option<&dyn Fn(&str, u32, u32) -> Option<String>>,
+    source_loader: Option<&SourceLoader>,
 ) -> FormattedContext {
     let mut nodes: Vec<FormattedNode> = Vec::new();
     let mut files: HashMap<String, Vec<String>> = HashMap::new();
 
-    for (_, node) in &subgraph.nodes {
+    for node in subgraph.nodes.values() {
         let mut formatted = FormattedNode::from(node);
 
         // Load source if available
@@ -407,7 +408,7 @@ mod tests {
         let text = "This is a test string with multiple words";
         let tokens = ContextFormatter::estimate_tokens(text);
         // 42 chars / 4 = 10 tokens (approx)
-        assert!(tokens >= 10 && tokens <= 12);
+        assert!((10..=12).contains(&tokens));
     }
 
     #[test]

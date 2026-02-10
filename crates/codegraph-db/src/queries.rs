@@ -232,7 +232,7 @@ impl QueryBuilder {
             .query_row(
                 "SELECT * FROM nodes WHERE id = ?",
                 params![id],
-                |row| Self::row_to_node(row),
+                Self::row_to_node,
             )
             .optional()?;
 
@@ -250,7 +250,7 @@ impl QueryBuilder {
         )?;
 
         let nodes = stmt
-            .query_map(params![file_path], |row| Self::row_to_node(row))?
+            .query_map(params![file_path], Self::row_to_node)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(nodes)
@@ -261,7 +261,7 @@ impl QueryBuilder {
         let mut stmt = conn.prepare("SELECT * FROM nodes WHERE kind = ?")?;
 
         let nodes = stmt
-            .query_map(params![kind.as_str()], |row| Self::row_to_node(row))?
+            .query_map(params![kind.as_str()], Self::row_to_node)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(nodes)
@@ -548,7 +548,7 @@ impl QueryBuilder {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
                 let edges = stmt
-                    .query_map(params_refs.as_slice(), |row| Self::row_to_edge(row))?
+                    .query_map(params_refs.as_slice(), Self::row_to_edge)?
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(edges);
             }
@@ -556,7 +556,7 @@ impl QueryBuilder {
 
         let mut stmt = conn.prepare("SELECT * FROM edges WHERE source = ?")?;
         let edges = stmt
-            .query_map(params![source_id], |row| Self::row_to_edge(row))?
+            .query_map(params![source_id], Self::row_to_edge)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(edges)
     }
@@ -584,7 +584,7 @@ impl QueryBuilder {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
                 let edges = stmt
-                    .query_map(params_refs.as_slice(), |row| Self::row_to_edge(row))?
+                    .query_map(params_refs.as_slice(), Self::row_to_edge)?
                     .collect::<Result<Vec<_>, _>>()?;
                 return Ok(edges);
             }
@@ -592,7 +592,7 @@ impl QueryBuilder {
 
         let mut stmt = conn.prepare("SELECT * FROM edges WHERE target = ?")?;
         let edges = stmt
-            .query_map(params![target_id], |row| Self::row_to_edge(row))?
+            .query_map(params![target_id], Self::row_to_edge)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(edges)
     }
@@ -646,7 +646,7 @@ impl QueryBuilder {
         conn.query_row(
             "SELECT * FROM files WHERE path = ?",
             params![file_path],
-            |row| Self::row_to_file_record(row),
+            Self::row_to_file_record,
         )
         .optional()
         .map_err(DbError::from)
@@ -656,7 +656,7 @@ impl QueryBuilder {
     pub fn get_all_files(&self, conn: &Connection) -> Result<Vec<FileRecord>, DbError> {
         let mut stmt = conn.prepare("SELECT * FROM files ORDER BY path")?;
         let files = stmt
-            .query_map([], |row| Self::row_to_file_record(row))?
+            .query_map([], Self::row_to_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(files)
     }
@@ -694,7 +694,7 @@ impl QueryBuilder {
             "SELECT * FROM unresolved_refs WHERE reference_name = ?"
         )?;
         let refs = stmt
-            .query_map(params![name], |row| Self::row_to_unresolved_ref(row))?
+            .query_map(params![name], Self::row_to_unresolved_ref)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(refs)
     }
@@ -703,7 +703,7 @@ impl QueryBuilder {
     pub fn get_all_unresolved_refs(&self, conn: &Connection) -> Result<Vec<UnresolvedReference>, DbError> {
         let mut stmt = conn.prepare("SELECT * FROM unresolved_refs")?;
         let refs = stmt
-            .query_map([], |row| Self::row_to_unresolved_ref(row))?
+            .query_map([], Self::row_to_unresolved_ref)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(refs)
     }

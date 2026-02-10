@@ -16,6 +16,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tree_sitter::Node as TsNode;
 
+/// Shared context for AST extraction, bundling parameters passed through the recursive call chain
+struct ExtractionContext<'a> {
+    source: &'a str,
+    file_path: &'a str,
+    lang: Language,
+    config: &'a LanguageConfig,
+    result: &'a mut ExtractionResult,
+    seen_ids: &'a mut HashSet<String>,
+}
+
 /// Generic tree-sitter extractor that works with any configured language
 pub struct TreeSitterExtractor {
     parser: TreeSitterParser,
@@ -68,8 +78,18 @@ impl TreeSitterExtractor {
         let tree = self.parser.parse(source, lang)?;
         let root = tree.root_node();
 
-        // Walk the AST
-        self.walk_ast(root, source, file_path, &file_id, lang, &config, &mut result, &mut seen_ids);
+        // Walk the AST using extraction context to bundle recursive parameters
+        {
+            let mut ctx = ExtractionContext {
+                source,
+                file_path,
+                lang,
+                config: &config,
+                result: &mut result,
+                seen_ids: &mut seen_ids,
+            };
+            self.walk_ast(root, &file_id, &mut ctx);
+        }
 
         Ok(result)
     }
@@ -78,46 +98,41 @@ impl TreeSitterExtractor {
     fn walk_ast(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        file_path: &str,
         parent_id: &NodeId,
-        lang: Language,
-        config: &LanguageConfig,
-        result: &mut ExtractionResult,
-        seen_ids: &mut HashSet<String>,
+        ctx: &mut ExtractionContext<'_>,
     ) {
         let node_kind = node.kind();
 
         // Handle import statements before checking mapped nodes
-        if config.import_node_types.contains(&node_kind) {
-            self.extract_import(node, source, file_path, parent_id, lang, config, result, seen_ids);
+        if ctx.config.import_node_types.contains(&node_kind) {
+            self.extract_import(node, parent_id, ctx);
             return;
         }
 
         // Check if this node type is mapped
-        if let Some(mapping) = config.node_mappings.get(node_kind) {
+        if let Some(mapping) = ctx.config.node_mappings.get(node_kind) {
             // Extract this node
-            if let Some(name) = self.get_node_name(node, source, config) {
+            if let Some(name) = self.get_node_name(node, ctx.source, ctx.config) {
                 let line = node.start_position().row as u32 + 1;
                 let end_line = node.end_position().row as u32 + 1;
-                let decorators = self.extract_decorators(node, source, config);
-                let is_exported = self.is_exported(node, source, config, &name, lang);
+                let decorators = self.extract_decorators(node, ctx.source, ctx.config);
+                let is_exported = self.is_exported(node, ctx.source, ctx.config, &name, ctx.lang);
 
-                let node_id = generate_node_id(file_path, mapping.kind, &name, line);
+                let node_id = generate_node_id(ctx.file_path, mapping.kind, &name, line);
 
                 // Skip if already seen (prevents duplicates from multiple AST paths)
-                if seen_ids.contains(node_id.as_str()) {
+                if ctx.seen_ids.contains(node_id.as_str()) {
                     return;
                 }
-                seen_ids.insert(node_id.as_str().to_string());
+                ctx.seen_ids.insert(node_id.as_str().to_string());
 
                 let mut extracted_node = Node::new(
                     node_id.clone(),
                     mapping.kind,
                     &name,
-                    format!("{file_path}::{name}"),
-                    file_path,
-                    lang,
+                    format!("{}::{name}", ctx.file_path),
+                    ctx.file_path,
+                    ctx.lang,
                     line,
                     end_line,
                 );
@@ -129,10 +144,10 @@ impl TreeSitterExtractor {
                     Some(Visibility::Private)
                 };
                 extracted_node.code_snippet =
-                    extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
+                    extract_code_snippet_for_range(ctx.source, line, end_line, DEFAULT_MAX_LINES);
 
                 // Add contains edge from parent
-                result.edges.push(Edge::new(
+                ctx.result.edges.push(Edge::new(
                     parent_id.clone(),
                     node_id.clone(),
                     EdgeKind::Contains,
@@ -140,10 +155,8 @@ impl TreeSitterExtractor {
 
                 // Extract calls from function/method bodies
                 if matches!(mapping.kind, NodeKind::Function | NodeKind::Method) {
-                    if let Some(call_type) = config.call_node_type {
-                        self.extract_calls_from_subtree(
-                            node, source, file_path, &node_id, lang, config, call_type, result,
-                        );
+                    if let Some(call_type) = ctx.config.call_node_type {
+                        self.extract_calls_from_subtree(node, &node_id, call_type, ctx);
                     }
                 }
 
@@ -152,31 +165,29 @@ impl TreeSitterExtractor {
                     mapping.kind,
                     NodeKind::Class | NodeKind::Interface | NodeKind::Struct
                 ) {
-                    self.extract_inheritance(node, source, file_path, &node_id, lang, config, result);
+                    self.extract_inheritance(node, &node_id, ctx);
                 }
 
                 // If this node has children, process them with this node as parent
                 if mapping.has_children {
-                    if let Some(body_field) = config.body_field {
+                    if let Some(body_field) = ctx.config.body_field {
                         if let Some(body) = node.child_by_field_name(body_field) {
-                            self.process_children(
-                                body, source, file_path, &node_id, lang, config,
-                                &mapping.child_types, result, seen_ids,
-                            );
+                            let child_types = mapping.child_types.clone();
+                            self.process_children(body, &node_id, &child_types, ctx);
                         }
                     }
                 }
 
-                result.nodes.push(extracted_node);
+                ctx.result.nodes.push(extracted_node);
                 return; // Don't recurse into children we've already processed
             }
         }
 
         // Handle export statements specially (they wrap other declarations)
-        if config.export_indicators.contains(&node_kind) {
+        if ctx.config.export_indicators.contains(&node_kind) {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                self.walk_ast(child, source, file_path, parent_id, lang, config, result, seen_ids);
+                self.walk_ast(child, parent_id, ctx);
             }
             return;
         }
@@ -184,7 +195,7 @@ impl TreeSitterExtractor {
         // Recurse into children for unmapped nodes
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.walk_ast(child, source, file_path, parent_id, lang, config, result, seen_ids);
+            self.walk_ast(child, parent_id, ctx);
         }
     }
 
@@ -192,43 +203,38 @@ impl TreeSitterExtractor {
     fn process_children(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        file_path: &str,
         parent_id: &NodeId,
-        lang: Language,
-        config: &LanguageConfig,
         child_types: &[&str],
-        result: &mut ExtractionResult,
-        seen_ids: &mut HashSet<String>,
+        ctx: &mut ExtractionContext<'_>,
     ) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child_types.contains(&child.kind()) {
-                if let Some(mapping) = config.node_mappings.get(child.kind()) {
-                    if let Some(name) = self.get_node_name(child, source, config) {
+                if let Some(mapping) = ctx.config.node_mappings.get(child.kind()) {
+                    if let Some(name) = self.get_node_name(child, ctx.source, ctx.config) {
                         let line = child.start_position().row as u32 + 1;
                         let end_line = child.end_position().row as u32 + 1;
 
-                        let node_id = generate_node_id(file_path, mapping.kind, &name, line);
+                        let node_id = generate_node_id(ctx.file_path, mapping.kind, &name, line);
 
                         // Skip if already seen
-                        if seen_ids.contains(node_id.as_str()) {
+                        if ctx.seen_ids.contains(node_id.as_str()) {
                             continue;
                         }
-                        seen_ids.insert(node_id.as_str().to_string());
+                        ctx.seen_ids.insert(node_id.as_str().to_string());
 
-                        let decorators = self.extract_decorators(child, source, config);
+                        let decorators = self.extract_decorators(child, ctx.source, ctx.config);
 
                         // For methods, determine visibility based on name or modifiers
-                        let is_private = self.is_private_member(&name, child, source, lang);
+                        let is_private = self.is_private_member(&name, child, ctx.source, ctx.lang);
 
                         let mut extracted_node = Node::new(
                             node_id.clone(),
                             mapping.kind,
                             &name,
-                            format!("{file_path}::{name}"),
-                            file_path,
-                            lang,
+                            format!("{}::{name}", ctx.file_path),
+                            ctx.file_path,
+                            ctx.lang,
                             line,
                             end_line,
                         );
@@ -239,9 +245,9 @@ impl TreeSitterExtractor {
                             Some(Visibility::Public)
                         };
                         extracted_node.code_snippet =
-                            extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
+                            extract_code_snippet_for_range(ctx.source, line, end_line, DEFAULT_MAX_LINES);
 
-                        result.edges.push(Edge::new(
+                        ctx.result.edges.push(Edge::new(
                             parent_id.clone(),
                             node_id.clone(),
                             EdgeKind::Contains,
@@ -249,14 +255,12 @@ impl TreeSitterExtractor {
 
                         // Extract calls from method bodies
                         if matches!(mapping.kind, NodeKind::Function | NodeKind::Method) {
-                            if let Some(call_type) = config.call_node_type {
-                                self.extract_calls_from_subtree(
-                                    child, source, file_path, &node_id, lang, config, call_type, result,
-                                );
+                            if let Some(call_type) = ctx.config.call_node_type {
+                                self.extract_calls_from_subtree(child, &node_id, call_type, ctx);
                             }
                         }
 
-                        result.nodes.push(extracted_node);
+                        ctx.result.nodes.push(extracted_node);
                     }
                 }
             }
@@ -366,50 +370,45 @@ impl TreeSitterExtractor {
     fn extract_import(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        file_path: &str,
         parent_id: &NodeId,
-        lang: Language,
-        _config: &LanguageConfig,
-        result: &mut ExtractionResult,
-        seen_ids: &mut HashSet<String>,
+        ctx: &mut ExtractionContext<'_>,
     ) {
-        let import_name = match self.extract_import_name(node, source, lang) {
+        let import_name = match self.extract_import_name(node, ctx.source, ctx.lang) {
             Some(name) => name,
             None => return,
         };
 
         let line = node.start_position().row as u32 + 1;
         let end_line = node.end_position().row as u32 + 1;
-        let node_id = generate_node_id(file_path, NodeKind::Import, &import_name, line);
+        let node_id = generate_node_id(ctx.file_path, NodeKind::Import, &import_name, line);
 
-        if seen_ids.contains(node_id.as_str()) {
+        if ctx.seen_ids.contains(node_id.as_str()) {
             return;
         }
-        seen_ids.insert(node_id.as_str().to_string());
+        ctx.seen_ids.insert(node_id.as_str().to_string());
 
         let mut import_node = Node::new(
             node_id.clone(),
             NodeKind::Import,
             &import_name,
-            format!("{file_path}::{import_name}"),
-            file_path,
-            lang,
+            format!("{}::{import_name}", ctx.file_path),
+            ctx.file_path,
+            ctx.lang,
             line,
             end_line,
         );
         import_node.code_snippet =
-            extract_code_snippet_for_range(source, line, end_line, DEFAULT_MAX_LINES);
+            extract_code_snippet_for_range(ctx.source, line, end_line, DEFAULT_MAX_LINES);
 
         // Contains edge: file → import
-        result.edges.push(Edge::new(
+        ctx.result.edges.push(Edge::new(
             parent_id.clone(),
             node_id.clone(),
             EdgeKind::Contains,
         ));
 
         // Create unresolved reference for the import
-        result.unresolved_references.push(UnresolvedReference {
+        ctx.result.unresolved_references.push(UnresolvedReference {
             from_node_id: node_id.clone(),
             reference_name: import_name.clone(),
             reference_kind: EdgeKind::Imports,
@@ -418,7 +417,7 @@ impl TreeSitterExtractor {
             candidates: vec![],
         });
 
-        result.nodes.push(import_node);
+        ctx.result.nodes.push(import_node);
     }
 
     /// Extract the module/package name from an import statement
@@ -490,46 +489,38 @@ impl TreeSitterExtractor {
     fn extract_calls_from_subtree(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        file_path: &str,
         from_node_id: &NodeId,
-        lang: Language,
-        config: &LanguageConfig,
         call_type: &str,
-        result: &mut ExtractionResult,
+        ctx: &mut ExtractionContext<'_>,
     ) {
-        self.find_calls_recursive(node, source, file_path, from_node_id, lang, config, call_type, result, 0);
+        self.find_calls_recursive(node, from_node_id, call_type, 0, ctx);
     }
 
     /// Recursively find call expressions, skipping nested function definitions
     fn find_calls_recursive(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        file_path: &str,
         from_node_id: &NodeId,
-        lang: Language,
-        config: &LanguageConfig,
         call_type: &str,
-        result: &mut ExtractionResult,
         depth: usize,
+        ctx: &mut ExtractionContext<'_>,
     ) {
         // Skip nested function definitions to avoid attributing their calls to the parent
-        if depth > 0 && config.node_mappings.contains_key(node.kind()) {
-            let kind = &config.node_mappings[node.kind()].kind;
+        if depth > 0 && ctx.config.node_mappings.contains_key(node.kind()) {
+            let kind = &ctx.config.node_mappings[node.kind()].kind;
             if matches!(kind, NodeKind::Function | NodeKind::Method) {
                 return;
             }
         }
 
         if node.kind() == call_type {
-            if let Some(callee_name) = self.extract_callee_name(node, source, config) {
+            if let Some(callee_name) = self.extract_callee_name(node, ctx.source, ctx.config) {
                 // Skip built-in symbols
                 let base_name = callee_name.split("::").last().unwrap_or(&callee_name);
-                let base_name = base_name.split('.').last().unwrap_or(base_name);
+                let base_name = base_name.split('.').next_back().unwrap_or(base_name);
                 if !BUILTIN_SYMBOLS.contains(&base_name) {
                     let line = node.start_position().row as u32 + 1;
-                    result.unresolved_references.push(UnresolvedReference {
+                    ctx.result.unresolved_references.push(UnresolvedReference {
                         from_node_id: from_node_id.clone(),
                         reference_name: callee_name,
                         reference_kind: EdgeKind::Calls,
@@ -543,9 +534,7 @@ impl TreeSitterExtractor {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.find_calls_recursive(
-                child, source, file_path, from_node_id, lang, config, call_type, result, depth + 1,
-            );
+            self.find_calls_recursive(child, from_node_id, call_type, depth + 1, ctx);
         }
     }
 
@@ -606,22 +595,18 @@ impl TreeSitterExtractor {
     fn extract_inheritance(
         &self,
         node: TsNode<'_>,
-        source: &str,
-        _file_path: &str,
         from_node_id: &NodeId,
-        lang: Language,
-        config: &LanguageConfig,
-        result: &mut ExtractionResult,
+        ctx: &mut ExtractionContext<'_>,
     ) {
         // Check config-defined inheritance node types
-        for (inherit_type, edge_kind) in &config.inheritance_node_types {
+        for (inherit_type, edge_kind) in &ctx.config.inheritance_node_types {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == *inherit_type {
-                    let type_names = self.extract_type_names(child, source);
+                    let type_names = Self::extract_type_names(child, ctx.source);
                     for type_name in type_names {
                         let line = child.start_position().row as u32 + 1;
-                        result.unresolved_references.push(UnresolvedReference {
+                        ctx.result.unresolved_references.push(UnresolvedReference {
                             from_node_id: from_node_id.clone(),
                             reference_name: type_name,
                             reference_kind: *edge_kind,
@@ -635,13 +620,13 @@ impl TreeSitterExtractor {
         }
 
         // Python special handling: class Foo(Bar, Baz)
-        if lang == Language::Python {
-            self.extract_python_bases(node, source, from_node_id, result);
+        if ctx.lang == Language::Python {
+            self.extract_python_bases(node, ctx.source, from_node_id, ctx.result);
         }
     }
 
     /// Extract type identifiers from an extends/implements clause
-    fn extract_type_names(&self, node: TsNode<'_>, source: &str) -> Vec<String> {
+    fn extract_type_names(node: TsNode<'_>, source: &str) -> Vec<String> {
         let mut names = Vec::new();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -660,7 +645,7 @@ impl TreeSitterExtractor {
                 }
                 _ => {
                     // Recurse to find nested type identifiers
-                    let nested = self.extract_type_names(child, source);
+                    let nested = Self::extract_type_names(child, source);
                     names.extend(nested);
                 }
             }

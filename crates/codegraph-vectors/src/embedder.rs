@@ -283,7 +283,10 @@ impl TextEmbedder {
         Ok(format!("{:x}", hash))
     }
 
-    /// Generate embedding for a single text
+    /// Generate embedding for a single text (raw, no prefix)
+    ///
+    /// For models that use query/document prefixes (like nomic-embed-text-v1.5),
+    /// prefer `embed_query()` or `embed_document()` instead.
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>, VectorError> {
         #[cfg(feature = "onnx")]
         {
@@ -296,7 +299,25 @@ impl TextEmbedder {
         }
     }
 
-    /// Generate embeddings for multiple texts
+    /// Generate embedding for a search query
+    ///
+    /// Prepends the `search_query: ` prefix required by nomic-embed-text-v1.5
+    /// for asymmetric query-document retrieval.
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>, VectorError> {
+        let prefixed = format!("search_query: {}", query);
+        self.embed(&prefixed)
+    }
+
+    /// Generate embedding for a document (code symbol text)
+    ///
+    /// Prepends the `search_document: ` prefix required by nomic-embed-text-v1.5
+    /// for asymmetric query-document retrieval.
+    pub fn embed_document(&mut self, document: &str) -> Result<Vec<f32>, VectorError> {
+        let prefixed = format!("search_document: {}", document);
+        self.embed(&prefixed)
+    }
+
+    /// Generate embeddings for multiple texts (raw, no prefix)
     pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, VectorError> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
@@ -371,12 +392,17 @@ impl TextEmbedder {
             .try_extract_tensor::<f32>()
             .map_err(|e| VectorError::InferenceFailed(e.to_string()))?;
 
-        let embedding: Vec<f32> = data.iter().take(dimension).copied().collect();
-
-        // Mean pooling if we got token embeddings (use standalone function to avoid borrow issues)
-        if embedding.len() > dimension {
-            Ok(mean_pool(&embedding, seq_len, dimension))
+        // Determine output shape: token-level [1, seq_len, dim] vs sentence-level [1, dim]
+        let total_elements = data.len();
+        if total_elements > dimension && total_elements % dimension == 0 {
+            // Token-level embeddings (e.g. last_hidden_state [1, seq_len, dim]):
+            // apply mean pooling across tokens
+            let output_seq_len = total_elements / dimension;
+            Ok(mean_pool(&data, output_seq_len, dimension))
         } else {
+            // Sentence-level embedding (e.g. sentence_embedding [1, dim]):
+            // use directly, truncating to configured dimension
+            let embedding: Vec<f32> = data.iter().take(dimension).copied().collect();
             Ok(embedding)
         }
     }

@@ -678,9 +678,8 @@ mod tests {
         let result = McpTools::tool_search(db.conn(), &queries, args, &git_status).unwrap();
 
         assert!(!result.is_error);
-        if let ContentBlock::Text { text } = &result.content[0] {
-            assert!(text.contains("myFunction"));
-        }
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("myFunction"));
     }
 
     #[test]
@@ -696,9 +695,8 @@ mod tests {
         let result = McpTools::tool_node(db.conn(), &mut queries, args, &git_status).unwrap();
 
         assert!(!result.is_error);
-        if let ContentBlock::Text { text } = &result.content[0] {
-            assert!(text.contains("myFunction"));
-            assert!(text.contains("function"));
-        }
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("myFunction"));
+        assert!(text.contains("function"));
     }
 }

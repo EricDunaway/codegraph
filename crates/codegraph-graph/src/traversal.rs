@@ -515,7 +515,7 @@ mod tests {
 
     fn setup_test_graph() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Create nodes: A -> B -> C, A -> D
         let node_a = create_test_node("a", "funcA", NodeKind::Function);
@@ -679,7 +679,7 @@ mod tests {
     fn setup_cyclic_graph() -> (DatabaseConnection, QueryBuilder) {
         // fn_a -> fn_b -> fn_c -> fn_a (cycle!)
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         let node_a = create_test_node("fn_a", "fn_a", NodeKind::Function);
         let node_b = create_test_node("fn_b", "fn_b", NodeKind::Function);
@@ -719,7 +719,7 @@ mod tests {
     fn setup_container_graph() -> (DatabaseConnection, QueryBuilder) {
         // Class MyClass contains method1, method2, method3
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         let class_node = create_test_node("my_class", "MyClass", NodeKind::Class);
         let method1 = create_test_node("method1", "method1", NodeKind::Method);
@@ -768,7 +768,7 @@ mod tests {
     fn setup_inheritance_graph() -> (DatabaseConnection, QueryBuilder) {
         // PaymentService extends BaseService, implements IPayment, IRefundable
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         let payment_service = create_test_node("payment_service", "PaymentService", NodeKind::Class);
         let base_service = create_test_node("base_service", "BaseService", NodeKind::Class);
@@ -826,7 +826,7 @@ mod tests {
 
     fn setup_graph_with_decorated_nodes() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Caller node
         let caller = create_test_node("caller", "caller", NodeKind::Function);
@@ -864,7 +864,7 @@ mod tests {
 
     fn setup_graph_with_call_counts() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // fn_popular - will be called by many
         let fn_popular = create_test_node("fn_popular", "fn_popular", NodeKind::Function);
@@ -908,7 +908,7 @@ mod tests {
 
     fn setup_graph_with_same_priority() -> (DatabaseConnection, QueryBuilder) {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let mut queries = QueryBuilder::new(db.conn()).unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Caller node
         let caller = create_test_node("caller", "caller", NodeKind::Function);

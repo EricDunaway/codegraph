@@ -55,9 +55,9 @@ pub fn extract_documentation(hover: &Hover) -> Option<String> {
         HoverContents::Markup(markup) => Some(markup.value.clone()),
         HoverContents::Scalar(MarkedString::String(s)) => Some(s.clone()),
         HoverContents::Scalar(MarkedString::LanguageString(ls)) => Some(ls.value.clone()),
-        HoverContents::Array(contents) => contents.iter().find_map(|ms| match ms {
-            MarkedString::String(s) => Some(s.clone()),
-            MarkedString::LanguageString(ls) => Some(ls.value.clone()),
+        HoverContents::Array(contents) => contents.first().map(|ms| match ms {
+            MarkedString::String(s) => s.clone(),
+            MarkedString::LanguageString(ls) => ls.value.clone(),
         }),
     }
 }
@@ -189,14 +189,12 @@ impl BaseEnricher {
     }
 
     /// Get a clone of the client Arc (minimal lock hold time)
-    fn get_client(&self) -> impl std::future::Future<Output = Result<Arc<LspClient>, LspError>> + '_ {
-        async {
-            let guard = self.client.lock().await;
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| LspError::NotReady("Server not started".to_string()))
-        }
+    async fn get_client(&self) -> Result<Arc<LspClient>, LspError> {
+        let guard = self.client.lock().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| LspError::NotReady("Server not started".to_string()))
     }
 
     /// Execute a hover query (can be called concurrently - I5)

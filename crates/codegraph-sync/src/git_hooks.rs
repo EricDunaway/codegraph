@@ -21,8 +21,6 @@ codegraph sync "$PWD" &
 
 /// Manages git hooks for automatic sync
 pub struct GitHooksManager {
-    /// Path to the repository
-    repo_path: PathBuf,
     /// Path to .git/hooks directory
     hooks_dir: PathBuf,
 }
@@ -42,7 +40,6 @@ impl GitHooksManager {
         let hooks_dir = git_dir.join("hooks");
 
         Ok(Self {
-            repo_path,
             hooks_dir,
         })
     }

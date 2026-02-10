@@ -1,6 +1,6 @@
 //! CodeGraph configuration
 
-use codegraph_types::{EmbeddingTextConfig, EnrichmentConfig, LspConfig, LspScope};
+use codegraph_types::{EmbeddingTextConfig, EnrichmentConfig, LspConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -265,7 +265,7 @@ impl CodeGraphConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codegraph_types::LspServerConfig;
+    use codegraph_types::{LspScope, LspServerConfig};
     use tempfile::TempDir;
 
     #[test]

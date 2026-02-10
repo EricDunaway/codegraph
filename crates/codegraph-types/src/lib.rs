@@ -644,6 +644,7 @@ pub struct Node {
 
 impl Node {
     /// Create a new node with required fields
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<NodeId>,
         kind: NodeKind,
@@ -1966,8 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_symbols_not_empty() {
-        assert!(!BUILTIN_SYMBOLS.is_empty());
+    fn test_builtin_symbols() {
         assert!(BUILTIN_SYMBOLS.contains(&"console"));
         assert!(BUILTIN_SYMBOLS.contains(&"React"));
         assert!(BUILTIN_SYMBOLS.contains(&"print"));
@@ -1975,7 +1975,6 @@ mod tests {
 
     #[test]
     fn test_default_exclude_patterns() {
-        assert!(!DEFAULT_EXCLUDE.is_empty());
         assert!(DEFAULT_EXCLUDE.contains(&"**/node_modules/**"));
         assert!(DEFAULT_EXCLUDE.contains(&"**/.git/**"));
         assert!(DEFAULT_EXCLUDE.contains(&"**/target/**"));
@@ -2138,14 +2137,12 @@ mod tests {
         let default_hash = default_config.version_hash();
 
         // Each field change should produce a different hash
-        let configs = vec![
-            EmbeddingTextConfig { max_tokens: 1000, ..Default::default() },
+        let configs = [EmbeddingTextConfig { max_tokens: 1000, ..Default::default() },
             EmbeddingTextConfig { max_callees: 5, ..Default::default() },
             EmbeddingTextConfig { max_callers: 10, ..Default::default() },
             EmbeddingTextConfig { max_siblings: 4, ..Default::default() },
             EmbeddingTextConfig { max_snippet_lines: 25, ..Default::default() },
-            EmbeddingTextConfig { git_activity_boost: true, ..Default::default() },
-        ];
+            EmbeddingTextConfig { git_activity_boost: true, ..Default::default() }];
 
         for (i, config) in configs.iter().enumerate() {
             let hash = config.version_hash();

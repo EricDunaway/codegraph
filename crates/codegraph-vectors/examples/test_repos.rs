@@ -69,7 +69,7 @@ fn main() {
             Ok(emb) => {
                 let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
                 println!("{}", label);
-                println!("  File: {}", path.split('/').last().unwrap_or(path));
+                println!("  File: {}", path.split('/').next_back().unwrap_or(path));
                 println!("  Content length: {} chars", content.len());
                 println!("  Embedding norm: {:.4}", norm);
                 embeddings.push((*label, emb));

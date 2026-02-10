@@ -291,10 +291,8 @@ fn get_files_for_nodes(conn: &Connection, node_ids: &[String]) -> Result<HashSet
             .collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
-        for file_result in rows {
-            if let Ok(file) = file_result {
-                files.insert(file);
-            }
+        for file in rows.flatten() {
+            files.insert(file);
         }
     }
 

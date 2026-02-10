@@ -377,10 +377,10 @@ impl CodeGraph {
     // ========== Vector/Semantic Search ==========
 
     /// Store embedding for a node
-    pub fn store_embedding(&self, node_id: &str, embedding: &[f32], text: &str) -> Result<(), CodeGraphError> {
+    pub fn store_embedding(&self, node_id: &str, embedding: &[f32], model: &str) -> Result<(), CodeGraphError> {
         let dimension = embedding.len();
         let storage = VectorStorage::new(dimension);
-        storage.store(self.db.conn(), node_id, embedding, text)?;
+        storage.store(self.db.conn(), node_id, embedding, model)?;
         Ok(())
     }
 

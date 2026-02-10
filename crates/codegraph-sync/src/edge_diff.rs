@@ -56,10 +56,8 @@ impl EdgeSnapshot {
             });
 
             if let Ok(rows) = rows {
-                for edge_result in rows {
-                    if let Ok(edge) = edge_result {
-                        snapshot.add_edge(edge);
-                    }
+                for edge in rows.flatten() {
+                    snapshot.add_edge(edge);
                 }
             }
         }
@@ -98,10 +96,8 @@ impl EdgeSnapshot {
                     kind: row.get(2)?,
                 })
             }) {
-                for edge_result in rows {
-                    if let Ok(edge) = edge_result {
-                        snapshot.add_edge(edge);
-                    }
+                for edge in rows.flatten() {
+                    snapshot.add_edge(edge);
                 }
             }
         }

@@ -164,7 +164,7 @@ mod tests {
     fn test_extract_code_snippet_middle_of_file() {
         let source = "line1\nline2\nline3\nline4\nline5";
         let node = make_test_node(2, 4);
-        let snippet = extract_code_snippet(&source, &node, 50);
+        let snippet = extract_code_snippet(source, &node, 50);
 
         assert!(snippet.is_some());
         let snippet = snippet.unwrap();
@@ -180,7 +180,7 @@ mod tests {
 }"#;
 
         let node = make_test_node(1, 5);
-        let snippet = extract_code_snippet(&source, &node, 50);
+        let snippet = extract_code_snippet(source, &node, 50);
 
         assert!(snippet.is_some());
         let snippet = snippet.unwrap();

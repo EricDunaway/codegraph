@@ -6,8 +6,9 @@ use crate::error::ContextError;
 use crate::formatter::{format_subgraph, ContextFormat, ContextFormatter, FormattedContext};
 use codegraph_db::QueryBuilder;
 use codegraph_graph::{GraphQueryManager, GraphTraverser};
-use codegraph_types::{EdgeKind, Node, NodeKind, Subgraph, TraversalDirection, TraversalOptions};
+use codegraph_types::{EdgeKind, NodeKind, Subgraph, TraversalDirection, TraversalOptions};
 use rusqlite::Connection;
+use crate::SourceLoader;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -147,8 +148,8 @@ impl<'a> ContextBuilder<'a> {
         }
 
         // Get type hierarchy if applicable
-        if self.options.include_types {
-            if matches!(
+        if self.options.include_types
+            && matches!(
                 root_node.kind,
                 NodeKind::Class | NodeKind::Struct | NodeKind::Interface | NodeKind::Trait
             ) {
@@ -156,7 +157,6 @@ impl<'a> ContextBuilder<'a> {
                 let hierarchy = query_manager.get_type_hierarchy(node_id)?;
                 self.merge_subgraph(&mut subgraph, &hierarchy, &mut visited);
             }
-        }
 
         self.finalize_context(subgraph, query)
     }
@@ -213,7 +213,6 @@ impl<'a> ContextBuilder<'a> {
     /// Build context for a file
     pub fn build_for_file(&mut self, file_path: &str) -> Result<ContextResult, ContextError> {
         let mut subgraph = Subgraph::default();
-        let visited: HashSet<String> = HashSet::new();
 
         // Get all nodes in the file
         let nodes = self.queries.get_nodes_by_file(self.conn, file_path)?;
@@ -336,7 +335,7 @@ impl<'a> ContextBuilder<'a> {
         let max_lines = self.options.max_source_lines;
         let include_source = self.options.include_source;
 
-        let source_loader: Option<Box<dyn Fn(&str, u32, u32) -> Option<String>>> =
+        let source_loader: Option<Box<SourceLoader>> =
             if include_source {
                 Some(Box::new(move |file_path: &str, start: u32, end: u32| {
                     load_source_lines(file_path, start, end, max_lines, base_path.as_deref())
@@ -412,7 +411,7 @@ fn load_source_lines(
 mod tests {
     use super::*;
     use codegraph_db::DatabaseConnection;
-    use codegraph_types::{Edge, Language};
+    use codegraph_types::{Edge, Language, Node};
 
     fn create_test_node(id: &str, name: &str, kind: NodeKind) -> Node {
         Node::new(
@@ -459,7 +458,7 @@ mod tests {
         let mut builder = ContextBuilder::new(db.conn(), &mut queries);
         let result = builder.build_for_node("main", "test context").unwrap();
 
-        assert!(result.context.nodes.len() >= 1);
+        assert!(!result.context.nodes.is_empty());
         assert_eq!(result.context.query, "test context");
     }
 
@@ -477,7 +476,7 @@ mod tests {
         let result = builder.build_for_query("getUser").unwrap();
 
         // Should find both functions
-        assert!(result.context.nodes.len() >= 1);
+        assert!(!result.context.nodes.is_empty());
     }
 
     #[test]

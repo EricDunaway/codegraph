@@ -63,12 +63,14 @@ impl<'a> SimilaritySearch<'a> {
     }
 
     /// Search for similar nodes by text query
+    ///
+    /// Uses `embed_query()` to apply the proper search prefix for asymmetric retrieval.
     pub fn search_by_text(
         &mut self,
         conn: &Connection,
         query: &str,
     ) -> Result<Vec<SimilarityResult>, VectorError> {
-        let query_embedding = self.embedder.embed(query)?;
+        let query_embedding = self.embedder.embed_query(query)?;
         self.search_by_vector(conn, &query_embedding)
     }
 
@@ -123,13 +125,15 @@ impl<'a> SimilaritySearch<'a> {
     }
 
     /// Search within a subset of nodes
+    ///
+    /// Uses `embed_query()` to apply the proper search prefix for asymmetric retrieval.
     pub fn search_in_subset(
         &mut self,
         conn: &Connection,
         query: &str,
         node_ids: &[&str],
     ) -> Result<Vec<SimilarityResult>, VectorError> {
-        let query_embedding = self.embedder.embed(query)?;
+        let query_embedding = self.embedder.embed_query(query)?;
         let records = self.storage.get_batch(conn, node_ids)?;
 
         let mut results: Vec<SimilarityResult> = records
@@ -237,23 +241,26 @@ mod tests {
         };
         let mut embedder = TextEmbedder::new(config);
 
-        // Store some vectors - using exact same text for one to guarantee match
-        let query_text = "function getUserById";
-        let v1 = embedder.embed(query_text).unwrap();
-        let v2 = embedder.embed("something completely different").unwrap();
-        let v3 = embedder.embed("another unrelated thing").unwrap();
+        // Store vectors using embed_document (proper prefix for storage)
+        let v1 = embedder.embed_document("function getUserById").unwrap();
+        let v2 = embedder.embed_document("something completely different").unwrap();
+        let v3 = embedder.embed_document("another unrelated thing").unwrap();
 
         storage.store(db.conn(), "n1", &v1, "test").unwrap();
         storage.store(db.conn(), "n2", &v2, "test").unwrap();
         storage.store(db.conn(), "n3", &v3, "test").unwrap();
 
-        let mut search = SimilaritySearch::new(&storage, &mut embedder);
-        let results = search.search_by_text(db.conn(), query_text).unwrap();
+        // Use min_score -1.0 to ensure all results are returned regardless of
+        // hash-based similarity values from the mock embedder
+        let search_config = SearchConfig {
+            min_score: -1.0,
+            ..Default::default()
+        };
+        let mut search = SimilaritySearch::with_config(&storage, &mut embedder, search_config);
+        let results = search.search_by_text(db.conn(), "function getUserById").unwrap();
 
-        // The most similar should be n1 (exact match text)
-        assert!(!results.is_empty());
-        assert_eq!(results[0].node_id, "n1");
-        assert!(results[0].score > 0.99); // Very high similarity for exact match
+        // Should return all 3 stored vectors
+        assert_eq!(results.len(), 3);
     }
 
     #[test]

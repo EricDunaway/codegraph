@@ -37,7 +37,7 @@ impl TreeSitterParser {
 
     /// Get or create a parser for a language
     fn get_or_create_parser(&mut self, lang: Language) -> Result<&mut Parser, ExtractionError> {
-        if !self.parsers.contains_key(&lang) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.parsers.entry(lang) {
             let mut parser = Parser::new();
             let ts_lang = get_tree_sitter_language(lang)?;
             parser.set_language(&ts_lang).map_err(|e| {
@@ -46,7 +46,7 @@ impl TreeSitterParser {
                     message: format!("Failed to set language: {e}"),
                 }
             })?;
-            self.parsers.insert(lang, parser);
+            e.insert(parser);
         }
         Ok(self.parsers.get_mut(&lang).unwrap())
     }
