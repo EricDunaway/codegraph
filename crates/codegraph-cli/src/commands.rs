@@ -75,10 +75,22 @@ pub fn index(path: &Path) -> Result<(), CliError> {
     );
     pb.set_message("Scanning files...");
 
-    let mut cg = CodeGraph::open(&path)?;
+    let mut cg = match CodeGraph::open(&path) {
+        Ok(cg) => cg,
+        Err(e) => {
+            pb.finish_and_clear();
+            return Err(e.into());
+        }
+    };
     pb.set_message("Extracting code...");
 
-    let result = cg.index_all()?;
+    let result = match cg.index_all() {
+        Ok(r) => r,
+        Err(e) => {
+            pb.finish_and_clear();
+            return Err(e.into());
+        }
+    };
 
     pb.finish_and_clear();
 
@@ -128,8 +140,20 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
     );
     pb.set_message("Checking for changes...");
 
-    let mut cg = CodeGraph::open(&path)?;
-    let result = cg.sync()?;
+    let mut cg = match CodeGraph::open(&path) {
+        Ok(cg) => cg,
+        Err(e) => {
+            pb.finish_and_clear();
+            return Err(e.into());
+        }
+    };
+    let result = match cg.sync() {
+        Ok(r) => r,
+        Err(e) => {
+            pb.finish_and_clear();
+            return Err(e.into());
+        }
+    };
 
     pb.finish_and_clear();
 
