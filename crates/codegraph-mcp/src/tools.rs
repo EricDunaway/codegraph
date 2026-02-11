@@ -205,7 +205,7 @@ impl McpTools {
     /// Search for symbols
     fn tool_search(
         conn: &Connection,
-        queries: &QueryBuilder,
+        queries: &mut QueryBuilder,
         args: Value,
         git_status: &GitStatus,
     ) -> Result<ToolCallResult, McpError> {
@@ -216,7 +216,48 @@ impl McpTools {
 
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
-        let results = queries.search_nodes(conn, query, None, None, limit, 0)?;
+        let fts_results = queries.search_nodes(conn, query, None, None, limit, 0)?;
+
+        // Add parent containers of matched symbols (e.g. find "login" → also show AuthService)
+        let mut seen: std::collections::HashSet<String> = fts_results
+            .iter()
+            .map(|r| r.node.id.as_str().to_string())
+            .collect();
+        let mut results = fts_results;
+
+        if results.len() < limit {
+            let matched_ids: Vec<String> = results
+                .iter()
+                .map(|r| r.node.id.as_str().to_string())
+                .collect();
+            for node_id in &matched_ids {
+                if results.len() >= limit {
+                    break;
+                }
+                // Find parent via contains edge (parent --contains--> matched node)
+                let parents = queries.get_incoming_edges(
+                    conn,
+                    node_id,
+                    Some(&[codegraph_types::EdgeKind::Contains]),
+                )?;
+                for edge in parents {
+                    if seen.contains(edge.source.as_str()) {
+                        continue;
+                    }
+                    if let Ok(Some(parent)) = queries.get_node_by_id(conn, edge.source.as_str()) {
+                        seen.insert(edge.source.as_str().to_string());
+                        results.push(codegraph_types::SearchResult {
+                            node: parent,
+                            score: 0.0,
+                            highlights: Vec::new(),
+                        });
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         let mut output = format!("Found {} results for '{}':\n\n", results.len(), query);
         let mut file_paths: Vec<&str> = Vec::new();
@@ -719,14 +760,14 @@ mod tests {
     #[test]
     fn test_tool_search() {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let queries = QueryBuilder::new(db.conn()).unwrap();
+        let mut queries = QueryBuilder::new(db.conn()).unwrap();
 
         let node = create_test_node("n1", "myFunction", NodeKind::Function);
         queries.insert_node(db.conn(), &node).unwrap();
 
         let git_status = GitStatus::default();
         let args = json!({"query": "myFunction"});
-        let result = McpTools::tool_search(db.conn(), &queries, args, &git_status).unwrap();
+        let result = McpTools::tool_search(db.conn(), &mut queries, args, &git_status).unwrap();
 
         assert!(!result.is_error);
         let ContentBlock::Text { text } = &result.content[0];
