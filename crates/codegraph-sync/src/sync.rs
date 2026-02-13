@@ -59,6 +59,10 @@ pub struct SyncResult {
     pub duration_ms: u64,
     /// Selective scope for enrichment (nodes/files needing re-enrichment)
     pub enrichment_scope: SelectiveScope,
+    /// Node IDs that were removed during sync (from modified + deleted files)
+    pub deleted_node_ids: Vec<String>,
+    /// File paths that changed (added, modified, or deleted)
+    pub changed_file_paths: Vec<String>,
 }
 
 /// Configuration for sync
@@ -187,6 +191,8 @@ impl SyncManager {
             had_changes,
             duration_ms,
             enrichment_scope,
+            deleted_node_ids: Vec::new(),
+            changed_file_paths: changed_files,
         })
     }
 
@@ -236,6 +242,8 @@ impl SyncManager {
             had_changes,
             duration_ms,
             enrichment_scope,
+            deleted_node_ids: Vec::new(),
+            changed_file_paths: changed_files,
         })
     }
 
