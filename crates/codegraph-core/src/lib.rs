@@ -24,7 +24,7 @@ mod config;
 pub mod embedding;
 mod error;
 
-pub use codegraph::{CodeGraph, EmbeddingSyncResult};
+pub use codegraph::{CodeGraph, EmbeddingSyncResult, FullSyncResult};
 pub use config::{CodeGraphConfig, DEFAULT_EXCLUDE_PATTERNS};
 pub use embedding::{build_embedding_text, build_embedding_text_with_budget};
 pub use error::CodeGraphError;

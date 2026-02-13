@@ -147,7 +147,7 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
             return Err(e.into());
         }
     };
-    let result = match cg.sync() {
+    let full_result = match cg.sync() {
         Ok(r) => r,
         Err(e) => {
             pb.finish_and_clear();
@@ -157,7 +157,10 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
 
     pb.finish_and_clear();
 
-    if !result.had_changes {
+    let result = &full_result.sync;
+    let embed = &full_result.embeddings;
+
+    if !result.had_changes && !embed.full_reembed {
         println!(
             "{} Already up to date",
             style("✓").green().bold()
@@ -182,6 +185,26 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
             "   {} total nodes",
             style(stats.total_nodes).cyan()
         );
+
+        // Embedding stats
+        if !embed.skipped_no_model {
+            let embed_total = embed.vectors_created + embed.vectors_updated + embed.vectors_deleted;
+            if embed_total > 0 || embed.full_reembed {
+                if embed.full_reembed {
+                    println!("   {} embeddings regenerated (full)", style(embed.vectors_created).cyan());
+                } else {
+                    if embed.vectors_created > 0 {
+                        println!("   {} embeddings created", style(embed.vectors_created).green());
+                    }
+                    if embed.vectors_updated > 0 {
+                        println!("   {} embeddings updated", style(embed.vectors_updated).yellow());
+                    }
+                    if embed.vectors_deleted > 0 {
+                        println!("   {} embeddings deleted", style(embed.vectors_deleted).red());
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

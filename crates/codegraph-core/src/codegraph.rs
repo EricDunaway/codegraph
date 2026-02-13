@@ -253,7 +253,9 @@ impl CodeGraph {
     /// - Captures edge snapshots before and after sync to detect structural changes
     /// - Re-embeds new, modified, and ripple-affected nodes
     /// - Deletes vectors for removed nodes
-    pub fn sync(&mut self) -> Result<codegraph_sync::SyncResult, CodeGraphError> {
+    ///
+    /// Returns a `FullSyncResult` containing both the file sync stats and embedding stats.
+    pub fn sync(&mut self) -> Result<FullSyncResult, CodeGraphError> {
         use codegraph_sync::{EdgeSnapshot, ReembedConfig, SyncConfig, SyncManager};
 
         let sync_config = SyncConfig {
@@ -295,27 +297,29 @@ impl CodeGraph {
         };
 
         // Run sync (detect changes, re-extract files, update DB)
-        let result = manager.sync_with_codegraph_dir(
+        let sync_result = manager.sync_with_codegraph_dir(
             self.db.conn(),
             &mut self.queries,
             Some(&self.config.data_dir),
         )?;
 
         // Resolve references for changed files if enabled
-        if self.config.resolve_references && result.had_changes {
+        if self.config.resolve_references && sync_result.had_changes {
             let mut resolver = ReferenceResolver::new(self.db.conn(), &mut self.queries);
             let _ = resolver.resolve_all();
         }
 
         // Embedding sync: full re-embed or incremental update
-        if result.had_changes || needs_full_reembed {
+        let mut embed_result = EmbeddingSyncResult::default();
+        if sync_result.had_changes || needs_full_reembed {
             if needs_full_reembed {
                 // Full re-embed: clear and regenerate all embeddings
                 log::info!("Full re-embed triggered, regenerating all embeddings");
                 match self.generate_embeddings() {
                     Ok(count) => {
-                        // Record metadata if model was available (count >= 0 means
-                        // model loaded; count == 0 means no embeddable nodes).
+                        embed_result.vectors_created = count;
+                        embed_result.full_reembed = true;
+                        // Record metadata if model was available.
                         // generate_embeddings() returns Ok(0) for model-not-found,
                         // so we check model availability separately.
                         let model_available = {
@@ -328,6 +332,8 @@ impl CodeGraph {
                                 &self.queries,
                                 &reembed_config,
                             );
+                        } else {
+                            embed_result.skipped_no_model = true;
                         }
                         log::info!("Full re-embed complete: {} vectors generated", count);
                     }
@@ -339,15 +345,18 @@ impl CodeGraph {
                 // Incremental: compute edge diff and re-embed affected nodes
                 let post_snapshot = EdgeSnapshot::capture(self.db.conn());
                 let edge_diff = EdgeDiff::compute(&pre_snapshot, &post_snapshot);
-                match self.sync_embeddings(&result, &edge_diff) {
-                    Ok(embed_result) if !embed_result.skipped_no_model => {
+                match self.sync_embeddings(&sync_result, &edge_diff) {
+                    Ok(result) if !result.skipped_no_model => {
+                        embed_result = result;
                         let _ = codegraph_sync::reembed::record_embed_metadata(
                             self.db.conn(),
                             &self.queries,
                             &reembed_config,
                         );
                     }
-                    Ok(_) => {} // Model unavailable — skip metadata recording
+                    Ok(result) => {
+                        embed_result = result; // Model unavailable — skip metadata
+                    }
                     Err(e) => {
                         log::warn!("Incremental embedding sync failed: {}", e);
                     }
@@ -355,7 +364,10 @@ impl CodeGraph {
             }
         }
 
-        Ok(result)
+        Ok(FullSyncResult {
+            sync: sync_result,
+            embeddings: embed_result,
+        })
     }
 
     // ========== Search ==========
@@ -620,6 +632,7 @@ impl CodeGraph {
             vectors_created,
             vectors_updated,
             skipped_no_model: false,
+            full_reembed: false,
         })
     }
 
@@ -890,6 +903,15 @@ pub struct ProjectStats {
     pub file_count: usize,
 }
 
+/// Combined result from sync + embedding operations
+#[derive(Debug)]
+pub struct FullSyncResult {
+    /// File sync statistics
+    pub sync: codegraph_sync::SyncResult,
+    /// Embedding sync statistics
+    pub embeddings: EmbeddingSyncResult,
+}
+
 /// Result of incremental embedding sync
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddingSyncResult {
@@ -901,6 +923,8 @@ pub struct EmbeddingSyncResult {
     pub vectors_updated: usize,
     /// Whether embedding was skipped due to missing model
     pub skipped_no_model: bool,
+    /// Whether a full re-embed was performed (vs incremental)
+    pub full_reembed: bool,
 }
 
 #[cfg(test)]
