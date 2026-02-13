@@ -59,7 +59,9 @@ pub struct SyncResult {
     pub duration_ms: u64,
     /// Selective scope for enrichment (nodes/files needing re-enrichment)
     pub enrichment_scope: SelectiveScope,
-    /// Node IDs that were removed during sync (from modified + deleted files)
+    /// Node IDs from old snapshots of modified + deleted files.
+    /// For modified files, includes IDs that may be recreated with new content.
+    /// Consumer must filter against new node IDs to find truly deleted nodes.
     pub deleted_node_ids: Vec<String>,
     /// File paths that changed (added, modified, or deleted)
     pub changed_file_paths: Vec<String>,
