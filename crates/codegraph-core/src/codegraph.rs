@@ -247,8 +247,14 @@ impl CodeGraph {
     /// This detects files that have been added, modified, or deleted since the last
     /// index/sync operation and updates the database accordingly. Much faster than
     /// a full re-index for small changes.
+    ///
+    /// Also handles incremental embedding updates:
+    /// - Checks for full re-embed triggers (schema/config/model change)
+    /// - Captures edge snapshots before and after sync to detect structural changes
+    /// - Re-embeds new, modified, and ripple-affected nodes
+    /// - Deletes vectors for removed nodes
     pub fn sync(&mut self) -> Result<codegraph_sync::SyncResult, CodeGraphError> {
-        use codegraph_sync::{SyncConfig, SyncManager};
+        use codegraph_sync::{EdgeSnapshot, ReembedConfig, SyncConfig, SyncManager};
 
         let sync_config = SyncConfig {
             excludes: self.config.exclude_patterns.clone(),
@@ -261,6 +267,34 @@ impl CodeGraph {
             sync_config,
         );
 
+        // Build ReembedConfig to detect full re-embed triggers
+        let config_json = serde_json::to_string(&self.config.embedding).unwrap_or_default();
+        let schema_version = codegraph_db::get_schema_version(self.db.conn())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let model_id = "nomic-embed-text-v1.5";
+        let reembed_config = ReembedConfig {
+            schema_version: &schema_version,
+            config_json: &config_json,
+            model_hash: model_id,
+            force: false,
+        };
+        let needs_full_reembed = codegraph_sync::should_full_reembed(
+            self.db.conn(),
+            &self.queries,
+            &reembed_config,
+        );
+
+        // Capture pre-sync edge snapshot for incremental embedding.
+        // Must happen BEFORE sync because sync deletes nodes (CASCADE deletes edges).
+        // On the full re-embed path we skip this since all embeddings are regenerated.
+        let pre_snapshot = if !needs_full_reembed {
+            EdgeSnapshot::capture(self.db.conn())
+        } else {
+            EdgeSnapshot::new()
+        };
+
+        // Run sync (detect changes, re-extract files, update DB)
         let result = manager.sync_with_codegraph_dir(
             self.db.conn(),
             &mut self.queries,
@@ -271,6 +305,42 @@ impl CodeGraph {
         if self.config.resolve_references && result.had_changes {
             let mut resolver = ReferenceResolver::new(self.db.conn(), &mut self.queries);
             let _ = resolver.resolve_all();
+        }
+
+        // Embedding sync: full re-embed or incremental update
+        if result.had_changes || needs_full_reembed {
+            if needs_full_reembed {
+                // Full re-embed: clear and regenerate all embeddings
+                log::info!("Full re-embed triggered, regenerating all embeddings");
+                let count = self.generate_embeddings().unwrap_or(0);
+                // Only record metadata if embeddings were actually generated
+                // (count == 0 when model is unavailable — don't record so next
+                // sync retries full re-embed)
+                if count > 0 {
+                    let _ = codegraph_sync::reembed::record_embed_metadata(
+                        self.db.conn(),
+                        &self.queries,
+                        &reembed_config,
+                    );
+                }
+            } else {
+                // Incremental: compute edge diff and re-embed affected nodes
+                let post_snapshot = EdgeSnapshot::capture(self.db.conn());
+                let edge_diff = EdgeDiff::compute(&pre_snapshot, &post_snapshot);
+                match self.sync_embeddings(&result, &edge_diff) {
+                    Ok(embed_result) if !embed_result.skipped_no_model => {
+                        let _ = codegraph_sync::reembed::record_embed_metadata(
+                            self.db.conn(),
+                            &self.queries,
+                            &reembed_config,
+                        );
+                    }
+                    Ok(_) => {} // Model unavailable — skip metadata recording
+                    Err(e) => {
+                        log::warn!("Incremental embedding sync failed: {}", e);
+                    }
+                }
+            }
         }
 
         Ok(result)
