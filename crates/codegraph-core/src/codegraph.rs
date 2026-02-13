@@ -7,8 +7,10 @@ use codegraph_db::{DatabaseConnection, QueryBuilder};
 use codegraph_extraction::{ExtractionOrchestrator, IndexResult as ExtractionIndexResult};
 use codegraph_graph::{GraphQueryManager, GraphTraverser, ImpactRadius};
 use codegraph_resolution::ReferenceResolver;
+use codegraph_sync::edge_diff::EdgeDiff;
 use codegraph_types::{Config, Node, NodeKind, SearchResult};
 use codegraph_vectors::{EmbedderConfig, SimilarityResult, TextEmbedder, VectorError, VectorStorage};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -393,6 +395,152 @@ impl CodeGraph {
         NodeKind::Module,
     ];
 
+    /// Incrementally update embeddings after a sync operation.
+    ///
+    /// This computes the minimal set of nodes that need re-embedding based on:
+    /// - New nodes from added/modified files
+    /// - Deleted nodes whose vectors need cleanup
+    /// - Ripple nodes whose embedding text references changed nodes (via EdgeDiff)
+    /// - Sibling nodes sharing a Contains parent with changed nodes
+    ///
+    /// Gracefully skips if the embedding model is unavailable.
+    pub fn sync_embeddings(
+        &mut self,
+        sync_result: &codegraph_sync::SyncResult,
+        edge_diff: &EdgeDiff,
+    ) -> Result<EmbeddingSyncResult, CodeGraphError> {
+        // Load embedder — gracefully skip if unavailable
+        let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+        match embedder.load() {
+            Ok(()) => {}
+            Err(VectorError::ModelNotFound { .. }) => {
+                log::info!("Embedding model not found, skipping incremental embedding sync");
+                return Ok(EmbeddingSyncResult { skipped_no_model: true, ..Default::default() });
+            }
+            Err(VectorError::FeatureNotEnabled { .. }) => {
+                log::debug!("ONNX feature not enabled, skipping incremental embedding sync");
+                return Ok(EmbeddingSyncResult { skipped_no_model: true, ..Default::default() });
+            }
+            Err(e) => return Err(CodeGraphError::Vector(e)),
+        }
+
+        let dimension = embedder.dimension();
+        let storage = VectorStorage::new(dimension);
+        storage.init(self.db.conn())?;
+        let model_name = "nomic-embed-text-v1.5";
+
+        // 1. Get new node IDs from changed files
+        let mut new_node_ids: HashSet<String> = HashSet::new();
+        for file_path in &sync_result.changed_file_paths {
+            let nodes = self.queries.get_nodes_by_file(self.db.conn(), file_path)?;
+            for node in nodes {
+                new_node_ids.insert(node.id.0.clone());
+            }
+        }
+
+        // 2. Compute truly deleted node IDs (old IDs not recreated)
+        let old_node_id_set: HashSet<&str> = sync_result.deleted_node_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let truly_deleted: Vec<&str> = old_node_id_set
+            .iter()
+            .filter(|id| !new_node_ids.contains(**id))
+            .copied()
+            .collect();
+
+        // 3. Delete stale vectors
+        let vectors_deleted = truly_deleted.len();
+        if !truly_deleted.is_empty() {
+            storage.delete_batch(self.db.conn(), &truly_deleted)?;
+        }
+
+        // 4. Compute ripple nodes from EdgeDiff (affected by edge changes)
+        let ripple_node_ids: HashSet<String> = edge_diff.affected_nodes
+            .iter()
+            .filter(|id| !old_node_id_set.contains(id.as_str()) && !new_node_ids.contains(*id))
+            .cloned()
+            .collect();
+
+        // 5. Compute sibling nodes (share Contains parent with changed nodes)
+        let all_changed_ids: Vec<&str> = new_node_ids.iter().map(|s| s.as_str())
+            .chain(truly_deleted.iter().copied())
+            .collect();
+        let sibling_node_ids = {
+            let mut traverser = GraphTraverser::new(self.db.conn(), &mut self.queries);
+            traverser.get_embedding_siblings(&all_changed_ids)?
+        };
+
+        // 6. Combine into embed candidates (exclude truly deleted)
+        let mut embed_candidates: HashSet<String> = new_node_ids;
+        embed_candidates.extend(ripple_node_ids);
+        for id in sibling_node_ids {
+            if !old_node_id_set.contains(id.as_str()) {
+                embed_candidates.insert(id);
+            }
+        }
+
+        // 7. Filter to embeddable kinds and generate embeddings
+        let embeddable_kinds: HashSet<NodeKind> = Self::EMBEDDABLE_KINDS.iter().copied().collect();
+        let mut vectors_created = 0;
+        let mut vectors_updated = 0;
+
+        for node_id in &embed_candidates {
+            let node = match self.queries.get_node_by_id(self.db.conn(), node_id)? {
+                Some(n) => n,
+                None => continue, // Node may have been deleted
+            };
+
+            if !embeddable_kinds.contains(&node.kind) {
+                continue;
+            }
+
+            // Check if this is a new embed or an update
+            let is_update = storage.get(self.db.conn(), node_id)?.is_some();
+
+            let text = match crate::embedding::build_embedding_text(
+                self.db.conn(),
+                &mut self.queries,
+                &node,
+                &self.config.embedding,
+            ) {
+                Ok(text) => text,
+                Err(e) => {
+                    log::warn!("Failed to build embedding text for {}: {}", node_id, e);
+                    continue;
+                }
+            };
+
+            let embedding = match embedder.embed_document(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("Failed to embed {}: {}", node_id, e);
+                    continue;
+                }
+            };
+
+            storage.store(self.db.conn(), node_id, &embedding, model_name)?;
+
+            if is_update {
+                vectors_updated += 1;
+            } else {
+                vectors_created += 1;
+            }
+        }
+
+        log::info!(
+            "Incremental embedding sync: {} deleted, {} created, {} updated",
+            vectors_deleted, vectors_created, vectors_updated
+        );
+
+        Ok(EmbeddingSyncResult {
+            vectors_deleted,
+            vectors_created,
+            vectors_updated,
+            skipped_no_model: false,
+        })
+    }
+
     /// Generate embeddings for all embeddable nodes
     ///
     /// Tries to load the ONNX model. If the model is not found or the ONNX
@@ -658,6 +806,19 @@ pub struct ProjectStats {
     pub edge_count: usize,
     /// Total number of files
     pub file_count: usize,
+}
+
+/// Result of incremental embedding sync
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingSyncResult {
+    /// Vectors deleted (from truly removed nodes)
+    pub vectors_deleted: usize,
+    /// Vectors created (new nodes)
+    pub vectors_created: usize,
+    /// Vectors updated (ripple re-embeds)
+    pub vectors_updated: usize,
+    /// Whether embedding was skipped due to missing model
+    pub skipped_no_model: bool,
 }
 
 #[cfg(test)]
