@@ -187,7 +187,9 @@ pub fn sync(path: &Path) -> Result<(), CliError> {
         );
 
         // Embedding stats
-        if !embed.skipped_no_model {
+        if embed.skipped_no_model {
+            println!("   {} embeddings skipped (model unavailable)", style("—").dim());
+        } else {
             let embed_total = embed.vectors_created + embed.vectors_updated + embed.vectors_deleted;
             if embed_total > 0 || embed.full_reembed {
                 if embed.full_reembed {

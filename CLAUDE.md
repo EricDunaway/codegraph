@@ -72,6 +72,8 @@ crates/
 
 - **codegraph-resolution**: Resolves unresolved references using framework patterns, import resolution, and name matching
 
+- **codegraph-sync**: Incremental file change detection, edge diff computation (`EdgeSnapshot`/`EdgeDiff`), full re-embed trigger detection (`reembed.rs`), selective scope for cascade enrichment, file locking
+
 ### Database Schema
 
 SQLite database with:
@@ -81,6 +83,8 @@ SQLite database with:
 - `unresolved_refs`: References pending resolution
 - `vectors`: Embeddings stored as BLOBs
 - `nodes_fts`: FTS5 virtual table for full-text search
+- `metadata`: Key-value store for schema version, embedding config hash, model hash
+- `schema_version`: Migration tracking (version, applied_at, description)
 
 ### Supported Languages
 
@@ -155,11 +159,17 @@ Tests use temporary directories created with `tempfile` crate and cleaned up aft
 
 **Gotcha:** `!=` gets escaped to `\!=` in this environment. Use `<>` or `length(column) > 2` instead.
 
+**Gotcha:** `edges` table CASCADE deletes when `nodes` are deleted. Capture `EdgeSnapshot` BEFORE `SyncManager::sync()` if you need pre-sync edge state.
+
+**Gotcha:** `TextEmbedder::load()` creates an ONNX session (~100ms). Avoid loading twice in the same code path. `generate_embeddings()` returns `Ok(0)` for both "model not found" and "no embeddable nodes" — check model availability separately if the distinction matters.
+
 **Relationship edges not implemented (P0):** Tree-sitter extraction works and captures decorators (verified), but only creates `contains` edges (structural). No `calls`, `imports`, or `extends` edges are created, which breaks `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` tools. See `crates/codegraph-extraction/src/tree_sitter_extractor.rs` lines 124-129.
 
 **Key plan documents:**
 - `RUST_REWRITE_PLAN.md` - Original requirements
 - `docs/plans/LINKED_REPOS.md` - Multi-repo feature design
+- `docs/plans/2026-02-12-incremental-embedding-sync-design.md` - Incremental embedding sync design
+- `docs/plans/2026-02-12-incremental-embedding-sync-impl.md` - Implementation plan (11 tasks)
 
 ## Verifying Tree-sitter Grammar Support
 

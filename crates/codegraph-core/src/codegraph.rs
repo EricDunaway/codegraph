@@ -318,7 +318,6 @@ impl CodeGraph {
                 match self.generate_embeddings() {
                     Ok(count) => {
                         embed_result.vectors_created = count;
-                        embed_result.full_reembed = true;
                         // Record metadata if model was available.
                         // generate_embeddings() returns Ok(0) for model-not-found,
                         // so we check model availability separately.
@@ -327,6 +326,7 @@ impl CodeGraph {
                             embedder.load().is_ok()
                         };
                         if model_available {
+                            embed_result.full_reembed = true;
                             let _ = codegraph_sync::reembed::record_embed_metadata(
                                 self.db.conn(),
                                 &self.queries,
@@ -913,7 +913,7 @@ pub struct FullSyncResult {
 }
 
 /// Result of incremental embedding sync
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EmbeddingSyncResult {
     /// Vectors deleted (from truly removed nodes)
     pub vectors_deleted: usize,
@@ -1016,5 +1016,122 @@ mod tests {
         let results = cg.search("myTestFunction", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].node.name, "myTestFunction");
+    }
+
+    #[test]
+    fn test_sync_returns_full_sync_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("sync_test");
+        fs::create_dir(&project_path).unwrap();
+
+        // Create a Rust source file
+        fs::write(
+            project_path.join("lib.rs"),
+            "fn hello() { println!(\"hello\"); }\nfn world() {}",
+        )
+        .unwrap();
+
+        let mut cg = CodeGraph::init(&project_path).unwrap();
+
+        // First: index to establish baseline
+        let index_result = cg.index_all().unwrap();
+        assert!(index_result.files_indexed > 0);
+
+        // Sync with no changes — should be up to date
+        let result = cg.sync().unwrap();
+        assert!(!result.sync.had_changes);
+        // Embeddings skipped (no ONNX model in test env)
+        assert!(
+            result.embeddings.skipped_no_model
+                || result.embeddings == EmbeddingSyncResult::default()
+        );
+    }
+
+    #[test]
+    fn test_sync_detects_modified_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("sync_modify");
+        fs::create_dir(&project_path).unwrap();
+
+        fs::write(
+            project_path.join("main.rs"),
+            "fn main() { println!(\"v1\"); }",
+        )
+        .unwrap();
+
+        let mut cg = CodeGraph::init(&project_path).unwrap();
+        cg.index_all().unwrap();
+
+        // Modify the file
+        fs::write(
+            project_path.join("main.rs"),
+            "fn main() { println!(\"v2\"); }\nfn helper() {}",
+        )
+        .unwrap();
+
+        let result = cg.sync().unwrap();
+        assert!(result.sync.had_changes);
+        assert_eq!(result.sync.stats.files_modified, 1);
+        assert!(!result.sync.changed_file_paths.is_empty());
+    }
+
+    #[test]
+    fn test_sync_detects_deleted_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("sync_delete");
+        fs::create_dir(&project_path).unwrap();
+
+        fs::write(
+            project_path.join("a.rs"),
+            "fn func_a() {}",
+        )
+        .unwrap();
+        fs::write(
+            project_path.join("b.rs"),
+            "fn func_b() {}",
+        )
+        .unwrap();
+
+        let mut cg = CodeGraph::init(&project_path).unwrap();
+        cg.index_all().unwrap();
+
+        // Verify both files indexed
+        let nodes_a = cg.get_nodes_in_file("a.rs").unwrap();
+        assert!(!nodes_a.is_empty());
+
+        // Delete file a.rs
+        fs::remove_file(project_path.join("a.rs")).unwrap();
+
+        let result = cg.sync().unwrap();
+        assert!(result.sync.had_changes);
+        assert_eq!(result.sync.stats.files_deleted, 1);
+        assert!(!result.sync.deleted_node_ids.is_empty());
+    }
+
+    #[test]
+    fn test_sync_adds_new_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = temp.path().join("sync_add");
+        fs::create_dir(&project_path).unwrap();
+
+        fs::write(
+            project_path.join("existing.rs"),
+            "fn existing() {}",
+        )
+        .unwrap();
+
+        let mut cg = CodeGraph::init(&project_path).unwrap();
+        cg.index_all().unwrap();
+
+        // Add a new file
+        fs::write(
+            project_path.join("new_file.rs"),
+            "fn new_func() {}\nfn another() {}",
+        )
+        .unwrap();
+
+        let result = cg.sync().unwrap();
+        assert!(result.sync.had_changes);
+        assert_eq!(result.sync.stats.files_added, 1);
     }
 }
