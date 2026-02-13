@@ -492,6 +492,107 @@ impl<'a> GraphTraverser<'a> {
         ).map_err(|e| GraphError::Database(codegraph_db::DbError::Sqlite(e)))?;
         Ok(count as usize)
     }
+
+    // =========================================================================
+    // Embedding Sync Methods — 1-hop neighbor detection for incremental re-embedding
+    // =========================================================================
+
+    /// Get all 1-hop embedding neighbors for a set of node IDs.
+    ///
+    /// Returns node IDs whose embedding text could reference any input node.
+    /// Mirrors the edge types used in `build_graph_context()`:
+    /// - Incoming Calls (callers that list input as callee)
+    /// - Outgoing Calls (callees that list input as caller)
+    /// - Incoming Extends (subclasses that list input as base)
+    /// - Incoming Implements (implementers that list input as interface)
+    pub fn get_embedding_neighbors(
+        &mut self,
+        node_ids: &[&str],
+    ) -> Result<HashSet<String>, GraphError> {
+        let input_set: HashSet<&str> = node_ids.iter().copied().collect();
+        let mut neighbors: HashSet<String> = HashSet::new();
+
+        for &node_id in node_ids {
+            // Incoming Calls — callers whose "callees:" list includes this node
+            let incoming_calls = self.queries.get_incoming_edges(
+                self.conn, node_id, Some(&[EdgeKind::Calls]),
+            )?;
+            for edge in &incoming_calls {
+                if !input_set.contains(edge.source.0.as_str()) {
+                    neighbors.insert(edge.source.0.clone());
+                }
+            }
+
+            // Outgoing Calls — callees whose "called by:" list includes this node
+            let outgoing_calls = self.queries.get_outgoing_edges(
+                self.conn, node_id, Some(&[EdgeKind::Calls]),
+            )?;
+            for edge in &outgoing_calls {
+                if !input_set.contains(edge.target.0.as_str()) {
+                    neighbors.insert(edge.target.0.clone());
+                }
+            }
+
+            // Incoming Extends — subclasses whose "extends:" references this node
+            let incoming_extends = self.queries.get_incoming_edges(
+                self.conn, node_id, Some(&[EdgeKind::Extends]),
+            )?;
+            for edge in &incoming_extends {
+                if !input_set.contains(edge.source.0.as_str()) {
+                    neighbors.insert(edge.source.0.clone());
+                }
+            }
+
+            // Incoming Implements — implementers whose "implements:" references this node
+            let incoming_implements = self.queries.get_incoming_edges(
+                self.conn, node_id, Some(&[EdgeKind::Implements]),
+            )?;
+            for edge in &incoming_implements {
+                if !input_set.contains(edge.source.0.as_str()) {
+                    neighbors.insert(edge.source.0.clone());
+                }
+            }
+        }
+
+        Ok(neighbors)
+    }
+
+    /// Get all nodes that share a Contains parent with any of the given node IDs.
+    ///
+    /// When a node is added/removed from a container, other nodes in that container
+    /// have stale "siblings:" lists in their embeddings.
+    ///
+    /// Traversal: input -> parent (incoming Contains) -> children (outgoing Contains) - input
+    pub fn get_embedding_siblings(
+        &mut self,
+        node_ids: &[&str],
+    ) -> Result<HashSet<String>, GraphError> {
+        let input_set: HashSet<&str> = node_ids.iter().copied().collect();
+        let mut siblings: HashSet<String> = HashSet::new();
+
+        for &node_id in node_ids {
+            // Find parent containers
+            let parent_edges = self.queries.get_incoming_edges(
+                self.conn, node_id, Some(&[EdgeKind::Contains]),
+            )?;
+
+            for parent_edge in parent_edges {
+                // Get all children of this parent
+                let child_edges = self.queries.get_outgoing_edges(
+                    self.conn, &parent_edge.source.0, Some(&[EdgeKind::Contains]),
+                )?;
+
+                for child_edge in child_edges {
+                    let child_id = &child_edge.target.0;
+                    if !input_set.contains(child_id.as_str()) {
+                        siblings.insert(child_id.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(siblings)
+    }
 }
 
 #[cfg(test)]
@@ -939,5 +1040,95 @@ mod tests {
         assert_eq!(callees.len(), 2);
         assert_eq!(callees[0], "fn_alpha", "Alpha should come before beta");
         assert_eq!(callees[1], "fn_beta", "Beta should come after alpha");
+    }
+
+    // =========================================================================
+    // Embedding Sync Tests (get_embedding_neighbors, get_embedding_siblings)
+    // =========================================================================
+
+    #[test]
+    fn test_get_embedding_neighbors_callers_and_callees() {
+        // A -> B -> C: neighbors of B should be A (caller) and C (callee)
+        let (db, mut queries) = setup_test_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        let neighbors = traverser.get_embedding_neighbors(&["b"]).unwrap();
+
+        assert!(neighbors.contains("a"), "A calls B, so A is a neighbor");
+        assert!(neighbors.contains("c"), "B calls C, so C is a neighbor");
+        assert!(!neighbors.contains("b"), "Should exclude input node");
+    }
+
+    #[test]
+    fn test_get_embedding_neighbors_excludes_input_set() {
+        // A -> B, A -> D: neighbors of {a, b} should be {c, d} (not a or b)
+        let (db, mut queries) = setup_test_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        let neighbors = traverser.get_embedding_neighbors(&["a", "b"]).unwrap();
+
+        assert!(!neighbors.contains("a"));
+        assert!(!neighbors.contains("b"));
+        assert!(neighbors.contains("c"), "B calls C");
+        assert!(neighbors.contains("d"), "A calls D");
+    }
+
+    #[test]
+    fn test_get_embedding_neighbors_extends_implements() {
+        let (db, mut queries) = setup_inheritance_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        // Neighbors of base_service: payment_service extends it
+        let neighbors = traverser.get_embedding_neighbors(&["base_service"]).unwrap();
+        assert!(neighbors.contains("payment_service"), "PaymentService extends BaseService");
+
+        // Neighbors of i_payment: payment_service implements it
+        let neighbors = traverser.get_embedding_neighbors(&["i_payment"]).unwrap();
+        assert!(neighbors.contains("payment_service"), "PaymentService implements IPayment");
+    }
+
+    #[test]
+    fn test_get_embedding_neighbors_empty_input() {
+        let (db, mut queries) = setup_test_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        let neighbors = traverser.get_embedding_neighbors(&[]).unwrap();
+        assert!(neighbors.is_empty());
+    }
+
+    #[test]
+    fn test_get_embedding_siblings_basic() {
+        // MyClass contains method1, method2, method3
+        let (db, mut queries) = setup_container_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        let siblings = traverser.get_embedding_siblings(&["method1"]).unwrap();
+
+        assert!(siblings.contains("method2"));
+        assert!(siblings.contains("method3"));
+        assert!(!siblings.contains("method1"), "Should exclude input");
+    }
+
+    #[test]
+    fn test_get_embedding_siblings_no_container() {
+        // funcA has no Contains parent
+        let (db, mut queries) = setup_test_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        let siblings = traverser.get_embedding_siblings(&["a"]).unwrap();
+        assert!(siblings.is_empty());
+    }
+
+    #[test]
+    fn test_get_embedding_siblings_excludes_input_set() {
+        let (db, mut queries) = setup_container_graph();
+        let mut traverser = GraphTraverser::new(db.conn(), &mut queries);
+
+        // Input is {method1, method2}, siblings should only be {method3}
+        let siblings = traverser.get_embedding_siblings(&["method1", "method2"]).unwrap();
+
+        assert!(siblings.contains("method3"));
+        assert!(!siblings.contains("method1"));
+        assert!(!siblings.contains("method2"));
     }
 }

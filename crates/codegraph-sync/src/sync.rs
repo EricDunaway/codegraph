@@ -161,10 +161,12 @@ impl SyncManager {
         // Collect changed file paths for selective scope
         let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
 
-        if had_changes {
+        let deleted_node_ids = if had_changes {
             // Process changes
-            self.process_changes(conn, queries, &changes, &mut stats)?;
-        }
+            self.process_changes(conn, queries, &changes, &mut stats)?
+        } else {
+            Vec::new()
+        };
 
         // Compute selective scope with cascade depth
         let changed_file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
@@ -191,7 +193,7 @@ impl SyncManager {
             had_changes,
             duration_ms,
             enrichment_scope,
-            deleted_node_ids: Vec::new(),
+            deleted_node_ids,
             changed_file_paths: changed_files,
         })
     }
@@ -213,9 +215,11 @@ impl SyncManager {
         // Collect changed file paths for selective scope
         let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
 
-        if had_changes {
-            self.process_changes(conn, queries, &changes, &mut stats)?;
-        }
+        let deleted_node_ids = if had_changes {
+            self.process_changes(conn, queries, &changes, &mut stats)?
+        } else {
+            Vec::new()
+        };
 
         // Compute selective scope with cascade depth
         let changed_file_refs: Vec<&str> = changed_files.iter().map(|s| s.as_str()).collect();
@@ -242,19 +246,21 @@ impl SyncManager {
             had_changes,
             duration_ms,
             enrichment_scope,
-            deleted_node_ids: Vec::new(),
+            deleted_node_ids,
             changed_file_paths: changed_files,
         })
     }
 
-    /// Process detected changes
+    /// Process detected changes, returning IDs of deleted nodes
     fn process_changes(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         changes: &[FileChange],
         stats: &mut SyncStats,
-    ) -> Result<(), SyncError> {
+    ) -> Result<Vec<String>, SyncError> {
+        let mut deleted_node_ids = Vec::new();
+
         for change in changes {
             match change.kind {
                 ChangeKind::Added => {
@@ -273,10 +279,11 @@ impl SyncManager {
                 }
                 ChangeKind::Modified => {
                     match self.process_modify(conn, queries, change) {
-                        Ok((deleted, added)) => {
+                        Ok((deleted, added, old_ids)) => {
                             stats.files_modified += 1;
                             stats.nodes_deleted += deleted;
                             stats.nodes_added += added;
+                            deleted_node_ids.extend(old_ids);
                         }
                         Err(e) => {
                             stats.errors.push(format!("Error modifying {}: {}", change.path, e));
@@ -288,9 +295,10 @@ impl SyncManager {
                 }
                 ChangeKind::Deleted => {
                     match self.process_delete(conn, queries, change) {
-                        Ok(node_count) => {
+                        Ok((node_count, old_ids)) => {
                             stats.files_deleted += 1;
                             stats.nodes_deleted += node_count;
+                            deleted_node_ids.extend(old_ids);
                         }
                         Err(e) => {
                             stats.errors.push(format!("Error deleting {}: {}", change.path, e));
@@ -303,7 +311,7 @@ impl SyncManager {
             }
         }
 
-        Ok(())
+        Ok(deleted_node_ids)
     }
 
     /// Process an added file
@@ -346,16 +354,17 @@ impl SyncManager {
         Ok(node_count)
     }
 
-    /// Process a modified file
+    /// Process a modified file, returning (old_count, new_count, old_node_ids)
     fn process_modify(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         change: &FileChange,
-    ) -> Result<(usize, usize), SyncError> {
-        // Get old node count
+    ) -> Result<(usize, usize, Vec<String>), SyncError> {
+        // Capture old node IDs before deletion
         let old_nodes = queries.get_nodes_by_file(conn, &change.path)?;
         let old_count = old_nodes.len();
+        let old_node_ids: Vec<String> = old_nodes.iter().map(|n| n.id.0.clone()).collect();
 
         // Delete old nodes and edges
         queries.delete_nodes_by_file(conn, &change.path)?;
@@ -388,24 +397,25 @@ impl SyncManager {
         };
         queries.upsert_file(conn, &file_record)?;
 
-        Ok((old_count, new_count))
+        Ok((old_count, new_count, old_node_ids))
     }
 
-    /// Process a deleted file
+    /// Process a deleted file, returning (node_count, old_node_ids)
     fn process_delete(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         change: &FileChange,
-    ) -> Result<usize, SyncError> {
-        // Get old node count
+    ) -> Result<(usize, Vec<String>), SyncError> {
+        // Capture old node IDs before deletion
         let old_nodes = queries.get_nodes_by_file(conn, &change.path)?;
         let count = old_nodes.len();
+        let old_node_ids: Vec<String> = old_nodes.iter().map(|n| n.id.0.clone()).collect();
 
         // Delete file and its nodes
         queries.delete_file(conn, &change.path)?;
 
-        Ok(count)
+        Ok((count, old_node_ids))
     }
 }
 

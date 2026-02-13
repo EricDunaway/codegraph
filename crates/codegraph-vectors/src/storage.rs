@@ -116,6 +116,31 @@ impl VectorStorage {
         Ok(())
     }
 
+    /// Delete vectors for multiple nodes in a single query
+    pub fn delete_batch(&self, conn: &Connection, node_ids: &[&str]) -> Result<(), VectorError> {
+        if node_ids.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders: String = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!("DELETE FROM vectors WHERE node_id IN ({})", placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::ToSql>> = node_ids
+            .iter()
+            .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        stmt.execute(params_refs.as_slice())?;
+
+        Ok(())
+    }
+
     /// Get all vectors (for similarity search)
     pub fn get_all(&self, conn: &Connection) -> Result<Vec<VectorRecord>, VectorError> {
         let mut stmt = conn.prepare(
@@ -300,5 +325,36 @@ mod tests {
         storage.store(db.conn(), "n3", &vector, "test").unwrap();
 
         assert_eq!(storage.count(db.conn()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_delete_batch_vectors() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        let storage = VectorStorage::new(384);
+        storage.init(db.conn()).unwrap();
+
+        let vector: Vec<f32> = vec![0.0; 384];
+        storage.store(db.conn(), "n1", &vector, "test").unwrap();
+        storage.store(db.conn(), "n2", &vector, "test").unwrap();
+        storage.store(db.conn(), "n3", &vector, "test").unwrap();
+
+        assert_eq!(storage.count(db.conn()).unwrap(), 3);
+
+        storage.delete_batch(db.conn(), &["n1", "n3"]).unwrap();
+
+        assert_eq!(storage.count(db.conn()).unwrap(), 1);
+        assert!(storage.get(db.conn(), "n1").unwrap().is_none());
+        assert!(storage.get(db.conn(), "n2").unwrap().is_some());
+        assert!(storage.get(db.conn(), "n3").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_batch_empty() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        let storage = VectorStorage::new(384);
+        storage.init(db.conn()).unwrap();
+
+        // Should not error on empty input
+        storage.delete_batch(db.conn(), &[]).unwrap();
     }
 }
