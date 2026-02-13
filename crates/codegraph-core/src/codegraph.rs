@@ -312,16 +312,28 @@ impl CodeGraph {
             if needs_full_reembed {
                 // Full re-embed: clear and regenerate all embeddings
                 log::info!("Full re-embed triggered, regenerating all embeddings");
-                let count = self.generate_embeddings().unwrap_or(0);
-                // Only record metadata if embeddings were actually generated
-                // (count == 0 when model is unavailable — don't record so next
-                // sync retries full re-embed)
-                if count > 0 {
-                    let _ = codegraph_sync::reembed::record_embed_metadata(
-                        self.db.conn(),
-                        &self.queries,
-                        &reembed_config,
-                    );
+                match self.generate_embeddings() {
+                    Ok(count) => {
+                        // Record metadata if model was available (count >= 0 means
+                        // model loaded; count == 0 means no embeddable nodes).
+                        // generate_embeddings() returns Ok(0) for model-not-found,
+                        // so we check model availability separately.
+                        let model_available = {
+                            let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+                            embedder.load().is_ok()
+                        };
+                        if model_available {
+                            let _ = codegraph_sync::reembed::record_embed_metadata(
+                                self.db.conn(),
+                                &self.queries,
+                                &reembed_config,
+                            );
+                        }
+                        log::info!("Full re-embed complete: {} vectors generated", count);
+                    }
+                    Err(e) => {
+                        log::warn!("Full re-embed failed: {}", e);
+                    }
                 }
             } else {
                 // Incremental: compute edge diff and re-embed affected nodes
