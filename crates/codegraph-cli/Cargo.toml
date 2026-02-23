@@ -12,7 +12,7 @@ name = "codegraph"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["onnx"]
 onnx = ["codegraph-core/onnx", "codegraph-mcp/onnx"]
 
 [dependencies]
