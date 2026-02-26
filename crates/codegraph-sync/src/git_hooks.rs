@@ -4,53 +4,122 @@ use crate::error::SyncError;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// Git hook names
-const POST_COMMIT_HOOK: &str = "post-commit";
-const POST_CHECKOUT_HOOK: &str = "post-checkout";
-const POST_MERGE_HOOK: &str = "post-merge";
+/// All hooks managed by CodeGraph
+const HOOKS: &[&str] = &[
+    "post-commit",
+    "post-checkout",
+    "post-merge",
+    "post-rewrite",
+];
 
-/// Hook script template
-const HOOK_SCRIPT: &str = r#"#!/bin/sh
-# CodeGraph auto-sync hook
-# This hook was installed by codegraph hooks install
+/// Marker line used to identify CodeGraph-managed hooks
+const HOOK_MARKER: &str = "Managed by codegraph";
 
-# Run codegraph sync in the background
-codegraph sync "$PWD" &
-"#;
+/// Backup suffix for existing hooks
+const BACKUP_SUFFIX: &str = ".codegraph-orig";
+
+/// Generate the hook script for a given hook name
+fn hook_script(hook_name: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+# Managed by codegraph — do not edit this block
+codegraph sync "$PWD" --hook {} &
+"#,
+        hook_name
+    )
+}
+
+/// Resolve the hooks directory using `git rev-parse --git-path hooks`.
+///
+/// Falls back to `<repo_root>/.git/hooks` if git is unavailable.
+fn get_hooks_dir(repo_root: &Path) -> Result<PathBuf, SyncError> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| SyncError::Other(format!("git rev-parse failed: {}", e)))?;
+    if !output.status.success() {
+        return Err(SyncError::Other("Not a git repository".to_string()));
+    }
+    let hooks_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // If path is relative, it's relative to repo root
+    let hooks_dir = if Path::new(&hooks_path).is_absolute() {
+        PathBuf::from(hooks_path)
+    } else {
+        repo_root.join(hooks_path)
+    };
+    Ok(hooks_dir)
+}
+
+/// Detect third-party hook managers (Husky, Lefthook).
+fn detect_hook_manager(repo_root: &Path) -> Option<String> {
+    // Check for Husky
+    if repo_root.join(".husky").exists() {
+        return Some("Husky".to_string());
+    }
+    // Check for Lefthook
+    if repo_root.join("lefthook.yml").exists() || repo_root.join(".lefthook.yml").exists() {
+        return Some("Lefthook".to_string());
+    }
+    None
+}
 
 /// Manages git hooks for automatic sync
 pub struct GitHooksManager {
-    /// Path to .git/hooks directory
+    /// Root of the git repository
+    repo_root: PathBuf,
+    /// Path to the hooks directory
     hooks_dir: PathBuf,
+    /// Whether to force install even if a hook manager is detected
+    force: bool,
 }
 
 impl GitHooksManager {
-    /// Create a new hooks manager
-    pub fn new(repo_path: impl AsRef<Path>) -> Result<Self, SyncError> {
-        let repo_path = repo_path.as_ref().to_path_buf();
-        let git_dir = repo_path.join(".git");
-
-        if !git_dir.exists() {
-            return Err(SyncError::Git {
-                message: "Not a git repository (no .git directory)".to_string(),
-            });
-        }
-
-        let hooks_dir = git_dir.join("hooks");
+    /// Create a new hooks manager.
+    ///
+    /// Uses `git rev-parse --git-path hooks` to locate the hooks directory,
+    /// which works correctly with worktrees and custom `core.hooksPath`.
+    pub fn new(repo_path: impl AsRef<Path>, force: bool) -> Result<Self, SyncError> {
+        let repo_root = repo_path.as_ref().to_path_buf();
+        let hooks_dir = get_hooks_dir(&repo_root)?;
 
         Ok(Self {
+            repo_root,
             hooks_dir,
+            force,
         })
     }
 
-    /// Install all CodeGraph hooks
+    /// Create a hooks manager with an explicit hooks directory (for testing).
+    #[cfg(test)]
+    fn with_hooks_dir(repo_root: PathBuf, hooks_dir: PathBuf, force: bool) -> Self {
+        Self {
+            repo_root,
+            hooks_dir,
+            force,
+        }
+    }
+
+    /// Install all CodeGraph hooks.
+    ///
+    /// Checks for third-party hook managers (Husky, Lefthook) and refuses
+    /// unless `force` was set. Also refuses if a `.codegraph-orig` backup
+    /// already exists (indicates a previous incomplete install/uninstall).
     pub fn install_all(&self) -> Result<(), SyncError> {
+        // Check for hook managers
+        if !self.force {
+            if let Some(tool) = detect_hook_manager(&self.repo_root) {
+                return Err(SyncError::HookManagerDetected { tool });
+            }
+        }
+
         self.ensure_hooks_dir()?;
 
-        self.install_hook(POST_COMMIT_HOOK)?;
-        self.install_hook(POST_CHECKOUT_HOOK)?;
-        self.install_hook(POST_MERGE_HOOK)?;
+        for hook in HOOKS {
+            self.install_hook(hook)?;
+        }
 
         log::info!("Installed all CodeGraph git hooks");
         Ok(())
@@ -59,23 +128,37 @@ impl GitHooksManager {
     /// Install a specific hook
     pub fn install_hook(&self, hook_name: &str) -> Result<(), SyncError> {
         let hook_path = self.hooks_dir.join(hook_name);
+        let backup_path = self.hooks_dir.join(format!("{}{}", hook_name, BACKUP_SUFFIX));
+
+        // Conflict detection: refuse if backup already exists
+        if backup_path.exists() {
+            return Err(SyncError::HookInstallFailed {
+                hook: hook_name.to_string(),
+                message: format!(
+                    "Backup file {} already exists. \
+                     This indicates a previous incomplete install/uninstall. \
+                     Remove it manually and retry.",
+                    backup_path.display()
+                ),
+            });
+        }
 
         if hook_path.exists() {
             // Check if it's our hook or a user hook
             let content = fs::read_to_string(&hook_path)?;
-            if content.contains("CodeGraph auto-sync hook") {
-                // Already installed
+            if content.contains(HOOK_MARKER) {
+                // Already installed — update in place
+                fs::write(&hook_path, hook_script(hook_name))?;
                 return Ok(());
             }
 
             // Backup existing hook
-            let backup_path = self.hooks_dir.join(format!("{}.codegraph-backup", hook_name));
             fs::rename(&hook_path, &backup_path)?;
-            log::info!("Backed up existing {} hook", hook_name);
+            log::info!("Backed up existing {} hook to {}", hook_name, backup_path.display());
         }
 
         // Write our hook
-        fs::write(&hook_path, HOOK_SCRIPT)?;
+        fs::write(&hook_path, hook_script(hook_name))?;
 
         // Make executable
         #[cfg(unix)]
@@ -91,9 +174,9 @@ impl GitHooksManager {
 
     /// Uninstall all CodeGraph hooks
     pub fn uninstall_all(&self) -> Result<(), SyncError> {
-        self.uninstall_hook(POST_COMMIT_HOOK)?;
-        self.uninstall_hook(POST_CHECKOUT_HOOK)?;
-        self.uninstall_hook(POST_MERGE_HOOK)?;
+        for hook in HOOKS {
+            self.uninstall_hook(hook)?;
+        }
 
         log::info!("Uninstalled all CodeGraph git hooks");
         Ok(())
@@ -109,7 +192,7 @@ impl GitHooksManager {
 
         // Check if it's our hook
         let content = fs::read_to_string(&hook_path)?;
-        if !content.contains("CodeGraph auto-sync hook") {
+        if !content.contains(HOOK_MARKER) {
             // Not our hook, don't remove
             return Ok(());
         }
@@ -118,7 +201,7 @@ impl GitHooksManager {
         fs::remove_file(&hook_path)?;
 
         // Restore backup if exists
-        let backup_path = self.hooks_dir.join(format!("{}.codegraph-backup", hook_name));
+        let backup_path = self.hooks_dir.join(format!("{}{}", hook_name, BACKUP_SUFFIX));
         if backup_path.exists() {
             fs::rename(&backup_path, &hook_path)?;
             log::info!("Restored backed up {} hook", hook_name);
@@ -130,7 +213,7 @@ impl GitHooksManager {
 
     /// Check if hooks are installed
     pub fn is_installed(&self) -> bool {
-        self.is_hook_installed(POST_COMMIT_HOOK)
+        self.is_hook_installed(HOOKS[0])
     }
 
     /// Check if a specific hook is installed
@@ -142,7 +225,7 @@ impl GitHooksManager {
         }
 
         match fs::read_to_string(&hook_path) {
-            Ok(content) => content.contains("CodeGraph auto-sync hook"),
+            Ok(content) => content.contains(HOOK_MARKER),
             Err(_) => false,
         }
     }
@@ -151,7 +234,7 @@ impl GitHooksManager {
     pub fn list_installed(&self) -> Vec<String> {
         let mut installed = Vec::new();
 
-        for hook in [POST_COMMIT_HOOK, POST_CHECKOUT_HOOK, POST_MERGE_HOOK] {
+        for hook in HOOKS {
             if self.is_hook_installed(hook) {
                 installed.push(hook.to_string());
             }
@@ -188,46 +271,47 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn test_not_a_git_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = GitHooksManager::new(dir.path());
-        assert!(result.is_err());
+    /// Helper to create a GitHooksManager for tests (bypasses git rev-parse)
+    fn test_manager(dir: &TempDir, force: bool) -> GitHooksManager {
+        let repo_root = dir.path().to_path_buf();
+        let hooks_dir = repo_root.join(".git/hooks");
+        GitHooksManager::with_hooks_dir(repo_root, hooks_dir, force)
     }
 
     #[test]
     fn test_install_and_check() {
         let dir = setup_git_repo();
-        let manager = GitHooksManager::new(dir.path()).unwrap();
+        let manager = test_manager(&dir, false);
 
         assert!(!manager.is_installed());
 
         manager.install_all().unwrap();
 
         assert!(manager.is_installed());
-        assert!(manager.is_hook_installed(POST_COMMIT_HOOK));
-        assert!(manager.is_hook_installed(POST_CHECKOUT_HOOK));
-        assert!(manager.is_hook_installed(POST_MERGE_HOOK));
+        assert!(manager.is_hook_installed("post-commit"));
+        assert!(manager.is_hook_installed("post-checkout"));
+        assert!(manager.is_hook_installed("post-merge"));
+        assert!(manager.is_hook_installed("post-rewrite"));
     }
 
     #[test]
     fn test_list_installed() {
         let dir = setup_git_repo();
-        let manager = GitHooksManager::new(dir.path()).unwrap();
+        let manager = test_manager(&dir, false);
 
         assert!(manager.list_installed().is_empty());
 
-        manager.install_hook(POST_COMMIT_HOOK).unwrap();
+        manager.install_hook("post-commit").unwrap();
 
         let installed = manager.list_installed();
         assert_eq!(installed.len(), 1);
-        assert!(installed.contains(&POST_COMMIT_HOOK.to_string()));
+        assert!(installed.contains(&"post-commit".to_string()));
     }
 
     #[test]
     fn test_uninstall() {
         let dir = setup_git_repo();
-        let manager = GitHooksManager::new(dir.path()).unwrap();
+        let manager = test_manager(&dir, false);
 
         manager.install_all().unwrap();
         assert!(manager.is_installed());
@@ -242,18 +326,18 @@ mod tests {
         let hooks_dir = dir.path().join(".git/hooks");
 
         // Create a pre-existing hook
-        let hook_path = hooks_dir.join(POST_COMMIT_HOOK);
+        let hook_path = hooks_dir.join("post-commit");
         fs::write(&hook_path, "#!/bin/sh\necho 'user hook'\n").unwrap();
 
-        let manager = GitHooksManager::new(dir.path()).unwrap();
-        manager.install_hook(POST_COMMIT_HOOK).unwrap();
+        let manager = test_manager(&dir, false);
+        manager.install_hook("post-commit").unwrap();
 
-        // Backup should exist
-        let backup_path = hooks_dir.join(format!("{}.codegraph-backup", POST_COMMIT_HOOK));
+        // Backup should exist with new suffix
+        let backup_path = hooks_dir.join(format!("post-commit{}", BACKUP_SUFFIX));
         assert!(backup_path.exists());
 
         // Our hook should be installed
-        assert!(manager.is_hook_installed(POST_COMMIT_HOOK));
+        assert!(manager.is_hook_installed("post-commit"));
     }
 
     #[test]
@@ -262,16 +346,148 @@ mod tests {
         let hooks_dir = dir.path().join(".git/hooks");
 
         // Create a pre-existing hook
-        let hook_path = hooks_dir.join(POST_COMMIT_HOOK);
+        let hook_path = hooks_dir.join("post-commit");
         let original_content = "#!/bin/sh\necho 'user hook'\n";
         fs::write(&hook_path, original_content).unwrap();
 
-        let manager = GitHooksManager::new(dir.path()).unwrap();
-        manager.install_hook(POST_COMMIT_HOOK).unwrap();
-        manager.uninstall_hook(POST_COMMIT_HOOK).unwrap();
+        let manager = test_manager(&dir, false);
+        manager.install_hook("post-commit").unwrap();
+        manager.uninstall_hook("post-commit").unwrap();
 
         // Original hook should be restored
         let restored_content = fs::read_to_string(&hook_path).unwrap();
         assert_eq!(restored_content, original_content);
+    }
+
+    #[test]
+    fn test_hook_script_contains_hook_name() {
+        let dir = setup_git_repo();
+        let manager = test_manager(&dir, false);
+
+        manager.install_hook("post-commit").unwrap();
+
+        let hook_path = dir.path().join(".git/hooks/post-commit");
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert!(content.contains("--hook post-commit"));
+        assert!(content.contains(HOOK_MARKER));
+    }
+
+    #[test]
+    fn test_hook_script_per_hook_name() {
+        let dir = setup_git_repo();
+        let manager = test_manager(&dir, false);
+
+        manager.install_all().unwrap();
+
+        for hook in HOOKS {
+            let hook_path = dir.path().join(format!(".git/hooks/{}", hook));
+            let content = fs::read_to_string(&hook_path).unwrap();
+            assert!(
+                content.contains(&format!("--hook {}", hook)),
+                "Hook {} should contain --hook {}",
+                hook,
+                hook
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_husky() {
+        let dir = setup_git_repo();
+        fs::create_dir(dir.path().join(".husky")).unwrap();
+        assert_eq!(detect_hook_manager(dir.path()), Some("Husky".to_string()));
+    }
+
+    #[test]
+    fn test_detect_lefthook() {
+        let dir = setup_git_repo();
+        fs::write(dir.path().join("lefthook.yml"), "").unwrap();
+        assert_eq!(
+            detect_hook_manager(dir.path()),
+            Some("Lefthook".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_lefthook_dotfile() {
+        let dir = setup_git_repo();
+        fs::write(dir.path().join(".lefthook.yml"), "").unwrap();
+        assert_eq!(
+            detect_hook_manager(dir.path()),
+            Some("Lefthook".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_hook_manager() {
+        let dir = setup_git_repo();
+        assert_eq!(detect_hook_manager(dir.path()), None);
+    }
+
+    #[test]
+    fn test_hook_manager_blocks_install() {
+        let dir = setup_git_repo();
+        fs::create_dir(dir.path().join(".husky")).unwrap();
+
+        let manager = test_manager(&dir, false);
+        let result = manager.install_all();
+        assert!(result.is_err());
+        match result {
+            Err(SyncError::HookManagerDetected { tool }) => {
+                assert_eq!(tool, "Husky");
+            }
+            other => panic!("Expected HookManagerDetected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_force_bypasses_hook_manager() {
+        let dir = setup_git_repo();
+        fs::create_dir(dir.path().join(".husky")).unwrap();
+
+        let manager = test_manager(&dir, true);
+        manager.install_all().unwrap();
+        assert!(manager.is_installed());
+    }
+
+    #[test]
+    fn test_conflict_detection_backup_exists() {
+        let dir = setup_git_repo();
+        let hooks_dir = dir.path().join(".git/hooks");
+
+        // Create a backup file that shouldn't exist
+        let backup_path = hooks_dir.join(format!("post-commit{}", BACKUP_SUFFIX));
+        fs::write(&backup_path, "stale backup").unwrap();
+
+        let manager = test_manager(&dir, false);
+        let result = manager.install_hook("post-commit");
+        assert!(result.is_err());
+        match result {
+            Err(SyncError::HookInstallFailed { hook, message }) => {
+                assert_eq!(hook, "post-commit");
+                assert!(message.contains("already exists"));
+            }
+            other => panic!("Expected HookInstallFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reinstall_updates_existing_hook() {
+        let dir = setup_git_repo();
+        let manager = test_manager(&dir, false);
+
+        // Install once
+        manager.install_hook("post-commit").unwrap();
+
+        // Install again — should succeed (update in place)
+        manager.install_hook("post-commit").unwrap();
+
+        // Still installed
+        assert!(manager.is_hook_installed("post-commit"));
+    }
+
+    #[test]
+    fn test_post_rewrite_in_hooks_list() {
+        assert!(HOOKS.contains(&"post-rewrite"));
     }
 }

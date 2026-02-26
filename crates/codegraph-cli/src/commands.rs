@@ -332,7 +332,7 @@ pub fn hooks_install(path: &Path) -> Result<(), CliError> {
         ));
     }
 
-    let manager = codegraph_core::sync::GitHooksManager::new(&path)?;
+    let manager = codegraph_core::sync::GitHooksManager::new(&path, false)?;
     manager.install_all()?;
 
     println!(
@@ -348,7 +348,7 @@ pub fn hooks_install(path: &Path) -> Result<(), CliError> {
 pub fn hooks_uninstall(path: &Path) -> Result<(), CliError> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    let manager = codegraph_core::sync::GitHooksManager::new(&path)?;
+    let manager = codegraph_core::sync::GitHooksManager::new(&path, false)?;
     manager.uninstall_all()?;
 
     println!(
@@ -363,7 +363,7 @@ pub fn hooks_uninstall(path: &Path) -> Result<(), CliError> {
 pub fn hooks_status(path: &Path) -> Result<(), CliError> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    let manager = codegraph_core::sync::GitHooksManager::new(&path)?;
+    let manager = codegraph_core::sync::GitHooksManager::new(&path, false)?;
 
     println!(
         "{} Git Hooks Status",
