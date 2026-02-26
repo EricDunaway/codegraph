@@ -11,6 +11,7 @@ use crate::matcher::NameMatcher;
 use codegraph_db::QueryBuilder;
 use codegraph_types::{Edge, EdgeKind, Node, NodeId, NodeKind};
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Statistics from resolution process
 #[derive(Debug, Default, Clone)]
@@ -35,6 +36,16 @@ impl ResolutionStats {
         }
         self.resolved as f64 / self.total_processed as f64
     }
+}
+
+/// Result of scoped resolution, carrying affected node IDs for embed candidate computation.
+#[derive(Debug, Default)]
+pub struct ScopedResolutionResult {
+    pub stats: ResolutionStats,
+    /// Source node IDs of newly created edges.
+    pub source_node_ids: HashSet<String>,
+    /// Target node IDs of newly created edges.
+    pub target_node_ids: HashSet<String>,
 }
 
 /// Result of resolving a single reference
@@ -190,6 +201,81 @@ impl<'a> ReferenceResolver<'a> {
         Ok(self.stats.clone())
     }
 
+    /// Resolve references scoped to changed files only.
+    ///
+    /// Source-scoped: refs FROM nodes in changed_files.
+    /// Target-scoped: refs TO symbols whose names match nodes in changed_files.
+    pub fn resolve_for_files(
+        &mut self,
+        changed_files: &[&str],
+    ) -> Result<ScopedResolutionResult, ResolutionError> {
+        let mut result = ScopedResolutionResult::default();
+
+        // Source-scoped: resolve unresolved refs from changed files
+        let source_refs = self
+            .queries
+            .get_unresolved_refs_by_files(self.conn, changed_files)?;
+        log::info!(
+            "Source-scoped resolution: {} refs from changed files",
+            source_refs.len()
+        );
+
+        for unresolved_ref in source_refs {
+            let res = self.resolve_reference_with_kind(
+                unresolved_ref.from_node_id.as_str(),
+                &unresolved_ref.reference_name,
+                unresolved_ref.reference_kind,
+            )?;
+            result.stats.total_processed += 1;
+            if let Some(ref target) = res.target {
+                result.stats.resolved += 1;
+                result
+                    .source_node_ids
+                    .insert(unresolved_ref.from_node_id.as_str().to_string());
+                result
+                    .target_node_ids
+                    .insert(target.node_id.as_str().to_string());
+            } else {
+                result.stats.unresolved += 1;
+            }
+        }
+
+        // Target-scoped: find refs TO symbols in changed files
+        let symbol_names = self
+            .queries
+            .get_symbol_names_in_files(self.conn, changed_files)?;
+        let name_refs: Vec<&str> = symbol_names.iter().map(|s| s.as_str()).collect();
+        let target_refs = self
+            .queries
+            .get_unresolved_refs_by_names_capped(self.conn, &name_refs, 100)?;
+        log::info!(
+            "Target-scoped resolution: {} refs to symbols in changed files",
+            target_refs.len()
+        );
+
+        for unresolved_ref in target_refs {
+            let res = self.resolve_reference_with_kind(
+                unresolved_ref.from_node_id.as_str(),
+                &unresolved_ref.reference_name,
+                unresolved_ref.reference_kind,
+            )?;
+            result.stats.total_processed += 1;
+            if let Some(ref target) = res.target {
+                result.stats.resolved += 1;
+                result
+                    .source_node_ids
+                    .insert(unresolved_ref.from_node_id.as_str().to_string());
+                result
+                    .target_node_ids
+                    .insert(target.node_id.as_str().to_string());
+            } else {
+                result.stats.unresolved += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Resolve a single reference (defaults to EdgeKind::References for backward compat)
     pub fn resolve_reference(
         &mut self,
@@ -255,9 +341,9 @@ impl<'a> ReferenceResolver<'a> {
             // Ignore duplicate edge errors
             let _ = self.queries.insert_edge(self.conn, &edge);
 
-            // Mark as resolved in unresolved_refs table
+            // Mark as resolved in unresolved_refs table (soft delete)
             self.queries
-                .delete_unresolved_reference(self.conn, source_id, ref_name)?;
+                .mark_unresolved_ref_resolved(self.conn, source_id, ref_name)?;
         }
 
         Ok(ResolutionResult {

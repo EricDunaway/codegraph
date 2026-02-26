@@ -8,5 +8,5 @@ pub mod resolver;
 pub mod matcher;
 
 pub use error::ResolutionError;
-pub use resolver::{ReferenceResolver, ResolutionResult, ResolutionStats};
+pub use resolver::{ReferenceResolver, ResolutionResult, ResolutionStats, ScopedResolutionResult};
 pub use matcher::NameMatcher;
