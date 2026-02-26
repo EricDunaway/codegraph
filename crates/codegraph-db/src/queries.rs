@@ -496,7 +496,7 @@ impl QueryBuilder {
     pub fn insert_edge(&self, conn: &Connection, edge: &Edge) -> Result<(), DbError> {
         conn.execute(
             r#"
-            INSERT INTO edges (source, target, kind, metadata, line, col)
+            INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             params![
@@ -699,13 +699,101 @@ impl QueryBuilder {
         Ok(refs)
     }
 
-    /// Get all unresolved references
+    /// Get all unresolved references (only those not yet resolved)
     pub fn get_all_unresolved_refs(&self, conn: &Connection) -> Result<Vec<UnresolvedReference>, DbError> {
-        let mut stmt = conn.prepare("SELECT * FROM unresolved_refs")?;
+        let mut stmt = conn.prepare("SELECT * FROM unresolved_refs WHERE resolved = 0")?;
         let refs = stmt
             .query_map([], Self::row_to_unresolved_ref)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(refs)
+    }
+
+    /// Get unresolved refs from nodes in the given files (source-scoped resolution).
+    /// Only returns refs where resolved = 0.
+    pub fn get_unresolved_refs_by_files(
+        &self,
+        conn: &Connection,
+        file_paths: &[&str],
+    ) -> Result<Vec<UnresolvedReference>, DbError> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            r#"SELECT ur.* FROM unresolved_refs ur
+               JOIN nodes n ON ur.from_node_id = n.id
+               WHERE n.file_path IN ({}) AND ur.resolved = 0"#,
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = file_paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let refs = stmt.query_map(params.as_slice(), Self::row_to_unresolved_ref)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(refs)
+    }
+
+    /// Get symbol names defined in the given files (for target-scoped resolution).
+    pub fn get_symbol_names_in_files(
+        &self,
+        conn: &Connection,
+        file_paths: &[&str],
+    ) -> Result<Vec<String>, DbError> {
+        if file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT DISTINCT name FROM nodes WHERE file_path IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = file_paths.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let names = stmt.query_map(params.as_slice(), |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Get unresolved refs matching given names, with frequency cap.
+    /// Skips names with > cap matching unresolved refs.
+    pub fn get_unresolved_refs_by_names_capped(
+        &self,
+        conn: &Connection,
+        names: &[&str],
+        cap: usize,
+    ) -> Result<Vec<UnresolvedReference>, DbError> {
+        let mut result = Vec::new();
+        for name in names {
+            let count: usize = conn.query_row(
+                "SELECT COUNT(*) FROM unresolved_refs WHERE reference_name = ?1 AND resolved = 0",
+                params![name],
+                |row| row.get(0),
+            )?;
+            if count > cap {
+                log::debug!("Skipping target-scoped resolution for '{}': {} refs > cap {}", name, count, cap);
+                continue;
+            }
+            let mut stmt = conn.prepare(
+                "SELECT * FROM unresolved_refs WHERE reference_name = ?1 AND resolved = 0"
+            )?;
+            let refs = stmt.query_map(params![name], Self::row_to_unresolved_ref)?
+                .collect::<Result<Vec<_>, _>>()?;
+            result.extend(refs);
+        }
+        Ok(result)
+    }
+
+    /// Mark an unresolved ref as resolved (set resolved = 1 instead of deleting).
+    pub fn mark_unresolved_ref_resolved(
+        &self,
+        conn: &Connection,
+        from_node_id: &str,
+        reference_name: &str,
+    ) -> Result<(), DbError> {
+        conn.execute(
+            "UPDATE unresolved_refs SET resolved = 1 WHERE from_node_id = ?1 AND reference_name = ?2 AND resolved = 0",
+            params![from_node_id, reference_name],
+        )?;
+        Ok(())
     }
 
     /// Clear all unresolved references

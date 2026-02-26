@@ -62,12 +62,55 @@ pub fn migrate_to_v2(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Migrate schema from v2 to v3 (edge dedup + resolved refs)
+pub fn migrate_to_v3(conn: &Connection) -> Result<(), DbError> {
+    let current = get_schema_version(conn)?;
+    if current >= 3 {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        BEGIN TRANSACTION;
+
+        -- Deduplicate existing edge rows
+        DELETE FROM edges WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM edges
+            GROUP BY source, target, kind, COALESCE(line, -1), COALESCE(col, -1)
+        );
+
+        -- Add unique index to prevent future duplicates
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+        ON edges(source, target, kind, COALESCE(line, -1), COALESCE(col, -1));
+
+        -- Add resolved column to unresolved_refs (soft delete)
+        ALTER TABLE unresolved_refs ADD COLUMN resolved INTEGER DEFAULT 0;
+
+        -- Index for scoped resolution queries
+        CREATE INDEX IF NOT EXISTS idx_unresolved_name_resolved
+        ON unresolved_refs(reference_name, resolved);
+
+        -- Record migration
+        INSERT INTO schema_version (version, applied_at, description)
+        VALUES (3, strftime('%s', 'now'), 'Edge dedup + unresolved_refs retention');
+
+        COMMIT;
+    "#,
+    )?;
+
+    Ok(())
+}
+
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> Result<(), DbError> {
     let current = get_schema_version(conn)?;
 
     if current < 2 {
         migrate_to_v2(conn)?;
+    }
+
+    if current < 3 {
+        migrate_to_v3(conn)?;
     }
 
     Ok(())
@@ -81,21 +124,21 @@ mod tests {
     #[test]
     fn test_get_schema_version_after_migrations() {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        // Migrations auto-run on connection open, so we should be at v2
+        // Migrations auto-run on connection open, so we should be at v3
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
     fn test_migration_to_v2() {
         let db = DatabaseConnection::open_in_memory().unwrap();
 
-        // Run migration
+        // Run migration (idempotent - already applied by open_in_memory)
         migrate_to_v2(db.conn()).unwrap();
 
-        // Check version updated
+        // Version is at latest (v3) since open_in_memory runs all migrations
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 2);
+        assert!(version >= 2);
 
         // Verify new columns exist by inserting with them
         db.conn()
@@ -112,16 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_idempotent() {
+    fn test_migration_v2_idempotent() {
         let db = DatabaseConnection::open_in_memory().unwrap();
 
-        // Run migration twice
+        // Run migration twice (idempotent)
         migrate_to_v2(db.conn()).unwrap();
         migrate_to_v2(db.conn()).unwrap();
 
-        // Should still be v2
+        // Version is at latest since open_in_memory runs all migrations
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 2);
+        assert!(version >= 2);
     }
 
     #[test]
@@ -133,7 +176,7 @@ mod tests {
 
         // Should be at latest version
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -191,5 +234,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, "true");
+    }
+
+    #[test]
+    fn test_migration_to_v3() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        // V3 already applied by open_in_memory -> run_migrations
+        migrate_to_v3(db.conn()).unwrap();
+        let version = get_schema_version(db.conn()).unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn test_migration_v3_idempotent() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        migrate_to_v3(db.conn()).unwrap();
+        migrate_to_v3(db.conn()).unwrap();
+        assert_eq!(get_schema_version(db.conn()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_edge_dedup_unique_index() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+
+        // Insert a test node first (edges reference nodes)
+        db.conn()
+            .execute(
+                "INSERT INTO nodes (id, kind, name, qualified_name, file_path, language,
+                 start_line, end_line, start_column, end_column, updated_at)
+                 VALUES ('n1', 'function', 'f', 'f', 'a.rs', 'rust', 1, 1, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // First edge insert succeeds
+        db.conn()
+            .execute(
+                "INSERT OR IGNORE INTO edges (source, target, kind, line, col) VALUES ('n1', 'n1', 'calls', 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Duplicate insert is silently ignored
+        db.conn()
+            .execute(
+                "INSERT OR IGNORE INTO edges (source, target, kind, line, col) VALUES ('n1', 'n1', 'calls', 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Count should be 1
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Same edge at different line is distinct
+        db.conn()
+            .execute(
+                "INSERT OR IGNORE INTO edges (source, target, kind, line, col) VALUES ('n1', 'n1', 'calls', 5, 0)",
+                [],
+            )
+            .unwrap();
+
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

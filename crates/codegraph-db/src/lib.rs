@@ -19,7 +19,7 @@ pub use enrichment_deps::{
     insert_enrichment_dep, insert_enrichment_deps_batch,
 };
 pub use error::DbError;
-pub use migrations::{get_schema_version, migrate_to_v2, run_migrations};
+pub use migrations::{get_schema_version, migrate_to_v2, migrate_to_v3, run_migrations};
 pub use queries::QueryBuilder;
 
 // Re-export rusqlite for external access to Connection type
