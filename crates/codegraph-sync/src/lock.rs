@@ -67,6 +67,23 @@ impl IndexLock {
         Self::acquire(codegraph_dir)
     }
 
+    /// Attempt to acquire lock. On LockHeld in hook mode, write sync.pending.
+    /// Returns Ok(Some(lock)) on success, Ok(None) if pending was written.
+    pub fn try_acquire_or_pending(
+        codegraph_dir: &Path,
+        hook_name: &str,
+    ) -> Result<Option<Self>, SyncError> {
+        match Self::acquire(codegraph_dir) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(SyncError::LockHeld) => {
+                use crate::pending::PendingSync;
+                PendingSync::new(codegraph_dir).write(hook_name)?;
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check if this lock is currently held
     pub fn is_held(&self) -> bool {
         self.held
@@ -233,5 +250,34 @@ mod tests {
         let contents = fs::read_to_string(&lock_path).unwrap();
         let pid: u32 = contents.trim().parse().unwrap();
         assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn test_try_acquire_or_pending_succeeds_when_unlocked() {
+        let temp = TempDir::new().unwrap();
+        let codegraph_dir = temp.path().join(".codegraph");
+        fs::create_dir_all(&codegraph_dir).unwrap();
+
+        let result = IndexLock::try_acquire_or_pending(&codegraph_dir, "post-commit").unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_held());
+    }
+
+    #[test]
+    fn test_try_acquire_or_pending_writes_pending_on_collision() {
+        let temp = TempDir::new().unwrap();
+        let codegraph_dir = temp.path().join(".codegraph");
+        fs::create_dir_all(&codegraph_dir).unwrap();
+
+        // Hold the lock
+        let _lock = IndexLock::acquire(&codegraph_dir).unwrap();
+
+        // try_acquire_or_pending should write sync.pending and return None
+        let result =
+            IndexLock::try_acquire_or_pending(&codegraph_dir, "post-commit").unwrap();
+        assert!(result.is_none());
+
+        // sync.pending should exist
+        assert!(codegraph_dir.join("sync.pending").exists());
     }
 }
