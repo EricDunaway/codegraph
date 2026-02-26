@@ -2,6 +2,7 @@
 
 use crate::change_detector::{ChangeDetector, ChangeKind, FileChange};
 use crate::error::SyncError;
+use crate::impact::ImpactCapture;
 use crate::lock::IndexLock;
 use crate::selective::SelectiveScope;
 use codegraph_db::QueryBuilder;
@@ -65,6 +66,8 @@ pub struct SyncResult {
     pub deleted_node_ids: Vec<String>,
     /// File paths that changed (added, modified, or deleted)
     pub changed_file_paths: Vec<String>,
+    /// Pre-delete impact: neighbors and siblings of modified/deleted nodes.
+    pub pre_delete_impact: ImpactCapture,
 }
 
 /// Configuration for sync
@@ -163,11 +166,11 @@ impl SyncManager {
         // Collect changed file paths for selective scope
         let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
 
-        let deleted_node_ids = if had_changes {
+        let (deleted_node_ids, pre_delete_impact) = if had_changes {
             // Process changes
             self.process_changes(conn, queries, &changes, &mut stats)?
         } else {
-            Vec::new()
+            (Vec::new(), ImpactCapture::new())
         };
 
         // Compute selective scope with cascade depth
@@ -197,6 +200,7 @@ impl SyncManager {
             enrichment_scope,
             deleted_node_ids,
             changed_file_paths: changed_files,
+            pre_delete_impact,
         })
     }
 
@@ -217,10 +221,10 @@ impl SyncManager {
         // Collect changed file paths for selective scope
         let changed_files: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
 
-        let deleted_node_ids = if had_changes {
+        let (deleted_node_ids, pre_delete_impact) = if had_changes {
             self.process_changes(conn, queries, &changes, &mut stats)?
         } else {
-            Vec::new()
+            (Vec::new(), ImpactCapture::new())
         };
 
         // Compute selective scope with cascade depth
@@ -250,18 +254,20 @@ impl SyncManager {
             enrichment_scope,
             deleted_node_ids,
             changed_file_paths: changed_files,
+            pre_delete_impact,
         })
     }
 
-    /// Process detected changes, returning IDs of deleted nodes
+    /// Process detected changes, returning IDs of deleted nodes and accumulated impact
     fn process_changes(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         changes: &[FileChange],
         stats: &mut SyncStats,
-    ) -> Result<Vec<String>, SyncError> {
+    ) -> Result<(Vec<String>, ImpactCapture), SyncError> {
         let mut deleted_node_ids = Vec::new();
+        let mut accumulated_impact = ImpactCapture::new();
 
         for change in changes {
             match change.kind {
@@ -281,11 +287,12 @@ impl SyncManager {
                 }
                 ChangeKind::Modified => {
                     match self.process_modify(conn, queries, change) {
-                        Ok((deleted, added, old_ids)) => {
+                        Ok((deleted, added, old_ids, impact)) => {
                             stats.files_modified += 1;
                             stats.nodes_deleted += deleted;
                             stats.nodes_added += added;
                             deleted_node_ids.extend(old_ids);
+                            accumulated_impact.merge(impact);
                         }
                         Err(e) => {
                             stats.errors.push(format!("Error modifying {}: {}", change.path, e));
@@ -297,10 +304,11 @@ impl SyncManager {
                 }
                 ChangeKind::Deleted => {
                     match self.process_delete(conn, queries, change) {
-                        Ok((node_count, old_ids)) => {
+                        Ok((node_count, old_ids, impact)) => {
                             stats.files_deleted += 1;
                             stats.nodes_deleted += node_count;
                             deleted_node_ids.extend(old_ids);
+                            accumulated_impact.merge(impact);
                         }
                         Err(e) => {
                             stats.errors.push(format!("Error deleting {}: {}", change.path, e));
@@ -313,7 +321,7 @@ impl SyncManager {
             }
         }
 
-        Ok(deleted_node_ids)
+        Ok((deleted_node_ids, accumulated_impact))
     }
 
     /// Process an added file
@@ -356,7 +364,7 @@ impl SyncManager {
         Ok(node_count)
     }
 
-    /// Process a modified file, returning (old_count, new_count, old_node_ids)
+    /// Process a modified file, returning (old_count, new_count, old_node_ids, impact)
     ///
     /// Safety: parses new content BEFORE deleting old data. If extraction fails,
     /// old nodes are preserved (no data loss).
@@ -365,7 +373,7 @@ impl SyncManager {
         conn: &Connection,
         queries: &mut QueryBuilder,
         change: &FileChange,
-    ) -> Result<(usize, usize, Vec<String>), SyncError> {
+    ) -> Result<(usize, usize, Vec<String>, ImpactCapture), SyncError> {
         // 1. Parse new content FIRST — failure preserves old data
         let full_path = std::path::Path::new(&self.base_path).join(&change.path);
         let content = std::fs::read_to_string(&full_path)?;
@@ -376,7 +384,11 @@ impl SyncManager {
         let old_count = old_nodes.len();
         let old_node_ids: Vec<String> = old_nodes.iter().map(|n| n.id.0.clone()).collect();
 
-        // 3. Now safe to delete old + insert new
+        // 3. Capture pre-delete impact (neighbors/siblings) while edges still exist
+        let old_id_refs: Vec<&str> = old_node_ids.iter().map(|s| s.as_str()).collect();
+        let impact = ImpactCapture::capture(conn, &old_id_refs)?;
+
+        // 4. Now safe to delete old + insert new
         queries.delete_nodes_by_file(conn, &change.path)?;
 
         let new_count = result.nodes.len();
@@ -399,25 +411,29 @@ impl SyncManager {
         };
         queries.upsert_file(conn, &file_record)?;
 
-        Ok((old_count, new_count, old_node_ids))
+        Ok((old_count, new_count, old_node_ids, impact))
     }
 
-    /// Process a deleted file, returning (node_count, old_node_ids)
+    /// Process a deleted file, returning (node_count, old_node_ids, impact)
     fn process_delete(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         change: &FileChange,
-    ) -> Result<(usize, Vec<String>), SyncError> {
+    ) -> Result<(usize, Vec<String>, ImpactCapture), SyncError> {
         // Capture old node IDs before deletion
         let old_nodes = queries.get_nodes_by_file(conn, &change.path)?;
         let count = old_nodes.len();
         let old_node_ids: Vec<String> = old_nodes.iter().map(|n| n.id.0.clone()).collect();
 
+        // Capture pre-delete impact (neighbors/siblings) while edges still exist
+        let old_id_refs: Vec<&str> = old_node_ids.iter().map(|s| s.as_str()).collect();
+        let impact = ImpactCapture::capture(conn, &old_id_refs)?;
+
         // Delete file and its nodes
         queries.delete_file(conn, &change.path)?;
 
-        Ok((count, old_node_ids))
+        Ok((count, old_node_ids, impact))
     }
 }
 
