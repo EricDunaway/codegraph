@@ -1339,10 +1339,33 @@ mod tests {
         let edge = Edge::new("n1", "n1", EdgeKind::Contains);
         queries.insert_edge(db.conn(), &edge).unwrap();
 
-        // Verify data exists
+        // Insert a file record
+        let file = FileRecord {
+            path: "test.rs".to_string(),
+            content_hash: "abc123".to_string(),
+            language: Language::Rust,
+            size: 100,
+            modified_at: 12345,
+            indexed_at: 12346,
+            node_count: 1,
+            errors: Vec::new(),
+        };
+        queries.upsert_file(db.conn(), &file).unwrap();
+
+        // Insert an unresolved reference
+        queries
+            .insert_unresolved_reference(db.conn(), "n1", "SomeType", "test.rs", 5)
+            .unwrap();
+
+        // Verify data exists before clearing
         let stats = queries.get_stats(db.conn()).unwrap();
         assert!(stats.node_count > 0);
         assert!(stats.edge_count > 0);
+        assert!(stats.file_count > 0);
+        let unresolved_before: i32 = db.conn()
+            .query_row("SELECT COUNT(*) FROM unresolved_refs", [], |r| r.get(0))
+            .unwrap();
+        assert!(unresolved_before > 0);
 
         // Clear
         queries.clear_all_graph_data(db.conn()).unwrap();

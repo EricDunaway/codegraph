@@ -133,11 +133,11 @@ impl CodeGraph {
             match IndexLock::acquire(&self.config.data_dir) {
                 Ok(lock) => Some(lock),
                 Err(codegraph_sync::SyncError::LockHeld) => {
-                    return Err(CodeGraphError::Other(
-                        "Cannot reindex: sync operation in progress".to_string(),
+                    return Err(CodeGraphError::Sync(
+                        codegraph_sync::SyncError::LockHeld,
                     ));
                 }
-                Err(e) => return Err(CodeGraphError::Other(e.to_string())),
+                Err(e) => return Err(CodeGraphError::Sync(e)),
             }
         } else {
             None
