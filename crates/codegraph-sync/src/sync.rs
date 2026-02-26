@@ -357,27 +357,28 @@ impl SyncManager {
     }
 
     /// Process a modified file, returning (old_count, new_count, old_node_ids)
+    ///
+    /// Safety: parses new content BEFORE deleting old data. If extraction fails,
+    /// old nodes are preserved (no data loss).
     fn process_modify(
         &self,
         conn: &Connection,
         queries: &mut QueryBuilder,
         change: &FileChange,
     ) -> Result<(usize, usize, Vec<String>), SyncError> {
-        // Capture old node IDs before deletion
+        // 1. Parse new content FIRST — failure preserves old data
+        let full_path = std::path::Path::new(&self.base_path).join(&change.path);
+        let content = std::fs::read_to_string(&full_path)?;
+        let result = self.registry.extract(&content, &change.path, change.language)?;
+
+        // 2. Capture old node IDs before deletion
         let old_nodes = queries.get_nodes_by_file(conn, &change.path)?;
         let old_count = old_nodes.len();
         let old_node_ids: Vec<String> = old_nodes.iter().map(|n| n.id.0.clone()).collect();
 
-        // Delete old nodes and edges
+        // 3. Now safe to delete old + insert new
         queries.delete_nodes_by_file(conn, &change.path)?;
 
-        // Re-extract
-        let full_path = std::path::Path::new(&self.base_path).join(&change.path);
-        let content = std::fs::read_to_string(&full_path)?;
-
-        let result = self.registry.extract(&content, &change.path, change.language)?;
-
-        // Insert new nodes
         let new_count = result.nodes.len();
         queries.insert_nodes(conn, &result.nodes)?;
         queries.insert_edges(conn, &result.edges)?;
@@ -386,7 +387,6 @@ impl SyncManager {
             queries.insert_unresolved_ref(conn, ref_info)?;
         }
 
-        // Update file record
         let file_record = FileRecord {
             path: change.path.clone(),
             content_hash: change.new_hash.clone().unwrap_or_default(),
