@@ -923,8 +923,10 @@ impl QueryBuilder {
 
     /// Clear all graph data (nodes, edges, files, unresolved_refs).
     /// Used by index_all() to do a clean rebuild.
-    pub fn clear_all_graph_data(&self, conn: &Connection) -> Result<(), DbError> {
-        // Order matters: edges have FK to nodes, unresolved_refs have FK to nodes
+    pub fn clear_all_graph_data(&mut self, conn: &Connection) -> Result<(), DbError> {
+        self.node_cache.clear();
+        self.cache_order.clear();
+        // Delete in dependency order (also handled by FK CASCADE, but explicit for clarity)
         conn.execute_batch(
             "DELETE FROM edges;
              DELETE FROM unresolved_refs;
@@ -1327,7 +1329,7 @@ mod tests {
     #[test]
     fn test_clear_all_graph_data() {
         let db = DatabaseConnection::open_in_memory().unwrap();
-        let queries = QueryBuilder::new(db.conn()).unwrap();
+        let mut queries = QueryBuilder::new(db.conn()).unwrap();
 
         // Insert a node
         let node = create_test_node("n1", "foo");
@@ -1345,10 +1347,20 @@ mod tests {
         // Clear
         queries.clear_all_graph_data(db.conn()).unwrap();
 
-        // Verify empty
+        // Verify all tables empty
         let stats = queries.get_stats(db.conn()).unwrap();
         assert_eq!(stats.node_count, 0);
         assert_eq!(stats.edge_count, 0);
         assert_eq!(stats.file_count, 0);
+
+        // Verify unresolved_refs also cleared
+        let unresolved_count: i32 = db.conn()
+            .query_row("SELECT COUNT(*) FROM unresolved_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unresolved_count, 0);
+
+        // Verify cache is not stale after clear
+        let cached = queries.get_node_by_id(db.conn(), "n1").unwrap();
+        assert!(cached.is_none(), "node should not be served from stale cache after clear");
     }
 }
