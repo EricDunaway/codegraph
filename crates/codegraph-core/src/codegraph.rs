@@ -541,6 +541,7 @@ impl CodeGraph {
         NodeKind::Trait,
         NodeKind::Enum,
         NodeKind::Module,
+        NodeKind::Component,
     ];
 
     /// Compute the set of node IDs that need re-embedding after a sync.

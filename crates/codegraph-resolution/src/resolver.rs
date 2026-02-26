@@ -314,7 +314,7 @@ impl<'a> ReferenceResolver<'a> {
             .unwrap_or("");
 
         // Try resolution strategies in order
-        let target = self
+        let mut target = self
             .try_import_resolution(source_id, ref_name)?
             .or_else(|| self.try_exact_match(ref_name, source_file).ok().flatten())
             .or_else(|| self.try_qualified_match(ref_name, source_file).ok().flatten())
@@ -338,12 +338,22 @@ impl<'a> ReferenceResolver<'a> {
         // If resolved, create the edge with the actual reference kind
         if let Some(ref resolved) = target {
             let edge = Edge::new(source_id, resolved.node_id.as_str(), edge_kind);
-            // Ignore duplicate edge errors
-            let _ = self.queries.insert_edge(self.conn, &edge);
-
-            // Mark as resolved in unresolved_refs table (soft delete)
-            self.queries
-                .mark_unresolved_ref_resolved(self.conn, source_id, ref_name)?;
+            match self.queries.insert_edge(self.conn, &edge) {
+                Ok(()) => {
+                    self.queries
+                        .mark_unresolved_ref_resolved(self.conn, source_id, ref_name)?;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Edge insert failed for {}->{}: {}; leaving ref unresolved",
+                        source_id,
+                        resolved.node_id,
+                        e
+                    );
+                    // Clear target so callers don't count this as resolved
+                    target = None;
+                }
+            }
         }
 
         Ok(ResolutionResult {
