@@ -918,6 +918,23 @@ impl QueryBuilder {
     }
 
     // =========================================================================
+    // Bulk Data Operations
+    // =========================================================================
+
+    /// Clear all graph data (nodes, edges, files, unresolved_refs).
+    /// Used by index_all() to do a clean rebuild.
+    pub fn clear_all_graph_data(&self, conn: &Connection) -> Result<(), DbError> {
+        // Order matters: edges have FK to nodes, unresolved_refs have FK to nodes
+        conn.execute_batch(
+            "DELETE FROM edges;
+             DELETE FROM unresolved_refs;
+             DELETE FROM nodes;
+             DELETE FROM files;"
+        )?;
+        Ok(())
+    }
+
+    // =========================================================================
     // Cache Management
     // =========================================================================
 
@@ -1305,5 +1322,33 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all.get("key1"), Some(&"value1".to_string()));
         assert_eq!(all.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_clear_all_graph_data() {
+        let db = DatabaseConnection::open_in_memory().unwrap();
+        let queries = QueryBuilder::new(db.conn()).unwrap();
+
+        // Insert a node
+        let node = create_test_node("n1", "foo");
+        queries.insert_node(db.conn(), &node).unwrap();
+
+        // Insert an edge (self-referential to keep it simple)
+        let edge = Edge::new("n1", "n1", EdgeKind::Contains);
+        queries.insert_edge(db.conn(), &edge).unwrap();
+
+        // Verify data exists
+        let stats = queries.get_stats(db.conn()).unwrap();
+        assert!(stats.node_count > 0);
+        assert!(stats.edge_count > 0);
+
+        // Clear
+        queries.clear_all_graph_data(db.conn()).unwrap();
+
+        // Verify empty
+        let stats = queries.get_stats(db.conn()).unwrap();
+        assert_eq!(stats.node_count, 0);
+        assert_eq!(stats.edge_count, 0);
+        assert_eq!(stats.file_count, 0);
     }
 }
