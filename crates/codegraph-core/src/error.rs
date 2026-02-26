@@ -68,4 +68,8 @@ pub enum CodeGraphError {
     /// Embedding error
     #[error("Embedding error: {0}")]
     Embedding(String),
+
+    /// Other error
+    #[error("{0}")]
+    Other(String),
 }

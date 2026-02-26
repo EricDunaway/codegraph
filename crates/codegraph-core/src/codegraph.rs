@@ -8,6 +8,7 @@ use codegraph_extraction::{ExtractionOrchestrator, IndexResult as ExtractionInde
 use codegraph_graph::{GraphQueryManager, GraphTraverser, ImpactRadius};
 use codegraph_resolution::ReferenceResolver;
 use codegraph_sync::edge_diff::EdgeDiff;
+use codegraph_sync::IndexLock;
 use codegraph_types::{Config, Node, NodeKind, SearchResult};
 use codegraph_vectors::{EmbedderConfig, SimilarityResult, TextEmbedder, VectorError, VectorStorage};
 use std::collections::HashSet;
@@ -127,6 +128,21 @@ impl CodeGraph {
         use codegraph_types::FileRecord;
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        // Acquire lock to prevent concurrent sync during full reindex
+        let _lock = if self.config.data_dir.exists() {
+            match IndexLock::acquire(&self.config.data_dir) {
+                Ok(lock) => Some(lock),
+                Err(codegraph_sync::SyncError::LockHeld) => {
+                    return Err(CodeGraphError::Other(
+                        "Cannot reindex: sync operation in progress".to_string(),
+                    ));
+                }
+                Err(e) => return Err(CodeGraphError::Other(e.to_string())),
+            }
+        } else {
+            None
+        };
+
         let extraction_config = Config {
             root_dir: self.config.root.to_string_lossy().to_string(),
             exclude: self.config.exclude_patterns.clone(),
@@ -149,8 +165,8 @@ impl CodeGraph {
 
         log::info!("Found {} files to index", scan_result.files.len());
 
-        // Clear previous unresolved refs before re-indexing
-        self.queries.clear_unresolved_refs(self.db.conn())?;
+        // Clear all graph data before full re-index (nodes, edges, files, unresolved_refs)
+        self.queries.clear_all_graph_data(self.db.conn())?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
