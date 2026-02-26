@@ -7,7 +7,6 @@ use codegraph_db::{DatabaseConnection, QueryBuilder};
 use codegraph_extraction::{ExtractionOrchestrator, IndexResult as ExtractionIndexResult};
 use codegraph_graph::{GraphQueryManager, GraphTraverser, ImpactRadius};
 use codegraph_resolution::ReferenceResolver;
-use codegraph_sync::edge_diff::EdgeDiff;
 use codegraph_sync::IndexLock;
 use codegraph_types::{Config, Node, NodeKind, SearchResult};
 use codegraph_vectors::{EmbedderConfig, SimilarityResult, TextEmbedder, VectorError, VectorStorage};
@@ -266,13 +265,16 @@ impl CodeGraph {
     ///
     /// Also handles incremental embedding updates:
     /// - Checks for full re-embed triggers (schema/config/model change)
-    /// - Captures edge snapshots before and after sync to detect structural changes
+    /// - Uses ImpactCapture (pre-delete neighbors + siblings) from SyncManager
+    /// - Runs scoped reference resolution for changed files only
+    /// - Computes embed candidates from impact + resolution results
     /// - Re-embeds new, modified, and ripple-affected nodes
     /// - Deletes vectors for removed nodes
+    /// - Warns if >30% of files changed (full reindex heuristic)
     ///
     /// Returns a `FullSyncResult` containing both the file sync stats and embedding stats.
     pub fn sync(&mut self) -> Result<FullSyncResult, CodeGraphError> {
-        use codegraph_sync::{EdgeSnapshot, ReembedConfig, SyncConfig, SyncManager};
+        use codegraph_sync::{ReembedConfig, SyncConfig, SyncManager};
 
         let sync_config = SyncConfig {
             excludes: self.config.exclude_patterns.clone(),
@@ -303,14 +305,10 @@ impl CodeGraph {
             &reembed_config,
         );
 
-        // Capture pre-sync edge snapshot for incremental embedding.
-        // Must happen BEFORE sync because sync deletes nodes (CASCADE deletes edges).
-        // On the full re-embed path we skip this since all embeddings are regenerated.
-        let pre_snapshot = if !needs_full_reembed {
-            EdgeSnapshot::capture(self.db.conn())
-        } else {
-            EdgeSnapshot::new()
-        };
+        // No pre-sync EdgeSnapshot needed: SyncManager now captures pre-delete
+        // impact (neighbors + siblings) inside process_modify/process_delete
+        // before edges are CASCADE-deleted. That data lives in
+        // sync_result.pre_delete_impact.
 
         // Run sync (detect changes, re-extract files, update DB)
         let sync_result = manager.sync_with_codegraph_dir(
@@ -319,11 +317,49 @@ impl CodeGraph {
             Some(&self.config.data_dir),
         )?;
 
-        // Resolve references for changed files if enabled
-        if self.config.resolve_references && sync_result.had_changes {
-            let mut resolver = ReferenceResolver::new(self.db.conn(), &mut self.queries);
-            let _ = resolver.resolve_all();
+        // Full-reindex heuristic check: warn if >30% of tracked files changed.
+        // Actual fallback to index_all() is deferred to M3 (sync_with_options).
+        if sync_result.had_changes {
+            let graph_stats = self.queries.get_stats(self.db.conn())?;
+            let total_files = graph_stats.file_count as usize;
+            let changed_files = sync_result.changed_file_paths.len();
+            if total_files > 0 && changed_files * 100 / total_files > 30 {
+                log::warn!(
+                    "Large changeset detected: {}/{} files changed ({}%). \
+                     Consider running index_all() instead of sync() for better performance.",
+                    changed_files,
+                    total_files,
+                    changed_files * 100 / total_files,
+                );
+            }
         }
+
+        // Resolve references for changed files if enabled (scoped, not global)
+        let scoped_resolution = if self.config.resolve_references && sync_result.had_changes {
+            let changed_file_refs: Vec<&str> = sync_result
+                .changed_file_paths
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut resolver = ReferenceResolver::new(self.db.conn(), &mut self.queries);
+            match resolver.resolve_for_files(&changed_file_refs) {
+                Ok(result) => {
+                    log::info!(
+                        "Scoped resolution: {} resolved ({} source nodes, {} target nodes)",
+                        result.stats.resolved,
+                        result.source_node_ids.len(),
+                        result.target_node_ids.len(),
+                    );
+                    Some(result)
+                }
+                Err(e) => {
+                    log::warn!("Scoped reference resolution failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Embedding sync: full re-embed or incremental update
         let mut embed_result = EmbeddingSyncResult::default();
@@ -358,10 +394,12 @@ impl CodeGraph {
                     }
                 }
             } else {
-                // Incremental: compute edge diff and re-embed affected nodes
-                let post_snapshot = EdgeSnapshot::capture(self.db.conn());
-                let edge_diff = EdgeDiff::compute(&pre_snapshot, &post_snapshot);
-                match self.sync_embeddings(&sync_result, &edge_diff) {
+                // Incremental: compute embed candidates from ImpactCapture + ScopedResolutionResult
+                let embed_candidates = self.compute_embed_candidates(
+                    &sync_result,
+                    scoped_resolution.as_ref(),
+                )?;
+                match self.sync_embeddings_for_candidates(&sync_result, embed_candidates) {
                     Ok(result) if !result.skipped_no_model => {
                         embed_result = result;
                         let _ = codegraph_sync::reembed::record_embed_metadata(
@@ -505,7 +543,189 @@ impl CodeGraph {
         NodeKind::Module,
     ];
 
-    /// Incrementally update embeddings after a sync operation.
+    /// Compute the set of node IDs that need re-embedding after a sync.
+    ///
+    /// Uses ImpactCapture (pre-delete neighbors + siblings) and ScopedResolutionResult
+    /// instead of the old EdgeSnapshot/EdgeDiff approach. The formula is:
+    ///
+    /// ```text
+    /// candidates = changed_nodes ∪ pre_delete_affected ∪ resolver_source
+    ///            ∪ resolver_target ∪ siblings - deleted
+    /// ```
+    fn compute_embed_candidates(
+        &self,
+        sync_result: &codegraph_sync::SyncResult,
+        scoped_resolution: Option<&codegraph_resolution::ScopedResolutionResult>,
+    ) -> Result<HashSet<String>, CodeGraphError> {
+        // 1. changed_nodes: current nodes in changed files (after sync)
+        let mut changed_nodes: HashSet<String> = HashSet::new();
+        for file_path in &sync_result.changed_file_paths {
+            let nodes = self.queries.get_nodes_by_file(self.db.conn(), file_path)?;
+            for node in nodes {
+                changed_nodes.insert(node.id.0.clone());
+            }
+        }
+
+        // 2. Truly deleted: old IDs that were NOT recreated
+        let truly_deleted: HashSet<&str> = sync_result
+            .deleted_node_ids
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|id| !changed_nodes.contains(*id))
+            .collect();
+
+        // 3. Build candidate set
+        let mut candidates = changed_nodes;
+
+        // pre_delete_affected: neighbors of modified/deleted nodes (captured before delete)
+        candidates.extend(
+            sync_result
+                .pre_delete_impact
+                .affected_ids
+                .iter()
+                .cloned(),
+        );
+
+        // siblings: nodes sharing Contains parent with modified/deleted nodes
+        candidates.extend(
+            sync_result
+                .pre_delete_impact
+                .sibling_ids
+                .iter()
+                .cloned(),
+        );
+
+        // resolver sources and targets from scoped resolution
+        if let Some(resolution) = scoped_resolution {
+            candidates.extend(resolution.source_node_ids.iter().cloned());
+            candidates.extend(resolution.target_node_ids.iter().cloned());
+        }
+
+        // Remove truly deleted nodes from candidates
+        candidates.retain(|id| !truly_deleted.contains(id.as_str()));
+
+        log::info!(
+            "Embed candidates: {} total ({} from impact, {} siblings, {} from resolver)",
+            candidates.len(),
+            sync_result.pre_delete_impact.affected_ids.len(),
+            sync_result.pre_delete_impact.sibling_ids.len(),
+            scoped_resolution
+                .map(|r| r.source_node_ids.len() + r.target_node_ids.len())
+                .unwrap_or(0),
+        );
+
+        Ok(candidates)
+    }
+
+    /// Incrementally update embeddings for a pre-computed set of candidate node IDs.
+    ///
+    /// This is the new incremental path that replaces the EdgeDiff-based approach.
+    /// Candidate computation happens in `compute_embed_candidates()`.
+    ///
+    /// Gracefully skips if the embedding model is unavailable.
+    fn sync_embeddings_for_candidates(
+        &mut self,
+        sync_result: &codegraph_sync::SyncResult,
+        embed_candidates: HashSet<String>,
+    ) -> Result<EmbeddingSyncResult, CodeGraphError> {
+        // Load embedder — gracefully skip if unavailable
+        let mut embedder = TextEmbedder::new(EmbedderConfig::default());
+        match embedder.load() {
+            Ok(()) => {}
+            Err(VectorError::ModelNotFound { .. }) => {
+                log::info!("Embedding model not found, skipping incremental embedding sync");
+                return Ok(EmbeddingSyncResult { skipped_no_model: true, ..Default::default() });
+            }
+            Err(VectorError::FeatureNotEnabled { .. }) => {
+                log::debug!("ONNX feature not enabled, skipping incremental embedding sync");
+                return Ok(EmbeddingSyncResult { skipped_no_model: true, ..Default::default() });
+            }
+            Err(e) => return Err(CodeGraphError::Vector(e)),
+        }
+
+        let dimension = embedder.dimension();
+        let storage = VectorStorage::new(dimension);
+        storage.init(self.db.conn())?;
+        let model_name = "nomic-embed-text-v1.5";
+
+        // 1. Compute truly deleted node IDs (old IDs not recreated)
+        let new_node_ids: HashSet<&str> = embed_candidates.iter().map(|s| s.as_str()).collect();
+        let truly_deleted: Vec<&str> = sync_result
+            .deleted_node_ids
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|id| !new_node_ids.contains(*id))
+            .collect();
+
+        // 2. Delete stale vectors
+        let vectors_deleted = truly_deleted.len();
+        if !truly_deleted.is_empty() {
+            storage.delete_batch(self.db.conn(), &truly_deleted)?;
+        }
+
+        // 3. Filter to embeddable kinds and generate embeddings
+        let embeddable_kinds: HashSet<NodeKind> = Self::EMBEDDABLE_KINDS.iter().copied().collect();
+        let mut vectors_created = 0;
+        let mut vectors_updated = 0;
+
+        for node_id in &embed_candidates {
+            let node = match self.queries.get_node_by_id(self.db.conn(), node_id)? {
+                Some(n) => n,
+                None => continue, // Node may have been deleted
+            };
+
+            if !embeddable_kinds.contains(&node.kind) {
+                continue;
+            }
+
+            // Check if this is a new embed or an update
+            let is_update = storage.get(self.db.conn(), node_id)?.is_some();
+
+            let text = match crate::embedding::build_embedding_text(
+                self.db.conn(),
+                &mut self.queries,
+                &node,
+                &self.config.embedding,
+            ) {
+                Ok(text) => text,
+                Err(e) => {
+                    log::warn!("Failed to build embedding text for {}: {}", node_id, e);
+                    continue;
+                }
+            };
+
+            let embedding = match embedder.embed_document(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("Failed to embed {}: {}", node_id, e);
+                    continue;
+                }
+            };
+
+            storage.store(self.db.conn(), node_id, &embedding, model_name)?;
+
+            if is_update {
+                vectors_updated += 1;
+            } else {
+                vectors_created += 1;
+            }
+        }
+
+        log::info!(
+            "Incremental embedding sync: {} deleted, {} created, {} updated",
+            vectors_deleted, vectors_created, vectors_updated
+        );
+
+        Ok(EmbeddingSyncResult {
+            vectors_deleted,
+            vectors_created,
+            vectors_updated,
+            skipped_no_model: false,
+            full_reembed: false,
+        })
+    }
+
+    /// Incrementally update embeddings after a sync operation (legacy EdgeDiff interface).
     ///
     /// This computes the minimal set of nodes that need re-embedding based on:
     /// - New nodes from added/modified files
@@ -513,11 +733,14 @@ impl CodeGraph {
     /// - Ripple nodes whose embedding text references changed nodes (via EdgeDiff)
     /// - Sibling nodes sharing a Contains parent with changed nodes
     ///
+    /// Retained for --verify-sync mode (M4). The primary sync path now uses
+    /// `compute_embed_candidates()` + `sync_embeddings_for_candidates()`.
+    ///
     /// Gracefully skips if the embedding model is unavailable.
     pub fn sync_embeddings(
         &mut self,
         sync_result: &codegraph_sync::SyncResult,
-        edge_diff: &EdgeDiff,
+        edge_diff: &codegraph_sync::edge_diff::EdgeDiff,
     ) -> Result<EmbeddingSyncResult, CodeGraphError> {
         // Load embedder — gracefully skip if unavailable
         let mut embedder = TextEmbedder::new(EmbedderConfig::default());
