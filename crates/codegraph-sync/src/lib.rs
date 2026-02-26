@@ -7,6 +7,7 @@ pub mod change_detector;
 pub mod edge_diff;
 pub mod error;
 pub mod git_hooks;
+pub mod impact;
 pub mod lock;
 pub mod reembed;
 pub mod selective;
@@ -14,6 +15,7 @@ pub mod sync;
 
 pub use change_detector::{ChangeDetector, FileChange, ChangeKind};
 pub use edge_diff::{EdgeDiff, EdgeKey, EdgeSnapshot};
+pub use impact::ImpactCapture;
 pub use error::SyncError;
 pub use git_hooks::GitHooksManager;
 pub use lock::IndexLock;
