@@ -42,4 +42,12 @@ pub enum SyncError {
     /// Lock is already held by another process
     #[error("Lock already held")]
     LockHeld,
+
+    /// Hook manager detected (Husky, Lefthook, etc.)
+    #[error("Hook manager detected: {tool}. Use --force to override.")]
+    HookManagerDetected { tool: String },
+
+    /// Other error
+    #[error("{0}")]
+    Other(String),
 }
