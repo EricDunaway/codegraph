@@ -479,6 +479,15 @@ impl CodeGraph {
             None
         };
 
+        // ====== Verify-sync: pre-snapshot ======
+        // Capture a full EdgeSnapshot before extraction so we can compare afterwards.
+        let pre_verify_snapshot = if options.verify_sync {
+            log::info!("verify-sync: capturing pre-sync EdgeSnapshot");
+            Some(codegraph_sync::EdgeSnapshot::capture(self.db.conn()))
+        } else {
+            None
+        };
+
         // ====== Phase 3: Extract (process changes) ======
         // Use SyncManager to detect (or process pre-detected) changes and update the DB.
         // SyncManager includes ImpactCapture in its process_modify/process_delete.
@@ -588,6 +597,7 @@ impl CodeGraph {
         if let Some(ref lock) = _lock { let _ = lock.refresh(); }
 
         let mut embed_result = EmbeddingSyncResult::default();
+        let mut embed_candidate_ids: Option<HashSet<String>> = None;
         if sync_result.had_changes || needs_full_reembed {
             if needs_full_reembed {
                 // Full re-embed: clear and regenerate all embeddings
@@ -621,6 +631,10 @@ impl CodeGraph {
                     &sync_result,
                     scoped_resolution.as_ref(),
                 )?;
+                // Store candidates for --verify-sync comparison
+                if options.verify_sync {
+                    embed_candidate_ids = Some(embed_candidates.clone());
+                }
                 match self.sync_embeddings_for_candidates(&sync_result, embed_candidates) {
                     Ok(result) if !result.skipped_no_model => {
                         embed_result = result;
@@ -652,6 +666,58 @@ impl CodeGraph {
             let failed_path = self.config.data_dir.join("sync.failed");
             if failed_path.exists() {
                 let _ = fs::remove_file(&failed_path);
+            }
+        }
+
+        // ====== Verify-sync: post-snapshot comparison ======
+        // Compare EdgeSnapshot-based affected nodes against ImpactCapture embed candidates.
+        if options.verify_sync {
+            if let Some(ref pre_snapshot) = pre_verify_snapshot {
+                let post_snapshot = codegraph_sync::EdgeSnapshot::capture(self.db.conn());
+                let diff = codegraph_sync::EdgeDiff::compute(pre_snapshot, &post_snapshot);
+
+                if diff.has_changes() {
+                    // Nodes affected per EdgeDiff (the "ground truth" set)
+                    let diff_affected: &HashSet<String> = &diff.affected_nodes;
+
+                    if let Some(ref candidates) = embed_candidate_ids {
+                        // Nodes that EdgeDiff says changed but ImpactCapture didn't flag
+                        let missed: Vec<&String> = diff_affected
+                            .iter()
+                            .filter(|id| !candidates.contains(*id))
+                            .collect();
+
+                        // Nodes that ImpactCapture flagged but EdgeDiff didn't see
+                        let extra: Vec<&String> = candidates
+                            .iter()
+                            .filter(|id| !diff_affected.contains(*id))
+                            .collect();
+
+                        if missed.is_empty() {
+                            log::info!(
+                                "verify-sync: ImpactCapture covered all {} EdgeDiff-affected nodes \
+                                 ({} extra candidates beyond EdgeDiff)",
+                                diff_affected.len(),
+                                extra.len(),
+                            );
+                        } else {
+                            log::warn!(
+                                "verify-sync: ImpactCapture missed {} of {} EdgeDiff-affected nodes: {:?}",
+                                missed.len(),
+                                diff_affected.len(),
+                                &missed[..missed.len().min(20)],
+                            );
+                        }
+                    } else {
+                        log::info!(
+                            "verify-sync: EdgeDiff found {} affected nodes but no incremental \
+                             candidates were computed (full re-embed or no changes)",
+                            diff_affected.len(),
+                        );
+                    }
+                } else {
+                    log::info!("verify-sync: no edge changes detected between snapshots");
+                }
             }
         }
 
