@@ -496,13 +496,11 @@ impl CodeGraph {
             // External file list mode
             let file_refs: Vec<&str> = file_list.iter().map(|s| s.as_str()).collect();
             manager.sync_files(self.db.conn(), &mut self.queries, &file_refs)?
-        } else if git_diff_changes.is_some() && !fallback_to_hash_scan {
+        } else if let (Some(ref changes), false) = (&git_diff_changes, fallback_to_hash_scan) {
             // Hook mode with git diff changes: use SyncManager with the diff-detected files.
             // Convert FileChange paths to file_refs for sync_files (which re-detects changes
             // against the DB under lock, providing revalidation).
-            let change_paths: Vec<String> = git_diff_changes
-                .as_ref()
-                .unwrap()
+            let change_paths: Vec<String> = changes
                 .iter()
                 .map(|c| c.path.clone())
                 .collect();
