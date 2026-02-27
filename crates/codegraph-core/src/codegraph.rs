@@ -675,20 +675,31 @@ impl CodeGraph {
                 let diff = codegraph_sync::EdgeDiff::compute(pre_snapshot, &post_snapshot);
 
                 if diff.has_changes() {
-                    // Nodes affected per EdgeDiff (the "ground truth" set)
-                    let diff_affected: &HashSet<String> = &diff.affected_nodes;
+                    // Nodes affected per EdgeDiff (the "ground truth" set), excluding
+                    // truly deleted nodes — they can't be re-embedded and are correctly
+                    // omitted from embed candidates.
+                    let truly_deleted: HashSet<&str> = sync_result
+                        .deleted_node_ids
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    let diff_affected: HashSet<&String> = diff
+                        .affected_nodes
+                        .iter()
+                        .filter(|id| !truly_deleted.contains(id.as_str()))
+                        .collect();
 
                     if let Some(ref candidates) = embed_candidate_ids {
                         // Nodes that EdgeDiff says changed but ImpactCapture didn't flag
-                        let missed: Vec<&String> = diff_affected
+                        let missed: Vec<&&String> = diff_affected
                             .iter()
-                            .filter(|id| !candidates.contains(*id))
+                            .filter(|id| !candidates.contains(**id))
                             .collect();
 
                         // Nodes that ImpactCapture flagged but EdgeDiff didn't see
                         let extra: Vec<&String> = candidates
                             .iter()
-                            .filter(|id| !diff_affected.contains(*id))
+                            .filter(|id| !diff_affected.contains(id))
                             .collect();
 
                         if missed.is_empty() {
