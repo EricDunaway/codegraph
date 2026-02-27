@@ -21,14 +21,31 @@ const HOOK_MARKER: &str = "Managed by codegraph";
 const BACKUP_SUFFIX: &str = ".codegraph-orig";
 
 /// Generate the hook script for a given hook name
-fn hook_script(hook_name: &str) -> String {
-    format!(
-        r#"#!/bin/sh
+fn hook_script(_hook_name: &str) -> String {
+    r#"#!/bin/sh
 # Managed by codegraph — do not edit this block
-codegraph sync "$PWD" --hook {} &
-"#,
-        hook_name
-    )
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -d "$repo_root/.codegraph" ] || exit 0
+
+hook_name="$(basename "$0")"
+
+# Chain to original hook if it exists
+orig_hook="$(dirname "$0")/${hook_name}.codegraph-orig"
+orig_exit=0
+if [ -x "$orig_hook" ]; then
+    "$orig_hook" "$@" || orig_exit=$?
+fi
+
+# Trigger sync in background
+if command -v codegraph >/dev/null 2>&1; then
+    ( codegraph sync "$repo_root" --hook "$hook_name" \
+        >> "$repo_root/.codegraph/sync.log" 2>&1 ) &
+fi
+
+exit "$orig_exit"
+"#.to_string()
 }
 
 /// Resolve the hooks directory using `git rev-parse --git-path hooks`.
@@ -127,6 +144,9 @@ impl GitHooksManager {
 
     /// Install a specific hook
     pub fn install_hook(&self, hook_name: &str) -> Result<(), SyncError> {
+        if !HOOKS.contains(&hook_name) {
+            return Err(SyncError::InvalidHookName { name: hook_name.to_string() });
+        }
         let hook_path = self.hooks_dir.join(hook_name);
         let backup_path = self.hooks_dir.join(format!("{}{}", hook_name, BACKUP_SUFFIX));
 
@@ -184,6 +204,9 @@ impl GitHooksManager {
 
     /// Uninstall a specific hook
     pub fn uninstall_hook(&self, hook_name: &str) -> Result<(), SyncError> {
+        if !HOOKS.contains(&hook_name) {
+            return Err(SyncError::InvalidHookName { name: hook_name.to_string() });
+        }
         let hook_path = self.hooks_dir.join(hook_name);
 
         if !hook_path.exists() {
@@ -218,6 +241,9 @@ impl GitHooksManager {
 
     /// Check if a specific hook is installed
     pub fn is_hook_installed(&self, hook_name: &str) -> bool {
+        if !HOOKS.contains(&hook_name) {
+            return false;
+        }
         let hook_path = self.hooks_dir.join(hook_name);
 
         if !hook_path.exists() {
@@ -368,7 +394,7 @@ mod tests {
 
         let hook_path = dir.path().join(".git/hooks/post-commit");
         let content = fs::read_to_string(&hook_path).unwrap();
-        assert!(content.contains("--hook post-commit"));
+        assert!(content.contains("--hook \"$hook_name\""));
         assert!(content.contains(HOOK_MARKER));
     }
 
@@ -383,10 +409,14 @@ mod tests {
             let hook_path = dir.path().join(format!(".git/hooks/{}", hook));
             let content = fs::read_to_string(&hook_path).unwrap();
             assert!(
-                content.contains(&format!("--hook {}", hook)),
-                "Hook {} should contain --hook {}",
+                content.contains("--hook \"$hook_name\""),
+                "Hook {} should contain --hook \"$hook_name\"",
                 hook,
-                hook
+            );
+            assert!(
+                content.contains(HOOK_MARKER),
+                "Hook {} should contain the marker",
+                hook,
             );
         }
     }

@@ -180,6 +180,29 @@ curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/mas
 curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-rust/master/grammar.js | grep -A5 "attribute_item:"
 ```
 
+## Versioning & Changelog
+
+**Single source of truth:** `CHANGELOG.md` (Keep a Changelog format)
+**Version location:** `Cargo.toml` → `[workspace.package] version`
+**Runtime access:** `env!("CARGO_PKG_VERSION")` (used in MCP server response)
+
+### When to update
+- **New feature**: Add entry under `## [Unreleased]` → `### Added`
+- **Bug fix**: Add entry under `## [Unreleased]` → `### Fixed`
+- **Breaking change**: Add entry under `## [Unreleased]` → `### Changed` or `### Removed`
+- **Deprecation**: Add entry under `## [Unreleased]` → `### Deprecated`
+- **Refactor with no behavior change**: No changelog entry needed
+
+### How to update
+1. Add a concise line to the appropriate section in `CHANGELOG.md` under `## [Unreleased]`
+2. When cutting a release, move `[Unreleased]` entries to a new `## [X.Y.Z] - YYYY-MM-DD` section
+3. Update `Cargo.toml` workspace version to match: `[workspace.package] version = "X.Y.Z"`
+
+### Skills/agents MUST
+- Add a changelog entry when completing any feature, fix, or behavioral change
+- Keep entries user-facing and concise (what changed, not how)
+- Never modify existing released version entries — only add to `[Unreleased]`
+
 ## Documentation Maintenance
 
 - **Always verify claims against code** - don't trust plan docs; check actual implementation

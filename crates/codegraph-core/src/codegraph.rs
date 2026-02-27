@@ -504,6 +504,9 @@ impl CodeGraph {
             manager.sync_with_codegraph_dir(self.db.conn(), &mut self.queries, None)?
         };
 
+        // Refresh lock after Phase 3 extraction
+        if let Some(ref lock) = _lock { let _ = lock.refresh(); }
+
         // Full-reindex fallback: if >30% of tracked files changed, do a full reindex
         if sync_result.had_changes {
             let graph_stats = self.queries.get_stats(self.db.conn())?;
@@ -577,7 +580,13 @@ impl CodeGraph {
             None
         };
 
+        // Refresh lock after Phase 4 resolution
+        if let Some(ref lock) = _lock { let _ = lock.refresh(); }
+
         // ====== Phase 5: Embed (compute candidates, sync embeddings) ======
+        // Refresh lock at start of Phase 5 embedding
+        if let Some(ref lock) = _lock { let _ = lock.refresh(); }
+
         let mut embed_result = EmbeddingSyncResult::default();
         if sync_result.had_changes || needs_full_reembed {
             if needs_full_reembed {

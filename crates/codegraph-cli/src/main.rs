@@ -42,6 +42,15 @@ enum Commands {
         /// Path to the project (default: current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Hook name (post-commit, post-checkout, post-merge, post-rewrite).
+        /// When set, enables hook-mode behavior (background, non-blocking).
+        #[arg(long)]
+        hook: Option<String>,
+
+        /// Run EdgeSnapshot verification after sync (debug mode).
+        #[arg(long)]
+        verify_sync: bool,
     },
 
     /// Show project statistics
@@ -104,6 +113,10 @@ enum HooksAction {
         /// Path to the project (default: current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Force install even if a hook manager (Husky, Lefthook) is detected
+        #[arg(long)]
+        force: bool,
     },
     /// Uninstall git hooks
     Uninstall {
@@ -132,12 +145,12 @@ fn main() {
     let result = match cli.command {
         Commands::Init { path } => commands::init(&path),
         Commands::Index { path } => commands::index(&path),
-        Commands::Sync { path } => commands::sync(&path),
+        Commands::Sync { path, hook, verify_sync } => commands::sync(&path, hook, verify_sync),
         Commands::Status { path } => commands::status(&path),
         Commands::Query { query, limit, path } => commands::query(&path, &query, limit),
         Commands::Context { task, max_tokens, path } => commands::context(&path, &task, max_tokens),
         Commands::Hooks { action } => match action {
-            HooksAction::Install { path } => commands::hooks_install(&path),
+            HooksAction::Install { path, force } => commands::hooks_install(&path, force),
             HooksAction::Uninstall { path } => commands::hooks_uninstall(&path),
             HooksAction::Status { path } => commands::hooks_status(&path),
         },

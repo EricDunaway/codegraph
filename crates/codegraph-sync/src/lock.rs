@@ -110,7 +110,37 @@ impl IndexLock {
         if self.held {
             self.held = false;
             if self.path.exists() {
-                fs::remove_file(&self.path)?;
+                // Verify PID ownership before deleting
+                let owned = match fs::read_to_string(&self.path) {
+                    Ok(contents) => match contents.trim().parse::<u32>() {
+                        Ok(pid) => {
+                            if pid == std::process::id() {
+                                true
+                            } else {
+                                log::warn!(
+                                    "Lock file PID mismatch: file has {}, our PID is {}. Skipping delete.",
+                                    pid,
+                                    std::process::id()
+                                );
+                                false
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Lock file contains unparseable PID, skipping delete: {}",
+                                self.path.display()
+                            );
+                            false
+                        }
+                    },
+                    Err(_) => {
+                        // File disappeared between exists() and read — already cleaned up
+                        false
+                    }
+                };
+                if owned {
+                    fs::remove_file(&self.path)?;
+                }
             }
         }
         Ok(())

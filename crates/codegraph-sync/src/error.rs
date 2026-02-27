@@ -43,6 +43,10 @@ pub enum SyncError {
     #[error("Lock already held")]
     LockHeld,
 
+    /// Invalid hook name
+    #[error("Invalid hook name: '{name}'. Valid hooks: post-commit, post-checkout, post-merge, post-rewrite")]
+    InvalidHookName { name: String },
+
     /// Hook manager detected (Husky, Lefthook, etc.)
     #[error("Hook manager detected: {tool}. Use --force to override.")]
     HookManagerDetected { tool: String },

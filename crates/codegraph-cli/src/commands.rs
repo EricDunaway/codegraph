@@ -1,6 +1,6 @@
 //! CLI command implementations
 
-use codegraph_core::{CodeGraph, CodeGraphConfig, CodeGraphError};
+use codegraph_core::{CodeGraph, CodeGraphConfig, CodeGraphError, SyncOptions};
 use codegraph_core::sync::SyncError;
 use codegraph_mcp::McpServer;
 use console::style;
@@ -123,39 +123,93 @@ pub fn index(path: &Path) -> Result<(), CliError> {
 }
 
 /// Sync changes incrementally
-pub fn sync(path: &Path) -> Result<(), CliError> {
+pub fn sync(path: &Path, hook: Option<String>, verify_sync: bool) -> Result<(), CliError> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let is_hook_mode = hook.is_some();
 
-    println!(
-        "{} Syncing {}",
-        style("→").cyan().bold(),
-        style(path.display()).blue()
-    );
+    if !is_hook_mode {
+        println!(
+            "{} Syncing {}",
+            style("→").cyan().bold(),
+            style(path.display()).blue()
+        );
+    }
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Checking for changes...");
+    let pb = if !is_hook_mode {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        pb.set_message("Checking for changes...");
+        Some(pb)
+    } else {
+        None
+    };
 
     let mut cg = match CodeGraph::open(&path) {
         Ok(cg) => cg,
         Err(e) => {
-            pb.finish_and_clear();
-            return Err(e.into());
-        }
-    };
-    let full_result = match cg.sync() {
-        Ok(r) => r,
-        Err(e) => {
-            pb.finish_and_clear();
+            if let Some(pb) = &pb { pb.finish_and_clear(); }
+            if is_hook_mode {
+                // Hook mode: never fail the git operation — sync_with_options
+                // would have written sync.failed, but we couldn't even open.
+                // Write sync.failed directly since no CodeGraph instance exists.
+                let codegraph_dir = path.join(".codegraph");
+                if codegraph_dir.exists() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let hook_name = hook.as_deref().unwrap_or("unknown");
+                    let _ = std::fs::write(
+                        codegraph_dir.join("sync.failed"),
+                        format!("{} hook={} error={}", now, hook_name, e),
+                    );
+                }
+                return Ok(());
+            }
             return Err(e.into());
         }
     };
 
-    pb.finish_and_clear();
+    let opts = SyncOptions {
+        hook_name: hook.clone(),
+        file_list: None,
+        verify_sync,
+    };
+
+    let full_result = match cg.sync_with_options(opts) {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(pb) = &pb { pb.finish_and_clear(); }
+            if is_hook_mode {
+                // Hook mode: write sync.failed for visibility, then exit OK.
+                let codegraph_dir = path.join(".codegraph");
+                if codegraph_dir.exists() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let hook_name = hook.as_deref().unwrap_or("unknown");
+                    let _ = std::fs::write(
+                        codegraph_dir.join("sync.failed"),
+                        format!("{} hook={} error={}", now, hook_name, e),
+                    );
+                }
+                return Ok(());
+            }
+            return Err(e.into());
+        }
+    };
+
+    if let Some(pb) = &pb { pb.finish_and_clear(); }
+
+    // In hook mode, stay silent on success
+    if is_hook_mode {
+        return Ok(());
+    }
 
     let result = &full_result.sync;
     let embed = &full_result.embeddings;
@@ -243,6 +297,33 @@ pub fn status(path: &Path) -> Result<(), CliError> {
         style(cg.config().db_path.display()).dim()
     );
 
+    // Surface sync.failed if present
+    let failed_path = cg.config().data_dir.join("sync.failed");
+    if failed_path.exists() {
+        println!();
+        match std::fs::read_to_string(&failed_path) {
+            Ok(contents) => {
+                println!(
+                    "{} Last background sync failed:",
+                    style("!").red().bold()
+                );
+                for line in contents.lines() {
+                    println!("   {}", style(line).red());
+                }
+                println!(
+                    "   {}",
+                    style("Run 'codegraph sync' to retry.").dim()
+                );
+            }
+            Err(_) => {
+                println!(
+                    "{} sync.failed marker exists but could not be read",
+                    style("!").yellow().bold()
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -321,7 +402,7 @@ pub fn context(path: &Path, task: &str, max_tokens: usize) -> Result<(), CliErro
 }
 
 /// Install git hooks
-pub fn hooks_install(path: &Path) -> Result<(), CliError> {
+pub fn hooks_install(path: &Path, force: bool) -> Result<(), CliError> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     // Check if git repo
@@ -332,8 +413,18 @@ pub fn hooks_install(path: &Path) -> Result<(), CliError> {
         ));
     }
 
-    let manager = codegraph_core::sync::GitHooksManager::new(&path, false)?;
+    let manager = codegraph_core::sync::GitHooksManager::new(&path, force)?;
     manager.install_all()?;
+
+    // Ensure .codegraph/ is in .gitignore
+    {
+        let gitignore = path.join(".gitignore");
+        let entry = ".codegraph/";
+        if !gitignore.exists() || !std::fs::read_to_string(&gitignore).map(|c| c.lines().any(|l| l.trim() == entry)).unwrap_or(false) {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&gitignore)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "{}", entry) });
+        }
+    }
 
     println!(
         "{} Git hooks installed",
