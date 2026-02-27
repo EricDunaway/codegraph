@@ -14,6 +14,17 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Options for controlling sync behavior
+#[derive(Debug, Default)]
+pub struct SyncOptions {
+    /// Hook name if triggered by a git hook (enables hook-mode behavior)
+    pub hook_name: Option<String>,
+    /// Specific file list to sync (overrides detection)
+    pub file_list: Option<Vec<String>>,
+    /// Enable EdgeSnapshot verification mode
+    pub verify_sync: bool,
+}
+
 /// Main CodeGraph API
 ///
 /// This is the primary entry point for using CodeGraph. It provides methods for:
@@ -46,6 +57,13 @@ impl CodeGraph {
         // Create .codegraph directory
         if !config.data_dir.exists() {
             fs::create_dir_all(&config.data_dir)?;
+        }
+
+        // Auto-add .codegraph/ to .gitignore if inside a git repo
+        if config.root.join(".git").exists() {
+            if let Err(e) = ensure_codegraph_in_gitignore(&config.root) {
+                log::warn!("Failed to update .gitignore: {}", e);
+            }
         }
 
         // Open/create database
@@ -270,15 +288,40 @@ impl CodeGraph {
     /// - Computes embed candidates from impact + resolution results
     /// - Re-embeds new, modified, and ripple-affected nodes
     /// - Deletes vectors for removed nodes
-    /// - Warns if >30% of files changed (full reindex heuristic)
+    /// - Falls back to full reindex if >30% of files changed
     ///
     /// Returns a `FullSyncResult` containing both the file sync stats and embedding stats.
     pub fn sync(&mut self) -> Result<FullSyncResult, CodeGraphError> {
-        use codegraph_sync::{ReembedConfig, SyncConfig, SyncManager};
+        self.sync_with_options(SyncOptions::default())
+    }
+
+    /// Incrementally sync changes with custom options.
+    ///
+    /// Implements the full Phase 0-7 sync pipeline:
+    ///
+    /// - **Phase 0 (Trigger):** Determine sync mode from `SyncOptions`.
+    /// - **Phase 1 (Detect):** Git-diff (hook mode), file list (external), or hash scan (fallback).
+    /// - **Phase 2 (Lock):** Acquire `IndexLock`. In hook mode, writes `sync.pending` on collision.
+    /// - **Phase 3 (Extract):** Process changes via `SyncManager` (includes ImpactCapture).
+    /// - **Phase 4 (Resolve):** Scoped reference resolution for changed files.
+    /// - **Phase 5 (Embed):** Compute candidates, run incremental embedding sync.
+    /// - **Phase 6 (Checkpoint):** Write `sync.last_head` and `sync.last_timestamp`.
+    /// - **Phase 7 (Release + Drain):** Drop lock, drain `sync.pending` (max 3 iterations).
+    pub fn sync_with_options(&mut self, options: SyncOptions) -> Result<FullSyncResult, CodeGraphError> {
+        use codegraph_sync::{
+            checkpoint, GitDiffDetector, PendingSync, ReembedConfig, SyncConfig, SyncManager,
+        };
+
+        let is_hook_mode = options.hook_name.is_some();
+
+        // ====== Phase 0: Trigger ======
+        // Determine sync mode based on options
 
         let sync_config = SyncConfig {
             excludes: self.config.exclude_patterns.clone(),
             continue_on_error: true,
+            // Disable SyncManager's internal lock — we manage lock externally in Phase 2
+            use_lock: false,
             ..SyncConfig::default()
         };
 
@@ -305,36 +348,209 @@ impl CodeGraph {
             &reembed_config,
         );
 
-        // No pre-sync EdgeSnapshot needed: SyncManager now captures pre-delete
-        // impact (neighbors + siblings) inside process_modify/process_delete
-        // before edges are CASCADE-deleted. That data lives in
-        // sync_result.pre_delete_impact.
+        // ====== Phase 1: Detect Changes ======
+        // Determine which files changed using the appropriate detection strategy
 
-        // Run sync (detect changes, re-extract files, update DB)
-        let sync_result = manager.sync_with_codegraph_dir(
-            self.db.conn(),
-            &mut self.queries,
-            Some(&self.config.data_dir),
-        )?;
+        let use_git_diff = is_hook_mode && self.config.data_dir.exists();
+        let mut git_diff_changes: Option<Vec<codegraph_sync::FileChange>> = None;
+        let mut fallback_to_hash_scan = false;
 
-        // Full-reindex heuristic check: warn if >30% of tracked files changed.
-        // Actual fallback to index_all() is deferred to M3 (sync_with_options).
+        if use_git_diff {
+            // Hook mode: use git diff against checkpoint
+            let last_head = checkpoint::read_last_head(self.db.conn(), &self.queries);
+            let current_head = checkpoint::get_git_head(&self.config.root);
+
+            match (last_head, current_head.as_ref()) {
+                (Ok(Some(ref checkpoint_sha)), Some(_current_sha)) => {
+                    let detector = GitDiffDetector::new(
+                        &self.config.root,
+                        &self.config.exclude_patterns,
+                    );
+                    match detector.detect_changes(checkpoint_sha) {
+                        Ok(changes) => {
+                            if changes.is_empty() {
+                                // No changes detected by git diff — early exit
+                                // Still update checkpoint if HEAD moved
+                                if let Some(head) = &current_head {
+                                    let _ = checkpoint::write_last_head(
+                                        self.db.conn(),
+                                        &self.queries,
+                                        head,
+                                    );
+                                    let _ = checkpoint::write_last_timestamp(
+                                        self.db.conn(),
+                                        &self.queries,
+                                    );
+                                }
+                                let sync_result = codegraph_sync::SyncResult {
+                                    stats: codegraph_sync::SyncStats::default(),
+                                    had_changes: false,
+                                    duration_ms: 0,
+                                    enrichment_scope: codegraph_sync::SelectiveScope::default(),
+                                    deleted_node_ids: Vec::new(),
+                                    changed_file_paths: Vec::new(),
+                                    pre_delete_impact: codegraph_sync::ImpactCapture::new(),
+                                };
+                                return Ok(FullSyncResult {
+                                    sync: sync_result,
+                                    embeddings: EmbeddingSyncResult::default(),
+                                });
+                            }
+                            git_diff_changes = Some(changes);
+                        }
+                        Err(e) => {
+                            log::warn!("Git diff detection failed, falling back to hash scan: {}", e);
+                            fallback_to_hash_scan = true;
+                        }
+                    }
+                }
+                _ => {
+                    // No checkpoint or no git HEAD — fall back to hash scan
+                    log::info!("No sync checkpoint found, falling back to hash scan");
+                    fallback_to_hash_scan = true;
+                }
+            }
+        }
+
+        // ====== Phase 2: Acquire Lock ======
+        // In hook mode, use try_acquire_or_pending to avoid blocking git.
+        // In normal mode, acquire the lock (blocking/failing on collision).
+
+        let _lock = if self.config.data_dir.exists() {
+            if is_hook_mode {
+                let hook_name = options.hook_name.as_deref().unwrap();
+                match IndexLock::try_acquire_or_pending(&self.config.data_dir, hook_name) {
+                    Ok(Some(lock)) => Some(lock),
+                    Ok(None) => {
+                        // Lock held, sync.pending written — return early
+                        log::info!(
+                            "Lock held by another sync, wrote sync.pending for hook '{}'",
+                            hook_name
+                        );
+                        let sync_result = codegraph_sync::SyncResult {
+                            stats: codegraph_sync::SyncStats::default(),
+                            had_changes: false,
+                            duration_ms: 0,
+                            enrichment_scope: codegraph_sync::SelectiveScope::default(),
+                            deleted_node_ids: Vec::new(),
+                            changed_file_paths: Vec::new(),
+                            pre_delete_impact: codegraph_sync::ImpactCapture::new(),
+                        };
+                        return Ok(FullSyncResult {
+                            sync: sync_result,
+                            embeddings: EmbeddingSyncResult::default(),
+                        });
+                    }
+                    Err(e) => {
+                        if is_hook_mode {
+                            // Hook mode errors should not crash — write sync.failed and return Ok
+                            log::error!("Hook sync lock error: {}", e);
+                            self.write_sync_failed(
+                                options.hook_name.as_deref().unwrap_or("unknown"),
+                                &format!("lock error: {}", e),
+                            );
+                            let sync_result = codegraph_sync::SyncResult {
+                                stats: codegraph_sync::SyncStats::default(),
+                                had_changes: false,
+                                duration_ms: 0,
+                                enrichment_scope: codegraph_sync::SelectiveScope::default(),
+                                deleted_node_ids: Vec::new(),
+                                changed_file_paths: Vec::new(),
+                                pre_delete_impact: codegraph_sync::ImpactCapture::new(),
+                            };
+                            return Ok(FullSyncResult {
+                                sync: sync_result,
+                                embeddings: EmbeddingSyncResult::default(),
+                            });
+                        }
+                        return Err(CodeGraphError::Sync(e));
+                    }
+                }
+            } else {
+                match IndexLock::acquire(&self.config.data_dir) {
+                    Ok(lock) => Some(lock),
+                    Err(codegraph_sync::SyncError::LockHeld) => {
+                        return Err(CodeGraphError::Sync(codegraph_sync::SyncError::LockHeld));
+                    }
+                    Err(e) => return Err(CodeGraphError::Sync(e)),
+                }
+            }
+        } else {
+            None
+        };
+
+        // ====== Phase 3: Extract (process changes) ======
+        // Use SyncManager to detect (or process pre-detected) changes and update the DB.
+        // SyncManager includes ImpactCapture in its process_modify/process_delete.
+
+        let sync_result = if let Some(ref file_list) = options.file_list {
+            // External file list mode
+            let file_refs: Vec<&str> = file_list.iter().map(|s| s.as_str()).collect();
+            manager.sync_files(self.db.conn(), &mut self.queries, &file_refs)?
+        } else if git_diff_changes.is_some() && !fallback_to_hash_scan {
+            // Hook mode with git diff changes: use SyncManager with the diff-detected files.
+            // Convert FileChange paths to file_refs for sync_files (which re-detects changes
+            // against the DB under lock, providing revalidation).
+            let change_paths: Vec<String> = git_diff_changes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|c| c.path.clone())
+                .collect();
+            let file_refs: Vec<&str> = change_paths.iter().map(|s| s.as_str()).collect();
+            manager.sync_files(self.db.conn(), &mut self.queries, &file_refs)?
+        } else {
+            // Fallback: full hash scan via SyncManager
+            manager.sync_with_codegraph_dir(self.db.conn(), &mut self.queries, None)?
+        };
+
+        // Full-reindex fallback: if >30% of tracked files changed, do a full reindex
         if sync_result.had_changes {
             let graph_stats = self.queries.get_stats(self.db.conn())?;
             let total_files = graph_stats.file_count as usize;
             let changed_files = sync_result.changed_file_paths.len();
             if total_files > 0 && changed_files * 100 / total_files > 30 {
                 log::warn!(
-                    "Large changeset detected: {}/{} files changed ({}%). \
-                     Consider running index_all() instead of sync() for better performance.",
+                    "Large changeset detected: {}/{} files changed ({}%). Running full reindex.",
                     changed_files,
                     total_files,
                     changed_files * 100 / total_files,
                 );
+                // Drop the lock guard early — index_all will acquire its own lock
+                drop(_lock);
+                let index_result = self.index_all()?;
+
+                // Update checkpoint after full reindex
+                if let Some(head) = checkpoint::get_git_head(&self.config.root) {
+                    let _ = checkpoint::write_last_head(self.db.conn(), &self.queries, &head);
+                    let _ = checkpoint::write_last_timestamp(self.db.conn(), &self.queries);
+                }
+
+                // Build a FullSyncResult from the index result
+                let full_sync_result = codegraph_sync::SyncResult {
+                    stats: codegraph_sync::SyncStats {
+                        files_added: index_result.files_indexed,
+                        ..codegraph_sync::SyncStats::default()
+                    },
+                    had_changes: true,
+                    duration_ms: 0,
+                    enrichment_scope: codegraph_sync::SelectiveScope::default(),
+                    deleted_node_ids: Vec::new(),
+                    changed_file_paths: Vec::new(),
+                    pre_delete_impact: codegraph_sync::ImpactCapture::new(),
+                };
+                return Ok(FullSyncResult {
+                    sync: full_sync_result,
+                    embeddings: EmbeddingSyncResult {
+                        vectors_created: index_result.embeddings_generated,
+                        full_reembed: true,
+                        ..Default::default()
+                    },
+                });
             }
         }
 
-        // Resolve references for changed files if enabled (scoped, not global)
+        // ====== Phase 4: Resolve (scoped reference resolution) ======
         let scoped_resolution = if self.config.resolve_references && sync_result.had_changes {
             let changed_file_refs: Vec<&str> = sync_result
                 .changed_file_paths
@@ -361,7 +577,7 @@ impl CodeGraph {
             None
         };
 
-        // Embedding sync: full re-embed or incremental update
+        // ====== Phase 5: Embed (compute candidates, sync embeddings) ======
         let mut embed_result = EmbeddingSyncResult::default();
         if sync_result.had_changes || needs_full_reembed {
             if needs_full_reembed {
@@ -370,9 +586,6 @@ impl CodeGraph {
                 match self.generate_embeddings() {
                     Ok(count) => {
                         embed_result.vectors_created = count;
-                        // Record metadata if model was available.
-                        // generate_embeddings() returns Ok(0) for model-not-found,
-                        // so we check model availability separately.
                         let model_available = {
                             let mut embedder = TextEmbedder::new(EmbedderConfig::default());
                             embedder.load().is_ok()
@@ -418,10 +631,74 @@ impl CodeGraph {
             }
         }
 
-        Ok(FullSyncResult {
+        // ====== Phase 6: Checkpoint ======
+        // Write sync.last_head and sync.last_timestamp
+        if let Some(head) = checkpoint::get_git_head(&self.config.root) {
+            let _ = checkpoint::write_last_head(self.db.conn(), &self.queries, &head);
+            let _ = checkpoint::write_last_timestamp(self.db.conn(), &self.queries);
+        }
+
+        // Clear sync.failed on success
+        if self.config.data_dir.exists() {
+            let failed_path = self.config.data_dir.join("sync.failed");
+            if failed_path.exists() {
+                let _ = fs::remove_file(&failed_path);
+            }
+        }
+
+        let result = FullSyncResult {
             sync: sync_result,
             embeddings: embed_result,
-        })
+        };
+
+        // ====== Phase 7: Release + Drain Pending ======
+        // Drop lock (will happen via _lock going out of scope after this block).
+        // In hook mode, check for pending events and re-run sync.
+        if is_hook_mode && self.config.data_dir.exists() {
+            drop(_lock);
+            let pending = PendingSync::new(&self.config.data_dir);
+            let max_drain_iterations = 3;
+            for drain_iter in 0..max_drain_iterations {
+                match pending.claim() {
+                    Ok(Some(hook)) => {
+                        log::info!(
+                            "Draining pending sync event (iteration {}/{}): hook={}",
+                            drain_iter + 1,
+                            max_drain_iterations,
+                            hook,
+                        );
+                        // Re-run sync with the claimed hook name
+                        let drain_options = SyncOptions {
+                            hook_name: Some(hook),
+                            file_list: None,
+                            verify_sync: false,
+                        };
+                        match self.sync_with_options(drain_options) {
+                            Ok(_drain_result) => {
+                                log::info!("Drain sync iteration {} completed", drain_iter + 1);
+                            }
+                            Err(e) => {
+                                log::warn!("Drain sync iteration {} failed: {}", drain_iter + 1, e);
+                                // Don't propagate drain errors — the primary sync succeeded
+                            }
+                        }
+                        pending.complete_processing().unwrap_or_else(|e| {
+                            log::warn!("Failed to complete processing marker: {}", e);
+                        });
+                    }
+                    Ok(None) => {
+                        // No more pending events
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to claim pending sync: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     // ========== Search ==========
@@ -1084,6 +1361,22 @@ impl CodeGraph {
         })
     }
 
+    // ========== Sync Helpers ==========
+
+    /// Write a sync.failed marker file for hook-mode error visibility.
+    fn write_sync_failed(&self, hook_name: &str, error: &str) {
+        if !self.config.data_dir.exists() {
+            return;
+        }
+        let failed_path = self.config.data_dir.join("sync.failed");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let content = format!("{} hook={} error={}", now, hook_name, error);
+        let _ = fs::write(failed_path, content);
+    }
+
     // ========== Accessors ==========
 
     /// Get the configuration
@@ -1165,6 +1458,36 @@ pub struct EmbeddingSyncResult {
     pub skipped_no_model: bool,
     /// Whether a full re-embed was performed (vs incremental)
     pub full_reembed: bool,
+}
+
+/// Ensure `.codegraph/` is listed in `.gitignore` (create or append).
+///
+/// This prevents the codegraph data directory from being committed to version control.
+/// If the `.gitignore` file doesn't exist, it is created with the entry.
+/// If it already contains the entry, this is a no-op.
+fn ensure_codegraph_in_gitignore(root: &Path) -> Result<(), std::io::Error> {
+    let gitignore_path = root.join(".gitignore");
+    let entry = ".codegraph/";
+
+    if gitignore_path.exists() {
+        let content = std::fs::read_to_string(&gitignore_path)?;
+        if content.lines().any(|line| line.trim() == entry) {
+            return Ok(()); // already present
+        }
+        // Append with newline
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitignore_path)?;
+        use std::io::Write;
+        if !content.ends_with('\n') {
+            writeln!(file)?;
+        }
+        writeln!(file, "{}", entry)?;
+    } else {
+        std::fs::write(&gitignore_path, format!("{}\n", entry))?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
