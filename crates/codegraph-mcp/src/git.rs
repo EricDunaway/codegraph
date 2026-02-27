@@ -1,7 +1,7 @@
 //! Git utilities for staleness detection
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Result of checking git status
@@ -98,14 +98,39 @@ pub fn get_git_status(repo_path: &Path) -> GitStatus {
     status
 }
 
+/// Resolve the hooks directory using `git rev-parse --git-path hooks`.
+///
+/// Falls back to `<repo_root>/.git/hooks` if git is unavailable.
+fn get_hooks_dir(repo_root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hooks_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if Path::new(&hooks_path).is_absolute() {
+        Some(PathBuf::from(hooks_path))
+    } else {
+        Some(repo_root.join(hooks_path))
+    }
+}
+
 /// Check if git hooks are installed for CodeGraph
 pub fn are_hooks_installed(repo_path: &Path) -> bool {
-    let hooks_dir = repo_path.join(".git/hooks");
+    let hooks_dir = match get_hooks_dir(repo_path) {
+        Some(dir) => dir,
+        None => repo_path.join(".git/hooks"),
+    };
 
-    for hook in ["post-commit", "post-checkout", "post-merge"] {
+    for hook in ["post-commit", "post-checkout", "post-merge", "post-rewrite"] {
         let hook_path = hooks_dir.join(hook);
         if let Ok(content) = std::fs::read_to_string(&hook_path) {
-            if content.contains("CodeGraph auto-sync hook") {
+            if content.contains("CodeGraph auto-sync hook")
+                || content.contains("Managed by codegraph")
+            {
                 return true;
             }
         }
