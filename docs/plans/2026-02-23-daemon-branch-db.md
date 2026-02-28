@@ -1,8 +1,8 @@
 # Daemon Mode & Branch-Based Databases
 
 **Date:** 2026-02-23
-**Status:** Design
-**Depends on:** `2026-02-22-sync-redesign.md` (Milestones 1-3 must land first)
+**Status:** Draft
+**Depends on:** None (sync redesign prerequisites completed 2026-02-28)
 **Crates affected:** `codegraph-core`, `codegraph-db`, `codegraph-sync`, `codegraph-cli`, `codegraph-mcp`, new `codegraph-daemon` crate
 
 ## Purpose

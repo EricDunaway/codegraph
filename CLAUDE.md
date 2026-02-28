@@ -8,10 +8,11 @@ CodeGraph is a local-first code intelligence system that builds a semantic knowl
 
 **Key characteristics:**
 - Headless library (no UI) - purely an API
-- Rust workspace with 11 crates
+- Rust workspace with 12 crates
 - Per-project data stored in `.codegraph/` directory
-- Deterministic extraction from AST, not AI-generated summaries
+- Two-stage extraction: tree-sitter AST parsing creates nodes + unresolved references, then resolution converts refs to edges
 - ONNX embeddings with CoreML acceleration on Apple Silicon
+- LSP integration for type enrichment (TypeScript, Rust, Python, Go, Dart)
 
 ## Build and Development Commands
 
@@ -47,42 +48,47 @@ sqlite3 .codegraph/codegraph.db "SELECT name, decorators FROM nodes WHERE length
 
 ```
 crates/
-├── codegraph-types/       # Shared types (Node, Edge, NodeKind, EdgeKind)
-├── codegraph-db/          # SQLite with FTS5, schema, prepared statements
-├── codegraph-extraction/  # Tree-sitter AST parsing (per-language extractors)
-├── codegraph-resolution/  # Reference resolution, framework patterns
-├── codegraph-graph/       # BFS/DFS traversal, circular deps, dead code
-├── codegraph-vectors/     # ONNX embeddings (ort + CoreML on Apple Silicon)
-├── codegraph-context/     # Context building for AI
-├── codegraph-sync/        # Incremental updates, git hooks
-├── codegraph-mcp/         # MCP server (7 tools)
-├── codegraph-core/        # Orchestration layer
+├── codegraph-types/       # Shared types (Node, Edge, NodeKind, EdgeKind, Language)
+├── codegraph-db/          # SQLite with FTS5, schema, prepared statements, enrichment_deps
+├── codegraph-extraction/  # Tree-sitter AST parsing, code snippets, test detection, package detection
+├── codegraph-resolution/  # Reference resolution (import, name matching, framework patterns)
+├── codegraph-graph/       # BFS/DFS traversal, call graphs, impact radius, circular deps, dead code
+├── codegraph-vectors/     # ONNX embeddings (ort + CoreML), enriched text building, token budgeting
+├── codegraph-context/     # Context building for AI (FTS + semantic strategies)
+├── codegraph-sync/        # Incremental updates, git diff detection, edge diffing, checkpoints, locking
+├── codegraph-lsp/         # LSP type enrichment (TypeScript, Rust, Python, Go, Dart)
+├── codegraph-mcp/         # MCP server (8 tools)
+├── codegraph-core/        # Orchestration layer (45+ public methods)
 └── codegraph-cli/         # CLI entry point
 ```
 
-### Key Crates
+Each complex crate has its own CLAUDE.md with detailed API docs. See `crates/<name>/CLAUDE.md`.
 
-- **codegraph-core**: Main orchestration. Lifecycle methods (`init`, `open`, `close`), indexing, graph queries, semantic search, context building
+### Extraction Pipeline (two-stage)
 
-- **codegraph-extraction**: Coordinates file scanning, parsing, and storing. Tree-sitter grammars for 17 languages (enabled via feature flags)
+1. **Extraction** (`codegraph-extraction`): Tree-sitter parses AST → creates nodes + `UnresolvedReference` records with `reference_kind` (Calls, Imports, Extends). Also creates structural `contains` edges. Extracts code snippets, decorators, test associations.
+2. **Resolution** (`codegraph-resolution`): Converts `UnresolvedReference` → actual `Edge` records using import resolution, name matching, and framework patterns. Creates `calls`, `imports`, `extends` edges.
 
-- **codegraph-graph**: BFS/DFS traversal, call graph construction, impact radius, circular dependency detection, dead code analysis
+### Key Crates (see per-crate CLAUDE.md for details)
 
-- **codegraph-vectors**: Manages embeddings using `ort` (ONNX Runtime). CoreML acceleration on Apple Silicon. Stores vectors in SQLite BLOB format
-
-- **codegraph-resolution**: Resolves unresolved references using framework patterns, import resolution, and name matching
-
-- **codegraph-sync**: Incremental file change detection, edge diff computation (`EdgeSnapshot`/`EdgeDiff`), full re-embed trigger detection (`reembed.rs`), selective scope for cascade enrichment, file locking
+- **codegraph-core**: Main orchestration. 45+ public methods: lifecycle (`init`, `open`), indexing, graph queries (`get_callers`, `get_callees`, `get_impact_radius`, `find_circular_dependencies`, `find_dead_code`), semantic search, context building
+- **codegraph-extraction**: File scanning, tree-sitter parsing for 17 languages, code snippet extraction, test detection, package/module detection, error extraction
+- **codegraph-graph**: BFS/DFS traversal, call graph construction, impact radius, circular dependency detection, dead code analysis, node metrics, type hierarchy, embedding neighbor queries
+- **codegraph-vectors**: ONNX embeddings with CoreML acceleration, enriched text building (includes graph neighbors), token budgeting, vector storage in SQLite BLOB
+- **codegraph-resolution**: Resolves unresolved references → edges using import resolution, name matching, framework patterns, scoped resolution (`resolve_for_files`)
+- **codegraph-sync**: Git diff-based change detection, edge diffing (`EdgeSnapshot`/`EdgeDiff`), checkpoint system, pending sync coalescing, PID-verified locking, selective enrichment scope, git hook management (post-commit/checkout/merge/rewrite)
+- **codegraph-lsp**: LSP type enrichment for TypeScript, Rust, Python, Go, Dart — inferred types, hover data, definition locations
 
 ### Database Schema
 
 SQLite database with:
-- `nodes`: Code symbols (functions, classes, methods, etc.)
-- `edges`: Relationships (calls, imports, extends, contains, etc.)
+- `nodes`: Code symbols (functions, classes, methods, etc.) with code_snippet, decorators, visibility
+- `edges`: Relationships (calls, imports, extends, contains, etc.) with unique index for deduplication
 - `files`: Tracked source files with content hashes
-- `unresolved_refs`: References pending resolution
+- `unresolved_refs`: References pending resolution (with `resolved` column for tracking)
 - `vectors`: Embeddings stored as BLOBs
 - `nodes_fts`: FTS5 virtual table for full-text search
+- `enrichment_deps`: Dependencies between enrichment operations (node→file tracking)
 - `metadata`: Key-value store for schema version, embedding config hash, model hash
 - `schema_version`: Migration tracking (version, applied_at, description)
 
@@ -119,20 +125,22 @@ codegraph hooks install     # Install git auto-sync
 codegraph serve --mcp       # Start MCP server
 ```
 
-## MCP Tools Best Practices
+## MCP Tools
 
-These tools are designed to be used by **Explore agents** for faster codebase exploration:
+8 tools for IDE/agent integration via JSON-RPC stdio:
 
-| Tool | Status | Use For |
-|------|--------|---------|
-| `codegraph_search` | ✅ | Find symbols by name (functions, classes, types) |
-| `codegraph_context` | ✅ | Get relevant code context for a task |
-| `codegraph_file_nodes` | ✅ | List all symbols in a file |
-| `codegraph_status` | ✅ | Index status and dirty file detection |
-| `codegraph_node` | ⚠️ | Get symbol location (code snippet not yet implemented) |
-| `codegraph_callers` | ❌ | Find what calls a function (needs edge extraction) |
-| `codegraph_callees` | ❌ | Find what a function calls (needs edge extraction) |
-| `codegraph_impact` | ❌ | See what's affected by changes (needs edge extraction) |
+| Tool | Use For |
+|------|---------|
+| `codegraph_search` | Find symbols by name (functions, classes, types) |
+| `codegraph_context` | Get relevant code context for a task (FTS + semantic) |
+| `codegraph_file_nodes` | List all symbols in a file |
+| `codegraph_status` | Index status, dirty file detection, git hooks status |
+| `codegraph_node` | Get symbol details with code snippet, signature, docstring |
+| `codegraph_callers` | Find what calls a function (requires resolved edges) |
+| `codegraph_callees` | Find what a function calls (requires resolved edges) |
+| `codegraph_impact` | Impact radius analysis (direct + indirect dependents) |
+
+**Note:** `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` depend on relationship edges (calls, imports, extends) being resolved. After a full `index`, these should be populated. Tools show staleness warnings if files are dirty.
 
 ### Important
 CodeGraph provides **code context**, not product requirements. For new features, still ask the user about:
@@ -163,13 +171,20 @@ Tests use temporary directories created with `tempfile` crate and cleaned up aft
 
 **Gotcha:** `TextEmbedder::load()` creates an ONNX session (~100ms). Avoid loading twice in the same code path. `generate_embeddings()` returns `Ok(0)` for both "model not found" and "no embeddable nodes" — check model availability separately if the distinction matters.
 
-**Relationship edges not implemented (P0):** Tree-sitter extraction works and captures decorators (verified), but only creates `contains` edges (structural). No `calls`, `imports`, or `extends` edges are created, which breaks `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` tools. See `crates/codegraph-extraction/src/tree_sitter_extractor.rs` lines 124-129.
+**Signatures/docstrings not populated:** `nodes.signature` and `nodes.docstring` columns are NULL for most nodes. Code snippets ARE populated.
 
-**Key plan documents:**
-- `RUST_REWRITE_PLAN.md` - Original requirements
-- `docs/plans/LINKED_REPOS.md` - Multi-repo feature design
-- `docs/plans/2026-02-12-incremental-embedding-sync-design.md` - Incremental embedding sync design
-- `docs/plans/2026-02-12-incremental-embedding-sync-impl.md` - Implementation plan (11 tasks)
+**Plan documents:**
+
+Active:
+- `docs/plans/2026-02-04-embedding-enrichment-design.md` - Embedding enrichment (PARTIALLY IMPLEMENTED — LSP crate + enrichment_deps done)
+- `docs/plans/2026-02-23-daemon-branch-db.md` - Daemon + per-branch DB (FUTURE — sync prerequisites met)
+- `docs/plans/CROSS_LANGUAGE_LINKING.md` - Cross-language/repo linking (FUTURE)
+
+Completed (archived in `docs/plans/completed/`):
+- Sync redesign design + implementation — IMPLEMENTED 2026-02-28
+- LINKED_REPOS.md — SUPERSEDED by CROSS_LANGUAGE_LINKING.md
+
+Reference: `RUST_REWRITE_PLAN.md` (original requirements)
 
 ## Verifying Tree-sitter Grammar Support
 
@@ -208,3 +223,5 @@ curl -s https://raw.githubusercontent.com/tree-sitter/tree-sitter-rust/master/gr
 - **Always verify claims against code** - don't trust plan docs; check actual implementation
 - **Use `docs/issues.md`** for bugs, **`docs/gaps.md`** for missing features
 - **Don't track fixed issues** - remove from issues.md once resolved
+- **Plan doc cleanup after implementation** - when completing a plan task, mark it done in the plan doc. When all tasks in a plan are complete, add `**Status: IMPLEMENTED (date)**` at the top. Superseded plans get `**Status: SUPERSEDED by [link]**`
+- **Per-crate CLAUDE.md maintenance** - when adding/changing public API in a crate, update its `crates/<name>/CLAUDE.md`

@@ -20,25 +20,19 @@ The MCP assumes you already know what to search for. Need tools for exploring un
 
 ## Understanding Tools (P1)
 
-| Gap | Description | Competitor Has |
-|-----|-------------|----------------|
-| `analyze_codebase` | Complete project analysis with structure, metrics, complexity | Other tool |
-| `complexity_analysis` | Code complexity with refactoring recommendations | Other tool |
-| `dependency_analysis` | Module/file-level dependency graph (not just node-level) | Other tool |
-| `project_statistics` | Comprehensive health metrics | Other tool (ours is basic) |
+| Gap | Description |
+|-----|-------------|
+| `analyze_codebase` | Complete project analysis with structure, metrics, complexity |
+| `complexity_analysis` | Code complexity with refactoring recommendations |
+| `dependency_analysis` | Module/file-level dependency graph (not just node-level) |
+| `project_statistics` | Comprehensive health metrics (ours is basic via `codegraph_status`) |
 
 ## Query Improvements (P1)
 
-| Gap | Description | Competitor Has |
-|-----|-------------|----------------|
-| Natural language query | "What functions handle authentication?" vs keyword "auth" | CodeRAG |
-| `get_usage_guide` | Self-documenting tool with workflows and examples | Other tool |
-
-## Code Display (P0)
-
-| Gap | Description | Impact |
-|-----|-------------|--------|
-| `codegraph_node` should return actual code | Currently just returns file:line pointer | User still has to read file manually |
+| Gap | Description |
+|-----|-------------|
+| Natural language query | "What functions handle authentication?" vs keyword "auth" |
+| `get_usage_guide` | Self-documenting tool with workflows and examples |
 
 ---
 
@@ -48,26 +42,10 @@ CodeGraph's goal is **exploration and understanding**, not just querying. Tools 
 1. "What is this codebase?" (overview)
 2. "Where do I start?" (entry points)
 3. "How is it organized?" (structure)
-4. "What does X do?" (context + code)
+4. "What does X do?" (context + code) — **partially addressed** by `codegraph_context` and `codegraph_node`
 
 Current tools skip 1-3 and assume you're at step 4.
 
 ---
 
-## Competitive Reference
-
-**CodeRAG tools:**
-- `list_directory` - file browsing
-- `query_code_graph` - natural language queries
-- `get_code_snippet` - actual code by qualified name
-
-**Other tool:**
-- `analyze_codebase` - complete project analysis
-- `complexity_analysis` - code quality
-- `dependency_analysis` - module-level deps
-- `project_statistics` - health metrics
-- `get_usage_guide` - self-documenting
-
----
-
-*Last updated: 2026-02-05*
+*Last updated: 2026-02-28*

@@ -1,7 +1,7 @@
 # Sync Redesign — Efficient Change Detection, Extraction, and Embedding
 
 **Date:** 2026-02-22
-**Status:** Design
+**Status:** IMPLEMENTED (2026-02-28) — All design goals verified: edge dedup, scoped resolution, ImpactCapture, git diff detection, PID-verified locking, checkpoints, pending sync coalescing
 **Crates affected:** `codegraph-sync`, `codegraph-core`, `codegraph-resolution`, `codegraph-db`, `codegraph-graph`, `codegraph-extraction`, `codegraph-cli`, `codegraph-mcp`
 
 ## Purpose

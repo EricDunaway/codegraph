@@ -1,9 +1,9 @@
 # Embedding Enrichment Design
 
-> **Status**: Approved
-> **Created**: 2026-02-04
-> **Last Updated**: 2026-02-04
-> **Approved**: 2026-02-04
+**Date:** 2026-02-04
+**Status:** Active
+**Crates affected:** `codegraph-vectors`, `codegraph-extraction`, `codegraph-db`, `codegraph-lsp`, `codegraph-core`
+**Depends on:** None (partially implemented — LSP crate and enrichment_deps table exist)
 
 ## Overview
 

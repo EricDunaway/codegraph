@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["lang-rust", "lang-typescript", "lang-python", "lang-go", "lang-php", "lang-dart"]
+default = ["all-languages"]
 # Primary target languages (with framework support)
 lang-typescript = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
 lang-rust = ["dep:tree-sitter-rust"]

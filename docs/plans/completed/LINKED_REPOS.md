@@ -1,5 +1,7 @@
 # Multi-Repository Tracking Design
 
+> **Status:** SUPERSEDED by `CROSS_LANGUAGE_LINKING.md` — monorepo approach replaces workspace-based multi-repo design.
+
 ## Overview
 
 Enable CodeGraph to track multiple repositories and make connections between them - specifically linking backend API endpoints to frontend API calls, and tracking shared library dependencies across repos.
