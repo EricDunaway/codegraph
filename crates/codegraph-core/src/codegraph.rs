@@ -514,12 +514,13 @@ impl CodeGraph {
         // Refresh lock after Phase 3 extraction
         if let Some(ref lock) = _lock { let _ = lock.refresh(); }
 
-        // Full-reindex fallback: if >30% of tracked files changed, do a full reindex
+        // Full-reindex fallback: if >30% of tracked files changed, do a full reindex.
+        // Require at least 10 tracked files to avoid triggering on tiny projects.
         if sync_result.had_changes {
             let graph_stats = self.queries.get_stats(self.db.conn())?;
             let total_files = graph_stats.file_count as usize;
             let changed_files = sync_result.changed_file_paths.len();
-            if total_files > 0 && changed_files * 100 / total_files > 30 {
+            if total_files >= 10 && changed_files * 100 / total_files > 30 {
                 log::warn!(
                     "Large changeset detected: {}/{} files changed ({}%). Running full reindex.",
                     changed_files,
@@ -1254,6 +1255,10 @@ impl CodeGraph {
                 log::debug!("ONNX feature not enabled, skipping embedding generation");
                 return Ok(0);
             }
+            Err(VectorError::ModelLoadFailed(ref msg)) => {
+                log::warn!("Embedding model failed to load ({}), skipping embedding generation", msg);
+                return Ok(0);
+            }
             Err(e) => return Err(CodeGraphError::Vector(e)),
         }
 
@@ -1687,9 +1692,11 @@ mod tests {
         // Sync with no changes — should be up to date
         let result = cg.sync().unwrap();
         assert!(!result.sync.had_changes);
-        // Embeddings skipped (no ONNX model in test env)
+        // Embeddings either skipped (no model), default (nothing to do), or
+        // full_reembed (model available but no embed metadata from index_all)
         assert!(
             result.embeddings.skipped_no_model
+                || result.embeddings.full_reembed
                 || result.embeddings == EmbeddingSyncResult::default()
         );
     }
