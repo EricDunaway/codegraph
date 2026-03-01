@@ -31,13 +31,13 @@ impl McpTools {
         vec![
             ToolDefinition {
                 name: TOOL_SEARCH.to_string(),
-                description: "Search for symbols by name (functions, classes, types)".to_string(),
+                description: "Quick symbol lookup by name. Returns locations, kinds, and node IDs — no source code. Use this to find node_ids for follow-up with codegraph_callers, codegraph_callees, or codegraph_node. For comprehensive task context with code, use codegraph_context instead.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query"
+                            "description": "Symbol name or partial name (e.g., 'auth', 'signIn', 'UserService')"
                         },
                         "limit": {
                             "type": "integer",
@@ -49,13 +49,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_CONTEXT.to_string(),
-                description: "Get relevant code context for a task".to_string(),
+                description: "PRIMARY TOOL: Build comprehensive code context for a task. Returns entry points, related symbols, and source code — often sufficient to understand a codebase area without additional tool calls. Uses semantic search with FTS fallback. NOTE: Provides CODE context, not product requirements — still ask the user about UX and edge cases for new features.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Task or query to get context for"
+                            "description": "Task or question to get code context for (e.g., 'how does authentication work', 'payment processing flow')"
                         },
                         "max_tokens": {
                             "type": "integer",
@@ -67,13 +67,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_CALLERS.to_string(),
-                description: "Find what calls a function".to_string(),
+                description: "Find all callers of a function or method. Requires a node_id from codegraph_search. Needs resolved edges — check codegraph_status if results are empty.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID to find callers for"
+                            "description": "Node ID from codegraph_search results"
                         }
                     },
                     "required": ["node_id"]
@@ -81,13 +81,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_CALLEES.to_string(),
-                description: "Find what a function calls".to_string(),
+                description: "Find all functions called by a symbol. Requires a node_id from codegraph_search. Needs resolved edges — check codegraph_status if results are empty.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID to find callees for"
+                            "description": "Node ID from codegraph_search results"
                         }
                     },
                     "required": ["node_id"]
@@ -95,13 +95,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_IMPACT.to_string(),
-                description: "See what's affected by changing a symbol".to_string(),
+                description: "Analyze blast radius of changing a symbol. Shows direct and indirect dependents traversing call and import edges. Use before making changes to understand what could break.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID to analyze impact for"
+                            "description": "Node ID from codegraph_search results"
                         },
                         "max_depth": {
                             "type": "integer",
@@ -113,13 +113,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_NODE.to_string(),
-                description: "Get details and source code for a symbol".to_string(),
+                description: "Get full details for a symbol: kind, file, language, signature, docs, and source code. Use after finding a node_id via codegraph_search to read the actual implementation.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID to get details for"
+                            "description": "Node ID from codegraph_search results"
                         }
                     },
                     "required": ["node_id"]
@@ -127,13 +127,13 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_FILE_NODES.to_string(),
-                description: "Get all symbols in a file".to_string(),
+                description: "List all symbols defined in a file with names, kinds, line numbers, and node IDs. Use to get a file's structure overview or find node IDs when you know the file path.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "File path to get symbols for"
+                            "description": "Relative file path from project root (e.g., 'src/auth/login.ts')"
                         }
                     },
                     "required": ["file_path"]
@@ -141,7 +141,7 @@ impl McpTools {
             },
             ToolDefinition {
                 name: TOOL_STATUS.to_string(),
-                description: "Get index status including dirty files and sync info".to_string(),
+                description: "Get index health: file count, node count, last sync time, hook status, dirty files. Check first if results seem stale or incomplete. Suggest 'codegraph sync' if dirty files are listed.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {},

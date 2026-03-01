@@ -9,7 +9,7 @@ MCP (Model Context Protocol) server that exposes CodeGraph functionality over JS
 | `src/lib.rs` | Re-exports `McpError`, `McpServer`, `McpTools` |
 | `src/server.rs` | Stdio read loop, JSON-RPC dispatch, lifecycle (`initialize` / `shutdown`) |
 | `src/protocol.rs` | Wire types: `JsonRpcRequest`, `JsonRpcResponse`, `ToolDefinition`, `ToolCallResult`, `ContentBlock` |
-| `src/tools.rs` | All 8 tool implementations + staleness logic |
+| `src/tools.rs` | All tool implementations + staleness logic |
 | `src/error.rs` | `McpError` enum (wraps `DbError`, `GraphError`, `ContextError`, IO, JSON) |
 | `src/git.rs` | `get_git_status`, `are_hooks_installed`, `get_last_sync_time` |
 
@@ -119,8 +119,8 @@ Protocol version: `2024-11-05`. Transport: newline-delimited JSON over stdio.
 
 | Method | Has `id`? | Purpose |
 |--------|-----------|---------|
-| `initialize` | yes | Handshake; returns `protocolVersion`, `capabilities`, `serverInfo` |
-| `tools/list` | yes | Returns all 8 `ToolDefinition` objects |
+| `initialize` | yes | Handshake; returns `protocolVersion`, `capabilities`, `serverInfo`, `instructions` |
+| `tools/list` | yes | Returns all `ToolDefinition` objects |
 | `tools/call` | yes | Executes a tool; params: `{ name, arguments }` |
 | `shutdown` | yes | Resets initialized state |
 | `notifications/initialized` | no (notification) | Client ack after initialize |
@@ -175,6 +175,10 @@ Run crate tests:
 ```bash
 cargo test -p codegraph-mcp
 ```
+
+## Server Instructions
+
+The `initialize` response includes an `instructions` field with workflow guidance for AI agents. This covers tool hierarchy (start with `codegraph_context`), node ID flow, and prerequisites. Built by `McpServer::build_instructions()` in `server.rs`.
 
 ## Gotchas
 

@@ -141,10 +141,29 @@ impl McpServer {
         })
     }
 
+    /// Build server-level instructions for AI agents.
+    /// This text is included in the initialize response and provides workflow guidance,
+    /// tool hierarchy, and concept definitions that help agents use codegraph tools effectively.
+    fn build_instructions(&self) -> String {
+        "CodeGraph is a code intelligence server providing structural understanding of codebases through a semantic knowledge graph.\n\n\
+         TOOL WORKFLOW:\n\
+         - Start with codegraph_context for most tasks — it's often sufficient on its own\n\
+         - Use codegraph_search to find specific symbols, then follow up with codegraph_node, codegraph_callers, or codegraph_callees\n\
+         - Use codegraph_impact before making changes to understand blast radius\n\
+         - Check codegraph_status if results seem stale or incomplete\n\n\
+         NODE IDS:\n\
+         - codegraph_callers, codegraph_callees, codegraph_impact, and codegraph_node require a node_id\n\
+         - Get node_ids from codegraph_search results — pass them as-is\n\n\
+         PREREQUISITES:\n\
+         - codegraph_callers, codegraph_callees, and codegraph_impact require resolved edges (full codegraph index)\n\
+         - Tool results include staleness warnings when referenced files have uncommitted changes".to_string()
+    }
+
     /// Handle initialize request
     fn handle_initialize(&mut self, id: Option<Value>, _params: Value) -> JsonRpcResponse {
         self.initialized = true;
 
+        let instructions = self.build_instructions();
         let result = json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -153,7 +172,8 @@ impl McpServer {
             "serverInfo": {
                 "name": "codegraph",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            "instructions": instructions
         });
 
         JsonRpcResponse::success(id, result)

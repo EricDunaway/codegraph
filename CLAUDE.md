@@ -131,16 +131,18 @@ codegraph serve --mcp       # Start MCP server
 
 | Tool | Use For |
 |------|---------|
-| `codegraph_search` | Find symbols by name (functions, classes, types) |
-| `codegraph_context` | Get relevant code context for a task (FTS + semantic) |
-| `codegraph_file_nodes` | List all symbols in a file |
-| `codegraph_status` | Index status, dirty file detection, git hooks status |
+| `codegraph_context` | **PRIMARY** — Comprehensive code context for a task (semantic + FTS) |
+| `codegraph_search` | Find symbols by name — returns node IDs for follow-up tools |
 | `codegraph_node` | Get symbol details with code snippet, signature, docstring |
-| `codegraph_callers` | Find what calls a function (requires resolved edges) |
-| `codegraph_callees` | Find what a function calls (requires resolved edges) |
-| `codegraph_impact` | Impact radius analysis (direct + indirect dependents) |
+| `codegraph_file_nodes` | List all symbols in a file |
+| `codegraph_callers` | Find callers of a function (requires resolved edges) |
+| `codegraph_callees` | Find callees of a function (requires resolved edges) |
+| `codegraph_impact` | Blast radius analysis (direct + indirect dependents) |
+| `codegraph_status` | Index health, dirty files, hook status |
 
-**Note:** `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` depend on relationship edges (calls, imports, extends) being resolved. After a full `index`, these should be populated. Tools show staleness warnings if files are dirty.
+**Workflow:** Start with `codegraph_context` — it's often sufficient alone. Use `codegraph_search` to find node IDs, then `codegraph_callers`/`codegraph_callees` to trace call chains. Use `codegraph_impact` before changes.
+
+**Note:** `codegraph_callers`, `codegraph_callees`, and `codegraph_impact` require resolved edges (full `codegraph index` run). Tools show staleness warnings if files are dirty.
 
 ### Important
 CodeGraph provides **code context**, not product requirements. For new features, still ask the user about:
