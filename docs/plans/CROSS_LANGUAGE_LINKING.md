@@ -1,13 +1,13 @@
-# Cross-Language AppSync Linking (Monorepo Approach)
+# Cross-Language GraphQL Linking (Monorepo Approach)
 
 **Date:** 2026-02-28
 **Status:** Draft
-**Crates affected:** `codegraph-types`, `codegraph-db`, `codegraph-extraction`, `codegraph-resolution`, `codegraph-core`, `codegraph-mcp`, `codegraph-cli`
+**Crates affected:** `codegraph-types`, `codegraph-db`, `codegraph-extraction`, `codegraph-resolution`, `codegraph-core`, `codegraph-mcp`, `codegraph-cli`, `codegraph-graph`, `codegraph-context`, `codegraph-sync`, `codegraph-vectors`
 **Depends on:** None (standalone feature)
 
 ## Context
 
-The original LINKED_REPOS.md plan proposed a workspace system (`~/.codegraph-workspaces/`, separate `cross_repo_edges` table, repo identity, etc.) to link TypeScript backend AppSync resolvers with Dart/Flutter frontend GraphQL calls.
+The original LINKED_REPOS.md plan proposed a workspace system (`~/.codegraph-workspaces/`, separate `cross_repo_edges` table, repo identity, etc.) to link TypeScript backend GraphQL resolvers with Dart/Flutter frontend GraphQL calls.
 
 After analysis with Codex, we identified a simpler approach: treat sibling repos as a single project by running `codegraph init` on the parent folder. This eliminates the need for workspace infrastructure entirely — file paths naturally scope by subfolder, existing graph traversal works unchanged, and no new tables are needed.
 
@@ -16,7 +16,7 @@ After analysis with Codex, we identified a simpler approach: treat sibling repos
 - **Rust only**: TS pipeline lacks Dart support
 - **Design seams**: Architect for future workspace support without building it now
 - **Child repo hooks**: Install git hooks in each child `.git` that trigger `codegraph sync <parent>`
-- **Separate edge kinds**: Use explicit `AppSyncQueryCall`, `AppSyncMutationCall`, `AppSyncSubscription` edge kinds (not a generic `ResolvesTo`) — matches the codebase's kind-filter-first architecture
+- **Separate edge kinds**: Use explicit `GraphQLQueryCall`, `GraphQLMutationCall`, `GraphQLSubscriptionCall` edge kinds (not a generic `ResolvesTo`) — matches the codebase's kind-filter-first architecture
 - **Language-agnostic embedded GraphQL**: One-pass candidate collection during `walk_ast()` then deferred GraphQL parsing. Separate `EmbeddedDslConfig` registry with per-language string node types, tag hints, and interpolation patterns. Hybrid parsing: tree-sitter-graphql + heuristic fallback for interpolated strings
 - **Rules-based resolver linking**: Backend resolver identification is driven by a user-editable `.codegraph/resolver-rules.json` file with tree-sitter S-expression queries (`.scm` files) for AST pattern matching and capture-based name extraction. Not hardcoded to any specific framework — supports AppSync, NestJS, Spring GraphQL, etc. Same file also contains scoped `scans` config for frontend GraphQL detection.
 
@@ -39,9 +39,9 @@ After analysis with Codex, we identified a simpler approach: treat sibling repos
 
 **`codegraph/crates/codegraph-types/src/lib.rs`**
 - Add three `EdgeKind` variants (~line 230):
-  - `AppSyncQueryCall` — frontend GraphQL query resolves to backend AppSync query handler
-  - `AppSyncMutationCall` — frontend GraphQL mutation resolves to backend AppSync mutation handler
-  - `AppSyncSubscription` — frontend GraphQL subscription resolves to backend subscription model
+  - `GraphQLQueryCall` — frontend GraphQL query resolves to backend query handler
+  - `GraphQLMutationCall` — frontend GraphQL mutation resolves to backend mutation handler
+  - `GraphQLSubscriptionCall` — frontend GraphQL subscription resolves to backend subscription model
 - Update `all()`, `as_str()`, `is_structural()` (none are structural), `FromStr`, `Display`
 - Rationale: The codebase is kind-filter-first (all traversal/query APIs filter by `EdgeKind` arrays, no metadata-based edge queries exist, DB indexes are on `kind`). Separate kinds are type-safe, debuggable, and match existing patterns. Future API families (REST, gRPC) add their own kinds.
 - Add `NodeKind::GraphQLOperation` variant (~line 56). Update `as_str()`, `FromStr`.
@@ -56,9 +56,9 @@ After analysis with Codex, we identified a simpler approach: treat sibling repos
 - Update `update_node()` (~line 120) to include `metadata` column — without this, sync updates would silently drop metadata on re-extraction
 - Update `row_to_node()` to read `metadata` column
 - Add `get_nodes_with_metadata_key(conn, key)` — `WHERE metadata LIKE '%"key":%'`
-  - **Note**: LIKE-based metadata lookup is adequate for V1 volume. If AppSync node counts grow large, consider SQLite generated columns (`ALTER TABLE nodes ADD COLUMN appsync_type TEXT GENERATED ALWAYS AS (json_extract(metadata, '$.appsync_type'))`) with an index for O(1) lookups.
+  - **Note**: LIKE-based metadata lookup is adequate for V1 volume. If resolver node counts grow large, consider SQLite generated columns (`ALTER TABLE nodes ADD COLUMN resolver_type TEXT GENERATED ALWAYS AS (json_extract(metadata, '$.resolver_type'))`) with an index for O(1) lookups.
 - `get_nodes_by_kind(conn, NodeKind)` already exists (~line 260) — no changes needed
-- Update `insert_edge()` (~line 499): currently uses `INSERT OR IGNORE` which silently drops metadata updates on re-index. For AppSync edges, use `INSERT ... ON CONFLICT(source_id, target_id, kind) DO UPDATE SET metadata = excluded.metadata` to preserve updated confidence/match data across re-indexing.
+- Update `insert_edge()` (~line 499): currently uses `INSERT OR IGNORE` which silently drops metadata updates on re-index. For GraphQL resolver edges, use `INSERT ... ON CONFLICT(source, target, kind) DO UPDATE SET metadata = excluded.metadata` to preserve updated confidence/match data across re-indexing. (Note: edge columns are `source`/`target`, not `source_id`/`target_id`.)
 
 **`codegraph/crates/codegraph-db/src/lib.rs`**
 - Export `migrate_to_v4`
@@ -110,7 +110,7 @@ cargo test -p codegraph-types -p codegraph-db
         "node": "node"
       },
       "operation_type": "query",
-      "edge_kind": "AppSyncQueryCall"
+      "edge_kind": "GraphQLQueryCall"
     },
     {
       "name": "appsync-mutation",
@@ -123,7 +123,7 @@ cargo test -p codegraph-types -p codegraph-db
         "node": "node"
       },
       "operation_type": "mutation",
-      "edge_kind": "AppSyncMutationCall"
+      "edge_kind": "GraphQLMutationCall"
     },
     {
       "name": "appsync-subscription",
@@ -139,7 +139,7 @@ cargo test -p codegraph-types -p codegraph-db
         "prepend": "subscribeTo"
       },
       "operation_type": "subscription",
-      "edge_kind": "AppSyncSubscription"
+      "edge_kind": "GraphQLSubscriptionCall"
     },
     {
       "name": "nestjs-query",
@@ -151,7 +151,7 @@ cargo test -p codegraph-types -p codegraph-db
         "node": "node"
       },
       "operation_type": "query",
-      "edge_kind": "AppSyncQueryCall"
+      "edge_kind": "GraphQLQueryCall"
     }
   ]
 }
@@ -223,7 +223,7 @@ Queries live in `.codegraph/queries/` as `.scm` files. Named captures (`@resolve
 | `captures.node` | `string?` | Name of the query capture for the node to tag (default: outermost matched node) |
 | `transforms` | `object?` | Optional name transforms applied to the captured resolver name |
 | `operation_type` | `string` | `"query"` / `"mutation"` / `"subscription"` |
-| `edge_kind` | `string` | Edge kind to create: `AppSyncQueryCall`, `AppSyncMutationCall`, `AppSyncSubscription` |
+| `edge_kind` | `string` | Edge kind to create: `GraphQLQueryCall`, `GraphQLMutationCall`, `GraphQLSubscriptionCall` |
 
 Either `query` or `query_file` must be provided. If both are present, `query_file` takes precedence.
 
@@ -301,11 +301,11 @@ Transforms are applied to the captured resolver name in order. Used when the res
 
 **`codegraph/crates/codegraph-core/src/config.rs`**
 - Add `pub resolver_rules: Option<ResolverRulesConfig>` to `CodeGraphConfig`
-- In `CodeGraphConfig::load()`: attempt to load `resolver-rules.json` from `.codegraph/`
+- In `CodeGraphConfig::new()` (~line 171): attempt to load `resolver-rules.json` from `.codegraph/` and populate the field (default `None` if file missing). Also add loading in `CodeGraphConfig::load()` (~line 196) for the config.json path. **Note**: `CodeGraph::init()` and `CodeGraph::open()` both construct config via `CodeGraphConfig::new(root)` (~lines 55, 91), not `load()`, so the rules must be loadable from `new()` as well — or `init`/`open` must be updated to call `load()` instead.
 
 **`codegraph/crates/codegraph-core/src/codegraph.rs`**
-- After extraction (in both `index_all` and `sync_with_options`): for files matching rule `languages` and `file_pattern`, re-use the already-parsed tree-sitter tree to run compiled resolver queries. Populate matching nodes' `node.metadata` with `{"resolver_type": "query"|"mutation"|"subscription", "resolver_name": "X", "rule_name": "appsync-query"}`
-- **Optimization**: The tree is already parsed during extraction. The resolver rules pass runs queries against the same tree — no re-parsing needed. The tree-sitter `QueryCursor` is lightweight and incremental.
+- After extraction (in both `index_all` and `sync_with_options`): for files matching rule `languages` and `file_pattern`, run compiled resolver queries against each file. Populate matching nodes' `node.metadata` with `{"resolver_type": "query"|"mutation"|"subscription", "resolver_name": "X", "rule_name": "appsync-query", "edge_kind": "GraphQLQueryCall"}` (the `edge_kind` comes from the matched rule's `edge_kind` field and is consumed by Phase 4 resolution)
+- **Important**: The extraction API (`ExtractionOrchestrator::extract_file()` at `orchestrator.rs:189`) currently returns `ExtractionResult` only — it does not expose the parsed tree-sitter `Tree`. Two options: (a) add a `extract_file_with_tree()` variant that returns both `ExtractionResult` and `Tree`, or (b) re-parse the file for the rules pass (cheap for the small subset of files matching rule `file_pattern` globs). Option (b) is simpler and avoids API changes across the crate boundary.
 - This pass runs before resolution (Phase 4)
 
 **`codegraph/crates/codegraph-core/src/lib.rs`**
@@ -349,7 +349,7 @@ cargo test -p codegraph-core
 **Heuristic coverage**: Don't rely on `query|mutation|subscription` only. Accept:
 - Explicit operations (`query Foo { ... }`, `mutation Bar { ... }`)
 - Shorthand query documents starting with `{` (treat as anonymous query)
-- Mixed documents with fragments (extract operations, skip fragment-only docs for AppSync linking)
+- Mixed documents with fragments (extract operations, skip fragment-only docs for resolver linking)
 - Skip documents that are only fragment/schema/type definitions
 
 **Confidence scoring**: Weighted evidence model.
@@ -439,11 +439,13 @@ cargo test -p codegraph-extraction
 
 ## Phase 4: Cross-Language Resolution
 
-**Goal**: After extraction + rules-based identification (Phase 2), match `GraphQLOperation` resolver names to backend nodes tagged by resolver rules. Create typed edges.
+**Depends on**: Phase 1 (`Node.metadata` field, `NodeKind::GraphQLOperation`, `GraphQL*` edge kinds), Phase 2 (backend nodes tagged with `resolver_name`/`edge_kind` in metadata), Phase 3 (`GraphQLOperation` nodes with `resolver_names` in metadata).
+
+**Goal**: Match `GraphQLOperation` resolver names to backend nodes tagged by resolver rules. Create typed edges.
 
 **Architecture decision**: Use **direct metadata-query resolution**, not the existing `unresolved_refs` pipeline. The unresolved_refs pipeline is name-based and designed for import/call resolution. Resolver linking needs confidence scores, match metadata, and fuzzy matching — a separate resolution pass is cleaner and more maintainable.
 
-**Key change from hardcoded**: Resolution no longer assumes AppSync. It reads `resolver_type` and `resolver_name` from `node.metadata` (populated by Phase 2 rules engine). The `edge_kind` to create comes from the matched rule's `edge_kind` field, stored in the backend node's metadata.
+**Key design**: Resolution is framework-agnostic. It reads `resolver_type` and `resolver_name` from `node.metadata` (populated by Phase 2 rules engine). The `edge_kind` to create comes from the matched rule's `edge_kind` field, stored in the backend node's metadata.
 
 ### Files to modify
 
@@ -455,26 +457,23 @@ cargo test -p codegraph-extraction
   3. For each GraphQL node, iterate its `resolver_names` from metadata
   4. **Exact match** (confidence 1.0, or 0.95 for subscriptions): look up resolver name in registry
   5. **Fuzzy match** (opt-in, confidence 0.7+): use existing `NameMatcher::find_all_matches()` from `matcher.rs`
-  6. Create edge with the appropriate `EdgeKind` based on `appsync_type`:
-     - `"query"` -> `EdgeKind::AppSyncQueryCall`
-     - `"mutation"` -> `EdgeKind::AppSyncMutationCall`
-     - `"subscription"` -> `EdgeKind::AppSyncSubscription`
+  6. Create edge with the `EdgeKind` from the matched backend node's `metadata.edge_kind` field (populated by Phase 2 rules engine — e.g. `"GraphQLQueryCall"`, `"GraphQLMutationCall"`, `"GraphQLSubscriptionCall"`). Parse the string into `EdgeKind` via `FromStr`.
   7. Store confidence and match details in edge metadata: `{"resolver_name", "confidence", "match_type"}`
   8. When multiple candidates exist for same name, lower confidence
 
 **`codegraph/crates/codegraph-core/src/codegraph.rs`**
-- **Full index path** (`index_all`, ~line 239-246): After `resolve_all()` call, add `resolver.resolve_appsync_links()` call. Log resolution stats.
-- **Sync path** (`sync_with_options`, ~line 351-413): After incremental extraction completes, run a scoped AppSync resolution pass. This is critical — without it, `codegraph sync` from child hooks would extract updated nodes but never create/update AppSync edges, making the hooks ineffective.
-  - Scope: only re-resolve AppSync links involving changed files (query `GraphQLOperation` nodes and AppSync-decorated nodes in changed file set)
-  - Clean up stale edges: when a TS file with `@AppSyncQuery` is re-extracted and the decorator changes or is removed, delete orphaned `AppSyncQueryCall` edges from the previous indexing before creating new ones
-  - Use `DELETE FROM edges WHERE source_id IN (changed_graphql_nodes) AND kind IN ('AppSyncQueryCall', ...)` before re-resolving
+- **Full index path** (`index_all`, starts ~line 144): After the `resolve_all()` call (~line 239), add `resolver.resolve_resolver_links()` call. Log resolution stats.
+- **Sync path** (`sync_with_options`, starts ~line 310): After incremental extraction completes, run a scoped GraphQL resolver resolution pass. This is critical — without it, `codegraph sync` from child hooks would extract updated nodes but never create/update resolver edges, making the hooks ineffective.
+  - Scope: only re-resolve GraphQL resolver links involving changed files (query `GraphQLOperation` nodes and resolver-decorated nodes in changed file set)
+  - Clean up stale edges: when a TS file with `@AppSyncQuery` is re-extracted and the decorator changes or is removed, delete orphaned `GraphQLQueryCall` edges from the previous indexing before creating new ones
+  - Use `DELETE FROM edges WHERE source IN (changed_graphql_nodes) AND kind IN ('GraphQLQueryCall', ...)` before re-resolving
 
 ### Test
 ```
 cargo test -p codegraph-resolution
 ```
-- Integration: in-memory DB with TS node (metadata: appsync query) + Dart GraphQLOperation node -> verify `AppSyncQueryCall` edge created with confidence 1.0
-- Test subscription derivation match -> `AppSyncSubscription` edge with confidence 0.95
+- Integration: in-memory DB with TS node (metadata: resolver query) + Dart GraphQLOperation node -> verify `GraphQLQueryCall` edge created with confidence 1.0
+- Test subscription derivation match -> `GraphQLSubscriptionCall` edge with confidence 0.95
 - Test fuzzy match for slight typo
 - Test no match when no backend resolver exists
 
@@ -482,42 +481,42 @@ cargo test -p codegraph-resolution
 
 ## Phase 5: Graph Traversal Updates
 
-**Goal**: Make AppSync edges visible in callers/callees, call graphs, and impact analysis.
+**Goal**: Make GraphQL resolver edges visible in callers/callees, call graphs, and impact analysis.
 
 ### Files to modify
 
 **`codegraph/crates/codegraph-graph/src/traversal.rs`**
-- `get_callers()` (line 182): add `AppSyncQueryCall`, `AppSyncMutationCall`, `AppSyncSubscription` to edge kind filter alongside `Calls`
-- `get_callees()` (line 200): same additions
-- Impact analysis at lines 517-518, 527-528: add the three AppSync edge kinds alongside `EdgeKind::Calls`
+- `get_callers()` (~line 181): add `GraphQLQueryCall`, `GraphQLMutationCall`, `GraphQLSubscriptionCall` to edge kind filter alongside `Calls`
+- `get_callees()` (~line 199): same additions
+- `get_embedding_neighbors()` (~lines 517-518, 527-528): add the three GraphQL resolver edge kinds alongside `EdgeKind::Calls` in both the incoming and outgoing edge queries — without this, embedding text for cross-language neighbors won't include GraphQL resolver relationships
 
 **`codegraph/crates/codegraph-graph/src/queries.rs`**
-- `collect_call_graph()` (line 144): add the three AppSync edge kinds to filter
-- `get_impact_radius()` (line 175): add the three AppSync edge kinds to filter
+- `collect_call_graph()` (~line 127): add the three GraphQL resolver edge kinds to filter
+- `get_impact_radius()` (~line 155): add the three GraphQL resolver edge kinds to filter
 
 **`codegraph/crates/codegraph-context/src/builder.rs`**
-- `build_edge_kinds()` (line 334): add AppSync edge kinds alongside `EdgeKind::Calls`. Without this, context building (used by MCP prompts and IDE integration) would silently exclude cross-language relationships.
+- `build_edge_kinds()` (~line 330): add GraphQL resolver edge kinds alongside `EdgeKind::Calls`. Without this, context building (used by MCP prompts and IDE integration) would silently exclude cross-language relationships.
 
 **`codegraph/crates/codegraph-sync/src/impact.rs`**
-- Line 71: hardcoded SQL `e.kind IN ('calls','extends','implements','references')` — **refactor to parameterized query** using `EdgeKind::call_like()` + relationship kinds. Current hardcoded kind SQL will drift as edge kinds expand. Generate the SQL `IN (...)` clause from the enum variants dynamically.
+- ~line 70: hardcoded SQL `e.kind IN ('calls','extends','implements','references')` — **refactor to parameterized query** using `EdgeKind::call_like()` + relationship kinds. Current hardcoded kind SQL will drift as edge kinds expand. Generate the SQL `IN (...)` clause from the enum variants dynamically.
 
 **`codegraph/crates/codegraph-graph/src/traversal.rs`**
-- `count_incoming_calls()` (line 488): currently uses raw SQL `kind = 'calls'` — migrate to use `EdgeKind::call_like()` kinds so AppSync callers are counted
+- `count_incoming_calls()` (~line 487): currently uses raw SQL `kind = 'calls'` — migrate to use `EdgeKind::call_like()` kinds so GraphQL resolver callers are counted
 
 **`codegraph/crates/codegraph-graph/src/queries.rs`**
-- `find_dead_code()` (~line 290): currently only checks `Calls` edges — add AppSync call-like edges to avoid false "unused" on backend resolvers that are invoked from frontend GraphQL operations
+- `find_dead_code()` (~line 282): currently only checks `Calls` edges — add GraphQL call-like edges to avoid false "unused" on backend resolvers that are invoked from frontend GraphQL operations
 
-**Required**: Add a helper `EdgeKind::call_like() -> &'static [EdgeKind]` that returns `&[Calls, AppSyncQueryCall, AppSyncMutationCall, AppSyncSubscription]`. Use it in all the above call sites plus `traversal.rs` `get_callers`/`get_callees`, `queries.rs` `collect_call_graph`/`get_impact_radius`, and `impact.rs`. This centralizes the list, avoids N+1 code paths when future API edge kinds are added, and eliminates the class of bugs where a new call-type kind is added to some filters but missed in others.
+**Required**: Add a helper `EdgeKind::call_like() -> &'static [EdgeKind]` that returns `&[Calls, GraphQLQueryCall, GraphQLMutationCall, GraphQLSubscriptionCall]`. Use it in all the above call sites plus `traversal.rs` `get_callers`/`get_callees`, `queries.rs` `collect_call_graph`/`get_impact_radius`, and `impact.rs`. This centralizes the list, avoids N+1 code paths when future API edge kinds are added, and eliminates the class of bugs where a new call-type kind is added to some filters but missed in others.
 
 ### Test
 ```
 cargo test -p codegraph-graph
 cargo test -p codegraph-sync
 ```
-- Test get_callers returns cross-language callers via AppSync edges
-- Test impact analysis traverses AppSync edges
-- Test count_incoming_calls includes AppSync call-like edges
-- Test find_dead_code does not flag resolvers with AppSync callers as dead
+- Test get_callers returns cross-language callers via GraphQL resolver edges
+- Test impact analysis traverses GraphQL resolver edges
+- Test count_incoming_calls includes GraphQL call-like edges
+- Test find_dead_code does not flag resolvers with GraphQL resolver callers as dead
 
 ---
 
@@ -538,46 +537,119 @@ cargo test -p codegraph-sync
   - Return list of child repo names where hooks were installed
 - Add corresponding `uninstall_child_hooks(parent_path)`
 
+**`codegraph/crates/codegraph-cli/src/main.rs`**
+- Add `--child-repo <PATH>` optional arg to the `sync` subcommand (~line 41). This arg is only passed by child hook scripts — it tells the sync command which child repo triggered the hook, so it can scope `git diff` to that child rather than scanning the entire parent tree.
+
 **`codegraph/crates/codegraph-cli/src/commands.rs`**
-- In `hooks_install` (~line 382): if parent path has no `.git` but has child dirs with `.git`, call `install_child_hooks()`
-- Print which child repos got hooks installed
-- In `hooks_status` (~line 395): add child-aware logic — when at a non-git parent, scan child repos and report hook status for each child. Without this, `codegraph hooks status` at the parent level would report "no hooks" even when child hooks are installed, confusing users.
-- In `hooks_uninstall`: call `uninstall_child_hooks()` when at non-git parent
+- In `sync` command handler (~line 126): when `--child-repo` is present, pass the child path to `sync_with_options()` so it scopes file change detection to the child repo directory.
+
+**`codegraph/crates/codegraph-cli/src/commands.rs`**
+- In `hooks_install` (~line 405): currently returns an error if the path has no `.git` directory (lines 408-414: `"Not a git repository. Git hooks require a .git directory."`). Change to: if parent path has no `.git` but has child dirs with `.git`, call `install_child_hooks()` instead of erroring. Print which child repos got hooks installed.
+- In `hooks_status` (~line 454): add child-aware logic — when at a non-git parent, scan child repos and report hook status for each child. Without this, `codegraph hooks status` at the parent level would report "no hooks" even when child hooks are installed, confusing users.
+- In `hooks_uninstall` (~line 439): call `uninstall_child_hooks()` when at non-git parent
 
 ### Test
 ```
 cargo test -p codegraph-sync
 ```
 - Test: temp dir with two child `.git` dirs, verify hook files created with correct parent path
-- Test: hook script includes `--files` argument with git diff output
+- Test: hook script includes `--child-repo` argument with correct parent path (diff logic is centralized in Rust, not shell)
 - Test: uninstall removes hooks from children
 - Test: `hooks_status` at parent level reports child hook status
 
 ---
 
-## Phase 7: MCP Tool
+## Phase 7: MCP Tool & AI-Facing Guidance
 
-**Goal**: Expose cross-language links through a dedicated MCP tool.
+**Goal**: Expose cross-language links through a dedicated MCP tool. Enrich all tool descriptions and add server-level `instructions` so AI agents can effectively discover and use codegraph tools — including the new cross-language capabilities — without prior knowledge.
 
-### Files to modify
+**Why guidance matters**: The current Rust MCP server tool descriptions are 1-sentence stubs (e.g., `"Find what calls a function"`). AI agents need to know *when* to use each tool, *what prerequisites* exist, and *how tools relate to each other*. The TypeScript reference server already has richer descriptions — the Rust server (which ships) must match or exceed that quality. The new cross-language concepts (confidence scores, resolver rules, workspace health) make this even more critical.
+
+### Part A: `codegraph_graphql_links` Tool
 
 **`codegraph/crates/codegraph-mcp/src/tools.rs`**
-- Add `codegraph_appsync_links` tool:
-  - Input: optional `resolver_name`, optional `direction` (frontend_to_backend / backend_to_frontend / both)
-  - Queries `AppSyncQueryCall`, `AppSyncMutationCall`, `AppSyncSubscription` edges
+- Add `codegraph_graphql_links` tool:
+  - Input: optional `resolver_name`, optional `direction` (frontend_to_backend / backend_to_frontend / both), optional `min_confidence` (0.0-1.0, default 0.0)
+  - Queries `GraphQLQueryCall`, `GraphQLMutationCall`, `GraphQLSubscriptionCall` edges
   - Returns matches with confidence, file paths, operation types
-- Existing `codegraph_callers` and `codegraph_callees` automatically include AppSync edges after Phase 5
+- Existing `codegraph_callers` and `codegraph_callees` automatically include GraphQL resolver edges after Phase 5
+
+### Part B: Enriched Tool Descriptions (Three-Layer Guidance)
+
+**DONE (Phase 7a — deployed independently of the cross-language feature):**
+- All 8 existing tool descriptions rewritten with what/when/how guidance
+- All parameter descriptions enriched with examples
+- Server `instructions` field added to `initialize` response
+- CLAUDE.md files and installer template updated with workflow guidance
+- See actual deployed descriptions in `tools.rs` and `server.rs`
+
+**Note on phasing**: The base enrichment (Layer 1 descriptions, Layer 2 instructions, Layer 3 CLAUDE.md) is deployed now and only describes existing functionality. When Phase 7 Part A lands (`codegraph_graphql_links` tool) and Phase 5 lands (GraphQL edge traversal in callers/callees), the descriptions below must be applied to reflect the new capabilities.
+
+#### Layer 1: Tool description updates for cross-language feature (`tools.rs`)
+
+When Phase 5 + Phase 7 Part A are implemented, update these tool descriptions to mention cross-language capabilities:
+
+| Tool | Addition to description |
+|------|------------------------|
+| `codegraph_callers` | Append: ", including cross-language callers via GraphQL resolver edges in multi-repo workspaces" |
+| `codegraph_callees` | Append: ", including cross-language GraphQL resolver targets in multi-repo workspaces" |
+| `codegraph_impact` | Change "call and import edges" to "call, import, AND cross-language GraphQL resolver edges" |
+
+New tool descriptions to add:
+
+| Tool | Description |
+|------|-------------|
+| `codegraph_graphql_links` | "Query cross-language GraphQL links between frontend operations and backend resolvers across repositories. Each link includes a confidence score (1.0 = exact match, 0.7+ = fuzzy). Use 'direction' to filter. For general call chains, use codegraph_callers/codegraph_callees which also traverse GraphQL edges automatically." |
+| `codegraph_workspace_status` (Phase 10) | "Get multi-repo workspace health. Reports per-repo hook installation, last sync time, indexed files/nodes, and sync errors. Use to diagnose missing cross-language links — a child repo may not be hooked or synced." |
+
+New parameter descriptions for `codegraph_graphql_links`:
+- `resolver_name`: `"Filter to links involving this resolver name (e.g., 'getUser'). Omit to return all."`
+- `direction`: `"Link direction: 'frontend_to_backend', 'backend_to_frontend', or 'both' (default)."`
+- `min_confidence`: `"Minimum confidence threshold (0.0-1.0). Default: 0.0 (all links). Set to 0.7 to exclude uncertain fuzzy matches."`
+
+#### Layer 2: Server `instructions` updates for cross-language feature (`server.rs`)
+
+When cross-language feature lands, add a `CROSS-LANGUAGE GRAPHQL LINKING` section to `build_instructions()`:
+```
+CROSS-LANGUAGE GRAPHQL LINKING:
+- In multi-repo workspaces, CodeGraph links frontend GraphQL operations to backend resolver functions
+- codegraph_callers and codegraph_callees automatically include cross-language GraphQL edges
+- codegraph_graphql_links provides dedicated filtering by resolver name, direction, and confidence
+- Confidence: 1.0 = exact name match, 0.7+ = fuzzy match
+- If cross-language links are missing, check codegraph_workspace_status for hook/sync issues
+```
+
+Consider making `build_instructions()` dynamic: include cross-language sections only when GraphQL edges or resolver-rules.json exist.
+
+#### Layer 3: CLAUDE.md & installer template updates for cross-language feature
+
+When the tools are implemented, add to:
+
+**`codegraph/src/installer/claude-md-template.ts`**
+- Add `codegraph_graphql_links` and `codegraph_workspace_status` to tool table
+- Add cross-language note to Notes section
+
+**`codegraph/crates/codegraph-mcp/CLAUDE.md`**
+- Add parameter tables for `codegraph_graphql_links` and `codegraph_workspace_status`
+- Add "Cross-Language GraphQL Linking" section: confidence scores, resolver rules, workspace health
+
+**`codegraph/CLAUDE.md`**
+- Update MCP Tools table with 2 new tools (8→10)
+- Add cross-language workflow guidance
 
 ### Test
 ```
 cargo test -p codegraph-mcp
 ```
+- Verify `initialize` response includes `instructions` field
+- Verify all tool descriptions are >50 chars
+- Verify `codegraph_context` description contains "PRIMARY"
 
 ---
 
 ## Phase 8: V2 Decorator Parsing — Contract/Schema Analysis
 
-**Goal**: Extend AppSync decorator parsing to extract contract-level metadata for type matching, auth analysis, and publish permissions.
+**Goal**: Extend resolver decorator parsing to extract contract-level metadata for type matching, auth analysis, and publish permissions. (This phase is framework-specific — the examples below use AppSync decorators, but the same `.scm` query infrastructure supports any framework.)
 
 ### Decorators
 
@@ -591,7 +663,7 @@ cargo test -p codegraph-mcp
 ### Files to modify
 
 **`codegraph/crates/codegraph-extraction/src/tree_sitter_extractor.rs`**
-- Extend `parse_appsync_metadata()` to recognize additional decorator patterns
+- Add `parse_resolver_metadata()` function (new — no framework-specific parsing exists in the extractor today; Phase 2's rules engine handles resolver identification via `.scm` queries, but this Phase 8 pass extracts richer contract metadata from additional decorators)
 - Add `parse_subscription_field(decorator_text: &str) -> Option<Value>` — extract field name and type from `@SubscriptionModelField()` arguments
 - Add `parse_entity_appsync_type(decorator_text: &str) -> Option<Value>` — extract GraphQL type name
 - Add `parse_auth_guard(decorator_text: &str) -> Option<Value>` — extract guard config
@@ -625,12 +697,12 @@ GraphQLOperation nodes are DSL-in-string — different from typical code nodes. 
 ### Files to modify
 
 **`codegraph/crates/codegraph-core/src/codegraph.rs`**
-- Add `NodeKind::GraphQLOperation` to `EMBEDDABLE_KINDS` constant (~line 886-897)
+- Add `NodeKind::GraphQLOperation` to `EMBEDDABLE_KINDS` constant (~line 897-907)
 
 **`codegraph/crates/codegraph-vectors/src/text_builder.rs`**
 - In `build_text()` (~line 89): add a branch for `NodeKind::GraphQLOperation` that builds embedding text from metadata fields (`operation_type`, `operation_name`, `resolver_names`) rather than the default signature/code approach
 - The GraphQL text from the node's body/code serves as the "code snippet" component
-- Graph context (callers/callees) still applies — includes the `AppSyncQueryCall` etc. edges for cross-language context
+- Graph context (callers/callees) still applies — includes the `GraphQLQueryCall` etc. edges for cross-language context
 
 ### Test
 ```
@@ -696,9 +768,9 @@ cargo test -p codegraph-sync
 2. `codegraph init /tmp/test-workspace`
 3. `codegraph index /tmp/test-workspace`
 4. Verify nodes exist for both TS classes and Dart GraphQL operations
-5. Verify `AppSyncQueryCall` / `AppSyncSubscription` edges link frontend -> backend
+5. Verify `GraphQLQueryCall` / `GraphQLSubscriptionCall` edges link frontend -> backend
 6. MCP tool `codegraph_callers` for a backend resolver ID shows Dart GraphQL operations as callers (no CLI `callers` command exists — use MCP tools or write a test)
-7. MCP tool `codegraph_appsync_links` returns correct links with confidence scores
+7. MCP tool `codegraph_graphql_links` returns correct links with confidence scores
 
 ### Run full test suite
 ```
@@ -712,11 +784,11 @@ cargo clippy --workspace --all-targets
 
 These deliberate design choices make future multi-root/workspace support addable without rewriting:
 
-1. **Explicit `EdgeKind` variants per API family** — `AppSyncQueryCall` etc. are specific and queryable. Future REST/gRPC linking adds its own kinds (e.g. `RestApiCall`, `GrpcCall`). The `EdgeKind::call_like()` helper makes adding new call-type kinds trivial.
-2. **`Node.metadata` is a generic JSON field** — any framework-specific data goes here. No AppSync-specific columns.
+1. **Explicit `EdgeKind` variants per API family** — `GraphQLQueryCall` etc. are specific and queryable. Future REST/gRPC linking adds its own kinds (e.g. `RestApiCall`, `GrpcCall`). The `EdgeKind::call_like()` helper makes adding new call-type kinds trivial.
+2. **`Node.metadata` is a generic JSON field** — any framework-specific data goes here. No framework-specific columns.
 3. **`NodeKind::GraphQLOperation` is first-class** — not a hack on Function/Method.
 4. **`install_child_hooks(parent_path)` accepts explicit parent** — a future `codegraph workspace add` could call this per-repo.
-5. **`resolve_appsync_links()` queries by metadata, not by file path** — does not assume directory structure.
+5. **`resolve_resolver_links()` queries by metadata, not by file path** — does not assume directory structure.
 6. **Edge metadata includes `confidence`** — future features can filter by threshold.
 7. **No `repos` or `cross_repo_edges` table** — all edges go in the unified `edges` table.
 8. **Hybrid GraphQL parsing** — tree-sitter-graphql handles standard GraphQL; heuristic fallback handles non-standard patterns. Future GraphQL schema file support can reuse the same parser.
@@ -730,11 +802,11 @@ These deliberate design choices make future multi-root/workspace support addable
 ### V1 (Phases 1-7) — cross-language edges via AST queries
 | Pattern | AST Query Captures | Edge produced |
 |---------|-------------------|---------------|
-| `@AppSyncQuery({ methodName: "X" })` | `@resolver_name` = `"X"` from decorator arg | `AppSyncQueryCall` |
-| `@AppSyncMutation({ methodName: "X" })` | `@resolver_name` = `"X"` from decorator arg | `AppSyncMutationCall` |
-| `@SubscriptionModel()` on class `FooSubscriptionModel` | `@class_name` → transforms → `subscribeToFoo` | `AppSyncSubscription` |
-| `@Query('getUser')` (NestJS) | `@resolver_name` = `"getUser"` from first arg | `AppSyncQueryCall` |
-| `@QueryMapping` (Spring) | `@resolver_name` = method name | `AppSyncQueryCall` |
+| `@AppSyncQuery({ methodName: "X" })` | `@resolver_name` = `"X"` from decorator arg | `GraphQLQueryCall` |
+| `@AppSyncMutation({ methodName: "X" })` | `@resolver_name` = `"X"` from decorator arg | `GraphQLMutationCall` |
+| `@SubscriptionModel()` on class `FooSubscriptionModel` | `@class_name` → transforms → `subscribeToFoo` | `GraphQLSubscriptionCall` |
+| `@Query('getUser')` (NestJS) | `@resolver_name` = `"getUser"` from first arg | `GraphQLQueryCall` |
+| `@QueryMapping` (Spring) | `@resolver_name` = method name | `GraphQLQueryCall` |
 
 Default `.scm` query files shipped for AppSync, NestJS, Spring GraphQL. Users add custom `.scm` queries for other frameworks.
 
@@ -755,7 +827,7 @@ V2 queries can use the same `.scm` query infrastructure — additional query fil
 
 ## Prerequisites & Assumptions
 
-- **Relationship edges (calls, imports, extends)**: CLAUDE.md line 166 notes these are P0 missing — only `contains` edges exist today. However, the extraction pipeline already emits `unresolved_refs` and the resolution pipeline resolves them into edges (`tree_sitter_extractor.rs:411`, `resolver.rs:155`, `codegraph.rs:236`). AppSync linking does **not** depend on these relationship edges and should not be blocked. The CLAUDE.md docs should be validated and updated separately.
+- **Relationship edges (calls, imports, extends)**: The extraction pipeline emits `unresolved_refs` and the resolution pipeline (`ReferenceResolver::resolve_all()` at `codegraph.rs:239`) resolves them into typed edges (Calls, Imports, Extends, etc.) when `config.resolve_references` is true (the default). These edges are functional today — `codegraph_callers`/`codegraph_callees` MCP tools depend on them. GraphQL resolver linking builds on this existing infrastructure but uses a separate resolution pass (Phase 4) rather than the `unresolved_refs` pipeline.
 - **All languages compiled by default**: `codegraph-extraction/Cargo.toml` default features set to `all-languages` (15 languages including tree-sitter-graphql). No feature flag changes needed for Phase 3.
 
 ---
