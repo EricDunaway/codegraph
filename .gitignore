@@ -29,3 +29,8 @@ npm-debug.log*
 
 # CodeGraph data directories (in test projects)
 .codegraph/
+
+
+# Added by cargo
+
+/target

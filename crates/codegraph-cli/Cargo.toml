@@ -1,0 +1,29 @@
+[package]
+name = "codegraph-cli"
+description = "Command-line interface for CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "codegraph"
+path = "src/main.rs"
+
+[features]
+default = ["onnx"]
+onnx = ["codegraph-core/onnx", "codegraph-mcp/onnx"]
+
+[dependencies]
+codegraph-core = { path = "../codegraph-core" }
+codegraph-mcp = { path = "../codegraph-mcp" }
+clap = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

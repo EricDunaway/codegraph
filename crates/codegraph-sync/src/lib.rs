@@ -1,0 +1,29 @@
+//! Incremental sync for CodeGraph
+//!
+//! This crate handles detecting file changes and updating the graph incrementally.
+//! It also provides git hooks management for automatic sync on commit.
+
+pub mod change_detector;
+pub mod checkpoint;
+pub mod edge_diff;
+pub mod error;
+pub mod git_diff;
+pub mod git_hooks;
+pub mod impact;
+pub mod lock;
+pub mod pending;
+pub mod reembed;
+pub mod selective;
+pub mod sync;
+
+pub use change_detector::{ChangeDetector, FileChange, ChangeKind};
+pub use edge_diff::{EdgeDiff, EdgeKey, EdgeSnapshot};
+pub use git_diff::GitDiffDetector;
+pub use impact::ImpactCapture;
+pub use error::SyncError;
+pub use git_hooks::GitHooksManager;
+pub use lock::IndexLock;
+pub use pending::PendingSync;
+pub use reembed::{check_reembed_triggers, should_full_reembed, ReembedConfig, ReembedReason};
+pub use selective::SelectiveScope;
+pub use sync::{SyncConfig, SyncManager, SyncResult, SyncStats};

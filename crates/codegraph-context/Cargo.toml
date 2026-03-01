@@ -1,0 +1,21 @@
+[package]
+name = "codegraph-context"
+description = "Context building for AI assistants in CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+codegraph-db = { path = "../codegraph-db" }
+codegraph-graph = { path = "../codegraph-graph" }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

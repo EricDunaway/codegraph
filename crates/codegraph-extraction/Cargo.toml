@@ -1,0 +1,72 @@
+[package]
+name = "codegraph-extraction"
+description = "Tree-sitter based code extraction for CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["all-languages"]
+# Primary target languages (with framework support)
+lang-typescript = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-php = ["dep:tree-sitter-php"]
+lang-dart = ["dep:tree-sitter-dart"]
+lang-swift = ["dep:tree-sitter-swift"]
+lang-graphql = ["dep:tree-sitter-graphql"]
+lang-hcl = ["dep:tree-sitter-hcl"]
+lang-bash = ["dep:tree-sitter-bash"]
+# Secondary languages (extraction only)
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+lang-java = ["dep:tree-sitter-java"]
+lang-c = ["dep:tree-sitter-c"]
+lang-cpp = ["dep:tree-sitter-cpp"]
+lang-csharp = ["dep:tree-sitter-c-sharp"]
+lang-ruby = ["dep:tree-sitter-ruby"]
+# All stable languages
+all-languages = [
+    "lang-typescript", "lang-rust", "lang-php", "lang-dart", "lang-swift", "lang-graphql", "lang-hcl", "lang-bash",
+    "lang-python", "lang-go", "lang-java", "lang-c", "lang-cpp", "lang-csharp", "lang-ruby"
+]
+# Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+walkdir = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+regex = "1"
+
+# Tree-sitter core
+tree-sitter = { workspace = true }
+
+# Tree-sitter grammars (optional, enabled by features)
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-php = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-c = { workspace = true, optional = true }
+tree-sitter-cpp = { workspace = true, optional = true }
+tree-sitter-c-sharp = { workspace = true, optional = true }
+tree-sitter-ruby = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-dart = { workspace = true, optional = true }
+tree-sitter-swift = { workspace = true, optional = true }
+tree-sitter-graphql = { workspace = true, optional = true }
+tree-sitter-hcl = { workspace = true, optional = true }
+# Note: Kotlin blocked by tree-sitter version constraint (>=0.21, <0.23)
+
+[dev-dependencies]
+tempfile = { workspace = true }
+env_logger = "0.11"

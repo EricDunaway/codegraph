@@ -1,0 +1,18 @@
+[package]
+name = "codegraph-resolution"
+description = "Reference resolution for CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+codegraph-db = { path = "../codegraph-db" }
+thiserror = { workspace = true }
+log = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

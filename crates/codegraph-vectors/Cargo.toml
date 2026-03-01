@@ -1,0 +1,42 @@
+[package]
+name = "codegraph-vectors"
+description = "Vector embeddings for semantic search in CodeGraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Enable ONNX runtime for actual embedding generation
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+
+[dependencies]
+codegraph-types = { path = "../codegraph-types" }
+codegraph-db = { path = "../codegraph-db" }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
+tiktoken-rs = { workspace = true }
+
+# Optional ONNX dependencies
+tokenizers = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+# Platform-specific ort configuration:
+# - On macOS Apple Silicon (M1/M2/M3/M4): auto-enable CoreML for Neural Engine + GPU acceleration
+# - On all other platforms: use base ort without CoreML
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "coreml"], optional = true }
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+ort = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+env_logger = "0.11"
